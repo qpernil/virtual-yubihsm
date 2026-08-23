@@ -19,9 +19,8 @@ virtual-yubihsm-core
     |-- SCP11-style P-256 authentication
     |-- shared SCP03-style secure message channel
     |-- session authorization snapshot
-    |-- in-memory object store and implemented commands
-    |-- durable encrypted device state (next step)
-    |-- options and audit (planned)
+    |-- object store, options, and chained audit log
+    |-- versioned durable CBOR state (sessions stay volatile)
     v
 software-key-core (path dependency)
 ```
@@ -63,35 +62,53 @@ within the session's domain and delegated-capability ceilings.
   PKCS#8 key-only RSA wrap/import format;
 - Yubico OTP AES-128/192/256 AEAD keys, credential creation/randomization,
   rewrapping and OTP decryption with private-ID and CRC validation;
-- SSH template storage and retrieval.
+- generated-key attestation certificates signed by the built-in P-256 device
+  identity or a domain-authorized P-256 attestation key;
+- force-audit, per-command audit, algorithm-toggle and FIPS-mode options,
+  chained log entries and log-index reclamation;
+- versioned CBOR persistence of objects, device identity, sequence metadata,
+  options and audit state, with sessions and message counters kept volatile;
+- a complete unprivileged `usb-gadget-supervisor` worker exposing the official
+  `1050:0030` full-speed bulk endpoint pair over FunctionFS.
 
 All officially registered cryptographic algorithms are now represented and
-their general-purpose cryptographic command families are implemented. Still to
-implement before claiming complete device compatibility: SSH certificate
-request validation/signing, attestation-certificate construction, options and
-audit log, durable encrypted state, and the final FunctionFS worker adapter. The
-wrapped-object plaintext representation is versioned for virtual-device
-round-trips; interoperability fixtures from physical YubiHSM exports remain a
-separate validation step. Unsupported commands return the documented
-`INVALID COMMAND` response rather than pretending to succeed.
+their general-purpose cryptographic command families are implemented. SSH
+certificate signing is intentionally out of scope; template storage remains
+available for protocol compatibility, while `Sign SSH Certificate` returns the
+documented `INVALID COMMAND` response. The wrapped-object plaintext
+representation is versioned for virtual-device round-trips; interoperability
+fixtures from physical YubiHSM exports remain a separate validation step.
 
-## Persistence checkpoint and next step
+## Persistence
 
-Persistence is intentionally in memory for the current checkpoint. A `Device`
-owns its objects for the lifetime of that instance: closing or expiring a
-secure session does not remove them, but dropping the device or restarting the
-process does. `ResetDevice` clears the in-memory objects and sessions and then
-reinstalls the factory Authentication Key. The device static P-256 identity is
-also regenerated when a new factory-default device is constructed unless an
-explicit deterministic key is supplied for a test fixture.
+The worker follows the same storage pattern as `virtual-yubikey`. It reads and
+writes `STATE_DIRECTORY/yubihsm-<serial>.cbor`, creates the initial image before
+serving USB, and atomically replaces it after persistent changes. Temporary and
+final files are created with mode `0600`, synced before replacement, and the
+containing directory is synced after replacement. A corrupt, unsupported, or
+wrong-serial image fails closed rather than silently factory-resetting.
 
-The next persistence step is a versioned, encrypted image of the complete
-device state. It will contain the device identity, objects, sequence metadata,
-options and audit state, while secure sessions and message counters remain
-volatile. Mutating commands must publish the new image atomically before
-returning success and must leave the previous state intact if storage fails.
-The encryption key will be supplied from outside the image so an Authentication
-Key is never required to decrypt the state which contains that same key.
+The CBOR image is deliberately not encrypted. It contains private key material
+and Authentication Keys, so `STATE_DIRECTORY` is part of the trusted boundary
+and must only be accessible to the worker identity and the administrator.
+Secure sessions and secure-message counters are never serialized. `ResetDevice`
+clears objects, options, audit state and sessions, then reinstalls the factory
+Authentication Key while retaining the device's static identity.
+
+## Worker lifecycle
+
+`virtual-yubihsm-worker` is the project worker, not a second adapter process.
+It receives the supervisor control channel on file descriptor 3, publishes its
+USB personality, receives the FunctionFS bulk endpoint descriptors, and passes
+each complete YubiHSM transfer to `virtual-yubihsm-core`. It clears volatile
+sessions on bind, unbind and disable events, stalls unsupported control
+requests, and participates in the supervisor's quiesce handshake. It refuses
+to run as root.
+
+[`profiles/virtual-yubihsm.toml`](profiles/virtual-yubihsm.toml) is an
+installation template for the supervisor. Replace the worker command and
+account with deployment-specific absolute values; the worker needs no named
+hardware resources.
 
 ## Development
 

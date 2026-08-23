@@ -7,37 +7,174 @@ use crate::{
     Frame, ObjectInfo, ObjectKey, ObjectMaterial, ObjectRecord, ObjectType, Result,
     SessionAuthorization,
 };
+use const_oid::ObjectIdentifier;
+use der::{
+    asn1::{Any, BitString, OctetString},
+    Decode, Encode,
+};
 use hmac::{Hmac, Mac};
-use p256::{elliptic_curve::sec1::ToSec1Point, SecretKey};
+use p256::{
+    ecdsa::{DerSignature, SigningKey as P256SigningKey},
+    elliptic_curve::sec1::ToSec1Point,
+    SecretKey,
+};
 use pbkdf2::pbkdf2_hmac;
+use rsa::{pkcs8::EncodePublicKey, BigUint, RsaPublicKey};
+use serde::{Deserialize, Serialize};
 use sha1::Sha1;
-use sha2::{Sha256, Sha384, Sha512};
+use sha2::{Digest, Sha256, Sha384, Sha512};
 use software_key_core::{
     rsa_signing::RsaHashAlgorithm,
     software_key_agreement::{derive_with_signing_key, SoftwareX25519Key},
-    software_signing::{SoftwarePublicKey, SoftwareSigningAlgorithm, SoftwareSigningKey},
+    software_signing::{EcCurve, SoftwarePublicKey, SoftwareSigningAlgorithm, SoftwareSigningKey},
     software_symmetric::{
         decrypt_aes_cbc, decrypt_aes_ccm, decrypt_aes_ecb, decrypt_yubico_otp_aead,
         encrypt_aes_cbc, encrypt_aes_ccm, encrypt_aes_ecb, encrypt_yubico_otp_aead, unwrap_aes_kwp,
         wrap_aes_kwp, AES_BLOCK_SIZE, AES_CCM_NONCE_SIZE, AES_CCM_TAG_SIZE,
     },
 };
-use std::collections::BTreeMap;
+use spki::{AlgorithmIdentifierOwned, SubjectPublicKeyInfoOwned};
+use std::{collections::BTreeMap, io::Cursor};
+use std::{str::FromStr, time::Duration};
 use subtle::ConstantTimeEq;
+use x509_cert::{
+    builder::{profile::BuilderProfile, Builder, CertificateBuilder},
+    certificate::TbsCertificate,
+    ext::{
+        pkix::{BasicConstraints, KeyUsage, KeyUsages},
+        Extension, ToExtension,
+    },
+    name::Name,
+    serial_number::SerialNumber,
+    time::Validity,
+};
 use zeroize::Zeroizing;
 
 const MAX_OBJECTS: usize = 256;
 const MAX_SESSIONS: u8 = 16;
 const DEFAULT_AUTHENTICATION_ALGORITHM: u8 = AUTHENTICATION_ALGORITHM_AES128_YUBICO;
 const OPAQUE_DATA_ALGORITHM: u8 = 30;
+const PERSISTENT_STATE_SCHEMA: &str = "virtual-yubihsm-state";
+const PERSISTENT_STATE_VERSION: u16 = 1;
+const OPTION_FORCE_AUDIT: u8 = 0x01;
+const OPTION_COMMAND_AUDIT: u8 = 0x03;
+const OPTION_ALGORITHM_TOGGLE: u8 = 0x04;
+const OPTION_FIPS_MODE: u8 = 0x05;
+const OPTION_OFF: u8 = 0;
+const OPTION_ON: u8 = 1;
+const OPTION_FIX: u8 = 2;
 
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, Deserialize, Serialize)]
 pub struct DeviceConfig {
     pub version: [u8; 3],
     pub serial: u32,
     pub log_capacity: u8,
     pub algorithms: Vec<u8>,
     pub part_number: [u8; 13],
+}
+
+#[derive(Clone, Debug, Default, Deserialize, Serialize)]
+struct DeviceOptions {
+    force_audit: u8,
+    command_audit: BTreeMap<u8, u8>,
+    algorithm_toggle: BTreeMap<u8, u8>,
+    fips_mode: u8,
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+struct AuditEntry {
+    number: u16,
+    command: u8,
+    length: u16,
+    session_key: u16,
+    target_key: u16,
+    second_key: u16,
+    result: u8,
+    systick: u32,
+    digest: [u8; 16],
+}
+
+impl AuditEntry {
+    fn encode(&self, output: &mut Vec<u8>) {
+        output.extend_from_slice(&self.number.to_be_bytes());
+        output.push(self.command);
+        output.extend_from_slice(&self.length.to_be_bytes());
+        output.extend_from_slice(&self.session_key.to_be_bytes());
+        output.extend_from_slice(&self.target_key.to_be_bytes());
+        output.extend_from_slice(&self.second_key.to_be_bytes());
+        output.push(self.result);
+        output.extend_from_slice(&self.systick.to_be_bytes());
+        output.extend_from_slice(&self.digest);
+    }
+}
+
+#[derive(Clone, Debug, Default, Deserialize, Serialize)]
+struct AuditState {
+    entries: Vec<AuditEntry>,
+    next_number: u16,
+    systick: u32,
+    previous_digest: [u8; 16],
+    unlogged_boot: u16,
+    unlogged_authentication: u16,
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize)]
+struct PersistentState {
+    schema: String,
+    version: u16,
+    config: DeviceConfig,
+    objects: Vec<ObjectRecord>,
+    device_static_private: [u8; 32],
+    next_sequence: u8,
+    options: DeviceOptions,
+    audit: AuditState,
+}
+
+struct AttestationProfile {
+    subject: Name,
+    issuer: Name,
+    key_agreement: bool,
+    key_encipherment: bool,
+    template_extensions: Vec<Extension>,
+    metadata_extensions: Vec<Extension>,
+}
+
+impl BuilderProfile for AttestationProfile {
+    fn get_issuer(&self, _subject: &Name) -> Name {
+        self.issuer.clone()
+    }
+
+    fn get_subject(&self) -> Name {
+        self.subject.clone()
+    }
+
+    fn build_extensions(
+        &self,
+        _subject_key: spki::SubjectPublicKeyInfoRef<'_>,
+        _issuer_key: spki::SubjectPublicKeyInfoRef<'_>,
+        tbs: &TbsCertificate,
+    ) -> x509_cert::builder::Result<Vec<Extension>> {
+        let mut extensions = self.template_extensions.clone();
+        if extensions.is_empty() {
+            extensions.push(
+                BasicConstraints {
+                    ca: false,
+                    path_len_constraint: None,
+                }
+                .to_extension(tbs.subject(), &extensions)?,
+            );
+            let mut usages = KeyUsages::DigitalSignature.into();
+            if self.key_agreement {
+                usages |= KeyUsages::KeyAgreement;
+            }
+            if self.key_encipherment {
+                usages |= KeyUsages::KeyEncipherment;
+            }
+            extensions.push(KeyUsage(usages).to_extension(tbs.subject(), &extensions)?);
+        }
+        extensions.extend(self.metadata_extensions.clone());
+        Ok(extensions)
+    }
 }
 
 impl Default for DeviceConfig {
@@ -63,6 +200,9 @@ pub struct Device {
     sessions: BTreeMap<u8, SessionEntry>,
     device_static_private: Zeroizing<[u8; 32]>,
     next_sequence: u8,
+    options: DeviceOptions,
+    audit: AuditState,
+    persistent_change: bool,
 }
 
 impl Device {
@@ -88,6 +228,12 @@ impl Device {
             sessions: BTreeMap::new(),
             device_static_private: Zeroizing::new(device_static_private),
             next_sequence: 1,
+            options: DeviceOptions::default(),
+            audit: AuditState {
+                next_number: 1,
+                ..AuditState::default()
+            },
+            persistent_change: false,
         };
         device.install_factory_authentication_key();
         Ok(device)
@@ -259,6 +405,7 @@ impl Device {
                 response.push(sid);
                 response.extend_from_slice(&device_ephemeral_public);
                 response.extend_from_slice(&receipt);
+                self.record_unlogged_authentication_if_full();
                 Ok(Frame::response(CommandCode::CreateSession as u8, response))
             }
         }
@@ -284,6 +431,7 @@ impl Device {
         entry.secure.authenticate_symmetric(request, &expected)?;
         entry.authenticated = true;
         self.sessions.insert(sid, entry);
+        self.record_unlogged_authentication_if_full();
         Ok(Frame::response(
             CommandCode::AuthenticateSession as u8,
             Vec::new(),
@@ -345,7 +493,34 @@ impl Device {
     /// Execute an already decrypted session command under a snapshotted
     /// Authentication Key authorization context.
     pub fn execute_inner(&mut self, authorization: SessionAuthorization, request: &Frame) -> Frame {
+        let command = CommandCode::from_byte(request.command);
+        let should_audit = command.is_some_and(|command| self.should_audit(command));
+        if command.is_some_and(|command| {
+            !command_is_meta(command)
+                && !matches!(
+                    command,
+                    CommandCode::GetLogEntries | CommandCode::SetLogIndex
+                )
+        }) && self.options.force_audit != OPTION_OFF
+            && self.audit.entries.len() >= usize::from(self.config.log_capacity)
+        {
+            return Frame::error(DeviceError::LogFull);
+        }
+
         let result = self.execute_inner_result(authorization, request);
+        let result_code = result
+            .as_ref()
+            .err()
+            .copied()
+            .map_or(0, |error| error as u8);
+        if let Some(command) = command {
+            if should_audit {
+                self.append_audit_entry(authorization, command, request, result_code);
+            }
+            if result.is_ok() && command_changes_persistent_state(command) {
+                self.persistent_change = true;
+            }
+        }
         match result {
             Ok(data) => Frame::response(request.command, data),
             Err(error) => Frame::error(error),
@@ -365,6 +540,7 @@ impl Device {
     pub fn provision_object(&mut self, object: ObjectRecord) -> Result<()> {
         object.validate()?;
         self.objects.insert(object.info.key(), object);
+        self.persistent_change = true;
         Ok(())
     }
 
@@ -375,6 +551,72 @@ impl Device {
     /// Invalidate every volatile secure session without changing objects.
     pub fn clear_sessions(&mut self) {
         self.sessions.clear();
+    }
+
+    /// Encode durable device state. Secure sessions and transport counters are
+    /// intentionally excluded, just as they are on a physical power cycle.
+    pub fn persistent_state(&self) -> Result<Vec<u8>> {
+        let state = PersistentState {
+            schema: PERSISTENT_STATE_SCHEMA.to_owned(),
+            version: PERSISTENT_STATE_VERSION,
+            config: self.config.clone(),
+            objects: self.objects.values().cloned().collect(),
+            device_static_private: *self.device_static_private,
+            next_sequence: self.next_sequence,
+            options: self.options.clone(),
+            audit: self.audit.clone(),
+        };
+        let mut output = Vec::new();
+        ciborium::into_writer(&state, &mut output).map_err(|_| DeviceError::StorageFailed)?;
+        Ok(output)
+    }
+
+    /// Restore durable state for the configured serial number. Corrupt,
+    /// foreign, or unsupported images are rejected rather than factory-reset.
+    pub fn from_persistent_state(config: DeviceConfig, encoded: &[u8]) -> Result<Self> {
+        let mut input = Cursor::new(encoded);
+        let state: PersistentState =
+            ciborium::from_reader(&mut input).map_err(|_| DeviceError::InvalidData)?;
+        if input.position() != encoded.len() as u64
+            || state.schema != PERSISTENT_STATE_SCHEMA
+            || state.version != PERSISTENT_STATE_VERSION
+            || state.config.serial != config.serial
+            || state.audit.entries.len() > usize::from(state.config.log_capacity)
+            || !valid_option_value(state.options.force_audit)
+            || !valid_option_value(state.options.fips_mode)
+            || state
+                .options
+                .command_audit
+                .values()
+                .chain(state.options.algorithm_toggle.values())
+                .any(|value| !valid_option_value(*value))
+        {
+            return Err(DeviceError::InvalidData);
+        }
+        SecretKey::from_slice(&state.device_static_private)
+            .map_err(|_| DeviceError::InvalidData)?;
+        let mut objects = BTreeMap::new();
+        for object in state.objects {
+            object.validate()?;
+            if objects.insert(object.info.key(), object).is_some() {
+                return Err(DeviceError::InvalidData);
+            }
+        }
+        Ok(Self {
+            config: state.config,
+            objects,
+            sessions: BTreeMap::new(),
+            device_static_private: Zeroizing::new(state.device_static_private),
+            next_sequence: state.next_sequence.max(1),
+            options: state.options,
+            audit: state.audit,
+            persistent_change: false,
+        })
+    }
+
+    /// Report and clear the durable-state dirty flag used by worker storage.
+    pub fn take_persistent_change(&mut self) -> bool {
+        std::mem::take(&mut self.persistent_change)
     }
 
     fn execute_inner_result(
@@ -410,6 +652,10 @@ impl Device {
                 authorization.require_visible(&object.info)?;
                 Ok(object.info.encode().to_vec())
             }
+            CommandCode::GetLogEntries => self.get_log_entries(&request.data),
+            CommandCode::SetLogIndex => self.set_log_index(&request.data),
+            CommandCode::SetOption => self.set_option(&request.data),
+            CommandCode::GetOption => self.get_option(&request.data),
             CommandCode::PutAuthenticationKey => {
                 self.put_authentication_key(authorization, &request.data)
             }
@@ -424,6 +670,9 @@ impl Device {
                 self.put_asymmetric_key(authorization, &request.data, true)
             }
             CommandCode::GetPublicKey => self.get_public_key(authorization, &request.data),
+            CommandCode::SignAttestationCertificate => {
+                self.sign_attestation_certificate(authorization, &request.data)
+            }
             CommandCode::SignPkcs1 => self.sign_pkcs1(authorization, &request.data),
             CommandCode::SignPss => self.sign_pss(authorization, &request.data),
             CommandCode::SignEcdsa => self.sign_ecdsa(authorization, &request.data),
@@ -511,9 +760,15 @@ impl Device {
                 self.objects.clear();
                 self.next_sequence = 1;
                 self.sessions.clear();
+                self.options = DeviceOptions::default();
+                self.audit = AuditState {
+                    next_number: 1,
+                    ..AuditState::default()
+                };
                 self.install_factory_authentication_key();
                 Ok(Vec::new())
             }
+            CommandCode::BlinkDevice => require_empty(&request.data).map(|()| Vec::new()),
             _ => Err(DeviceError::InvalidCommand),
         }
     }
@@ -521,16 +776,240 @@ impl Device {
     fn get_device_info(&self, data: &[u8]) -> Result<Vec<u8>> {
         match data {
             [] => {
-                let mut output = Vec::with_capacity(9 + self.config.algorithms.len());
+                let algorithms = self.enabled_algorithms();
+                let mut output = Vec::with_capacity(9 + algorithms.len());
                 output.extend_from_slice(&self.config.version);
                 output.extend_from_slice(&self.config.serial.to_be_bytes());
                 output.push(self.config.log_capacity);
-                output.push(0);
-                output.extend_from_slice(&self.config.algorithms);
+                output.push(self.audit.entries.len().try_into().unwrap_or(u8::MAX));
+                output.extend_from_slice(&algorithms);
                 Ok(output)
             }
             [1] => Ok(self.config.part_number.to_vec()),
             _ => Err(DeviceError::InvalidData),
+        }
+    }
+
+    fn get_log_entries(&self, data: &[u8]) -> Result<Vec<u8>> {
+        require_empty(data)?;
+        let mut output = Vec::with_capacity(5 + self.audit.entries.len() * 32);
+        output.extend_from_slice(&self.audit.unlogged_boot.to_be_bytes());
+        output.extend_from_slice(&self.audit.unlogged_authentication.to_be_bytes());
+        output.push(self.audit.entries.len().try_into().unwrap_or(u8::MAX));
+        for entry in &self.audit.entries {
+            entry.encode(&mut output);
+        }
+        Ok(output)
+    }
+
+    fn set_log_index(&mut self, data: &[u8]) -> Result<Vec<u8>> {
+        let index = parse_u16(data)?;
+        self.audit.entries.retain(|entry| entry.number > index);
+        Ok(Vec::new())
+    }
+
+    fn get_option(&self, data: &[u8]) -> Result<Vec<u8>> {
+        let &[option] = data else {
+            return Err(DeviceError::WrongLength);
+        };
+        match option {
+            OPTION_FORCE_AUDIT => Ok(vec![self.options.force_audit]),
+            OPTION_COMMAND_AUDIT => {
+                let mut output = Vec::new();
+                for command in 0..=u8::MAX {
+                    if CommandCode::from_byte(command).is_some() {
+                        output.extend_from_slice(&[
+                            command,
+                            self.options
+                                .command_audit
+                                .get(&command)
+                                .copied()
+                                .unwrap_or(OPTION_OFF),
+                        ]);
+                    }
+                }
+                Ok(output)
+            }
+            OPTION_ALGORITHM_TOGGLE => {
+                let mut output = Vec::with_capacity(self.config.algorithms.len() * 2);
+                for algorithm in &self.config.algorithms {
+                    output.extend_from_slice(&[
+                        *algorithm,
+                        self.options
+                            .algorithm_toggle
+                            .get(algorithm)
+                            .copied()
+                            .unwrap_or(OPTION_ON),
+                    ]);
+                }
+                Ok(output)
+            }
+            OPTION_FIPS_MODE => Ok(vec![self.options.fips_mode]),
+            _ => Err(DeviceError::InvalidData),
+        }
+    }
+
+    fn set_option(&mut self, data: &[u8]) -> Result<Vec<u8>> {
+        if data.len() < 3 {
+            return Err(DeviceError::WrongLength);
+        }
+        let option = data[0];
+        let value_length = u16::from_be_bytes(data[1..3].try_into().unwrap()) as usize;
+        if data.len() != 3 + value_length {
+            return Err(DeviceError::WrongLength);
+        }
+        let values = &data[3..];
+        match option {
+            OPTION_FORCE_AUDIT => {
+                let &[value] = values else {
+                    return Err(DeviceError::WrongLength);
+                };
+                set_option_value(&mut self.options.force_audit, value)?;
+            }
+            OPTION_COMMAND_AUDIT => {
+                if values.is_empty() || values.len() % 2 != 0 {
+                    return Err(DeviceError::WrongLength);
+                }
+                let mut updated = self.options.command_audit.clone();
+                for pair in values.chunks_exact(2) {
+                    if CommandCode::from_byte(pair[0]).is_none() || !valid_option_value(pair[1]) {
+                        return Err(DeviceError::InvalidData);
+                    }
+                    if CommandCode::from_byte(pair[0]).is_some_and(command_is_meta)
+                        && pair[1] != OPTION_OFF
+                    {
+                        return Err(DeviceError::InvalidData);
+                    }
+                    if updated.get(&pair[0]) == Some(&OPTION_FIX) && pair[1] != OPTION_FIX {
+                        return Err(DeviceError::InsufficientPermissions);
+                    }
+                    updated.insert(pair[0], pair[1]);
+                }
+                self.options.command_audit = updated;
+            }
+            OPTION_ALGORITHM_TOGGLE => {
+                self.require_fresh_device_for_algorithm_options()?;
+                if values.is_empty() || values.len() % 2 != 0 {
+                    return Err(DeviceError::WrongLength);
+                }
+                let mut updated = self.options.algorithm_toggle.clone();
+                for pair in values.chunks_exact(2) {
+                    if !self.config.algorithms.contains(&pair[0]) || !valid_option_value(pair[1]) {
+                        return Err(DeviceError::InvalidData);
+                    }
+                    if updated.get(&pair[0]) == Some(&OPTION_FIX) && pair[1] != OPTION_FIX {
+                        return Err(DeviceError::InsufficientPermissions);
+                    }
+                    updated.insert(pair[0], pair[1]);
+                }
+                self.options.algorithm_toggle = updated;
+            }
+            OPTION_FIPS_MODE => {
+                self.require_fresh_device_for_algorithm_options()?;
+                let &[value] = values else {
+                    return Err(DeviceError::WrongLength);
+                };
+                set_option_value(&mut self.options.fips_mode, value)?;
+            }
+            _ => return Err(DeviceError::InvalidData),
+        }
+        Ok(Vec::new())
+    }
+
+    fn require_fresh_device_for_algorithm_options(&self) -> Result<()> {
+        let factory_key = ObjectKey {
+            object_type: ObjectType::AuthenticationKey,
+            id: 1,
+        };
+        if self.objects.len() == 1 && self.objects.contains_key(&factory_key) {
+            Ok(())
+        } else {
+            Err(DeviceError::InsufficientPermissions)
+        }
+    }
+
+    fn enabled_algorithms(&self) -> Vec<u8> {
+        self.config
+            .algorithms
+            .iter()
+            .copied()
+            .filter(|algorithm| self.algorithm_enabled(*algorithm))
+            .collect()
+    }
+
+    fn algorithm_enabled(&self, algorithm: u8) -> bool {
+        self.options
+            .algorithm_toggle
+            .get(&algorithm)
+            .copied()
+            .unwrap_or(OPTION_ON)
+            != OPTION_OFF
+            && !(self.options.fips_mode != OPTION_OFF && fips_disallowed_algorithm(algorithm))
+    }
+
+    fn require_algorithm_enabled(&self, algorithm: u8) -> Result<()> {
+        if self.algorithm_enabled(algorithm) {
+            Ok(())
+        } else {
+            Err(DeviceError::InvalidData)
+        }
+    }
+
+    fn should_audit(&self, command: CommandCode) -> bool {
+        !command_is_meta(command)
+            && self
+                .options
+                .command_audit
+                .get(&(command as u8))
+                .copied()
+                .unwrap_or(OPTION_OFF)
+                != OPTION_OFF
+    }
+
+    fn append_audit_entry(
+        &mut self,
+        authorization: SessionAuthorization,
+        command: CommandCode,
+        request: &Frame,
+        result: u8,
+    ) {
+        if self.audit.entries.len() >= usize::from(self.config.log_capacity) {
+            return;
+        }
+        let (target_key, second_key) = audit_key_ids(command, &request.data);
+        let mut entry = AuditEntry {
+            number: self.audit.next_number,
+            command: command as u8,
+            length: request.data.len().try_into().unwrap_or(u16::MAX),
+            session_key: authorization.authentication_key_id,
+            target_key,
+            second_key,
+            result,
+            systick: self.audit.systick,
+            digest: [0; 16],
+        };
+        let mut encoded = Vec::with_capacity(32);
+        entry.encode(&mut encoded);
+        let mut digest_input = Vec::with_capacity(32);
+        digest_input.extend_from_slice(&encoded[..16]);
+        digest_input.extend_from_slice(&self.audit.previous_digest);
+        entry
+            .digest
+            .copy_from_slice(&Sha256::digest(&digest_input)[..16]);
+        self.audit.previous_digest = entry.digest;
+        self.audit.next_number = self.audit.next_number.wrapping_add(1).max(1);
+        self.audit.systick = self.audit.systick.wrapping_add(1);
+        self.audit.entries.push(entry);
+        self.persistent_change = true;
+    }
+
+    fn record_unlogged_authentication_if_full(&mut self) {
+        if self.options.force_audit != OPTION_OFF
+            && self.audit.entries.len() >= usize::from(self.config.log_capacity)
+        {
+            self.audit.unlogged_authentication =
+                self.audit.unlogged_authentication.saturating_add(1);
+            self.persistent_change = true;
         }
     }
 
@@ -551,6 +1030,7 @@ impl Device {
         if data.len() < 53 {
             return Err(DeviceError::WrongLength);
         }
+        self.require_algorithm_enabled(data[52])?;
         let id = self.resolve_id(
             ObjectType::Opaque,
             u16::from_be_bytes(data[..2].try_into().unwrap()),
@@ -591,6 +1071,7 @@ impl Device {
             return Err(DeviceError::WrongLength);
         }
         let algorithm = data[52];
+        self.require_algorithm_enabled(algorithm)?;
         let key_length = authentication_key_length(algorithm)?;
         if data.len() != HEADER_LENGTH + key_length {
             return Err(DeviceError::WrongLength);
@@ -633,6 +1114,7 @@ impl Device {
             return Err(DeviceError::WrongLength);
         }
         let algorithm = Algorithm::from_byte(data[52]).ok_or(DeviceError::InvalidData)?;
+        self.require_algorithm_enabled(algorithm as u8)?;
         let expected_length = algorithm
             .asymmetric_key_length()
             .ok_or(DeviceError::InvalidData)?;
@@ -713,6 +1195,123 @@ impl Device {
             }
         }
         Ok(output)
+    }
+
+    fn sign_attestation_certificate(
+        &self,
+        authorization: SessionAuthorization,
+        data: &[u8],
+    ) -> Result<Vec<u8>> {
+        if data.len() != 4 {
+            return Err(DeviceError::WrongLength);
+        }
+        let target_id = u16::from_be_bytes(data[..2].try_into().unwrap());
+        let attesting_id = u16::from_be_bytes(data[2..].try_into().unwrap());
+        let (target_spki, target_info) = if target_id == 0 {
+            let private = SecretKey::from_slice(self.device_static_private.as_ref())
+                .map_err(|_| DeviceError::StorageFailed)?;
+            let public = private.public_key().to_sec1_point(false);
+            (
+                ec_subject_public_key_info(EcCurve::P256, public.as_bytes())?,
+                ObjectInfo {
+                    capabilities: CapabilitySet::NONE,
+                    id: 0,
+                    length: 32,
+                    domains: 0,
+                    object_type: ObjectType::AsymmetricKey,
+                    algorithm: Algorithm::EcP256 as u8,
+                    sequence: 0,
+                    origin: 0,
+                    label: b"Virtual YubiHSM device key".to_vec(),
+                    delegated_capabilities: CapabilitySet::NONE,
+                },
+            )
+        } else {
+            let target = self.asymmetric_object(authorization, target_id)?;
+            if target.info.origin & 1 == 0 {
+                return Err(DeviceError::InvalidData);
+            }
+            self.require_algorithm_enabled(target.info.algorithm)?;
+            (object_subject_public_key_info(target)?, target.info.clone())
+        };
+        let (attesting_private, issuer) = if attesting_id == 0 {
+            (
+                *self.device_static_private,
+                format!("CN=Virtual YubiHSM {} Attestation", self.config.serial),
+            )
+        } else {
+            let attesting = self.asymmetric_object(authorization, attesting_id)?;
+            authorization.authorize_use(
+                &attesting.info,
+                Capability::SignAttestationCertificate,
+                Capability::SignAttestationCertificate,
+            )?;
+            if attesting.info.algorithm != Algorithm::EcP256 as u8 {
+                return Err(DeviceError::InvalidData);
+            }
+            let secret: [u8; 32] = object_secret(attesting)?
+                .try_into()
+                .map_err(|_| DeviceError::InvalidData)?;
+            (
+                secret,
+                format!("CN=Virtual YubiHSM Attestation Key {attesting_id}"),
+            )
+        };
+        let signer =
+            P256SigningKey::from_slice(&attesting_private).map_err(|_| DeviceError::InvalidData)?;
+        let mut subject = Name::from_str(&format!("CN=Virtual YubiHSM Key {target_id}"))
+            .map_err(|_| DeviceError::InvalidData)?;
+        let mut issuer = Name::from_str(&issuer).map_err(|_| DeviceError::InvalidData)?;
+        let mut validity = Validity::from_now(Duration::from_secs(10 * 365 * 86_400))
+            .map_err(|_| DeviceError::StorageFailed)?;
+        let mut template_extensions = Vec::new();
+        if attesting_id != 0 {
+            if let Some(template) = self.objects.get(&ObjectKey {
+                object_type: ObjectType::Opaque,
+                id: attesting_id,
+            }) {
+                authorization.require_visible(&template.info)?;
+                if template.info.algorithm != Algorithm::OpaqueX509Certificate as u8 {
+                    return Err(DeviceError::InvalidData);
+                }
+                let ObjectMaterial::Opaque(encoded) = &template.material else {
+                    return Err(DeviceError::InvalidData);
+                };
+                let certificate = x509_cert::Certificate::from_der(encoded)
+                    .map_err(|_| DeviceError::InvalidData)?;
+                let tbs = certificate.tbs_certificate();
+                subject = tbs.subject().clone();
+                issuer = tbs.issuer().clone();
+                validity = *tbs.validity();
+                template_extensions = tbs.extensions().cloned().unwrap_or_default();
+            }
+        }
+        let algorithm =
+            Algorithm::from_byte(target_info.algorithm).ok_or(DeviceError::InvalidData)?;
+        let profile = AttestationProfile {
+            subject,
+            issuer,
+            key_agreement: matches!(algorithm, Algorithm::Ecdh | Algorithm::X25519)
+                || algorithm.is_weierstrass_key(),
+            key_encipherment: algorithm.is_rsa_key(),
+            template_extensions,
+            metadata_extensions: attestation_metadata_extensions(&self.config, &target_info)?,
+        };
+        let mut serial = [0_u8; 8];
+        serial[..4].copy_from_slice(&self.config.serial.to_be_bytes());
+        serial[4..6].copy_from_slice(&target_id.to_be_bytes());
+        serial[6..].copy_from_slice(&attesting_id.to_be_bytes());
+        let builder = CertificateBuilder::new(
+            profile,
+            SerialNumber::new(&serial).map_err(|_| DeviceError::InvalidData)?,
+            validity,
+            target_spki,
+        )
+        .map_err(|_| DeviceError::InvalidData)?;
+        let certificate = builder
+            .build::<_, DerSignature>(&signer)
+            .map_err(|_| DeviceError::StorageFailed)?;
+        certificate.to_der().map_err(|_| DeviceError::StorageFailed)
     }
 
     fn sign_pkcs1(&self, authorization: SessionAuthorization, data: &[u8]) -> Result<Vec<u8>> {
@@ -863,6 +1462,7 @@ impl Device {
             })
             .ok_or(DeviceError::ObjectNotFound)?;
         authorization.require_visible(&object.info)?;
+        self.require_algorithm_enabled(object.info.algorithm)?;
         Ok(object)
     }
 
@@ -877,6 +1477,7 @@ impl Device {
             return Err(DeviceError::WrongLength);
         }
         let algorithm = data[52];
+        self.require_algorithm_enabled(algorithm)?;
         let generated_length = hmac_length(algorithm)?;
         let secret = if generate {
             let mut value = vec![0; generated_length];
@@ -931,6 +1532,7 @@ impl Device {
             return Err(DeviceError::WrongLength);
         }
         let algorithm = Algorithm::from_byte(data[52]).ok_or(DeviceError::InvalidData)?;
+        self.require_algorithm_enabled(algorithm as u8)?;
         let key_length = algorithm
             .aes_key_length()
             .filter(|_| {
@@ -992,6 +1594,7 @@ impl Device {
             return Err(DeviceError::WrongLength);
         }
         let algorithm = Algorithm::from_byte(data[52]).ok_or(DeviceError::InvalidData)?;
+        self.require_algorithm_enabled(algorithm as u8)?;
         let key_length = match algorithm {
             Algorithm::Aes128CcmWrap | Algorithm::Aes192CcmWrap | Algorithm::Aes256CcmWrap => {
                 algorithm.aes_key_length().unwrap()
@@ -1054,6 +1657,7 @@ impl Device {
             return Err(DeviceError::WrongLength);
         }
         let algorithm = Algorithm::from_byte(data[52]).ok_or(DeviceError::InvalidData)?;
+        self.require_algorithm_enabled(algorithm as u8)?;
         if !algorithm.is_rsa_key() {
             return Err(DeviceError::InvalidData);
         }
@@ -1298,6 +1902,7 @@ impl Device {
             return Err(DeviceError::InvalidData);
         }
         let algorithm = Algorithm::from_byte(data[55]).ok_or(DeviceError::InvalidData)?;
+        self.require_algorithm_enabled(algorithm as u8)?;
         let label_digest_length = rsa_oaep_hash(data[56])?.output_length();
         let mgf_hash = rsa_mgf_hash(data[57])?;
         let wrap_id = u16::from_be_bytes(data[..2].try_into().unwrap());
@@ -1363,6 +1968,7 @@ impl Device {
             })
             .ok_or(DeviceError::ObjectNotFound)?;
         authorization.require_visible(&object.info)?;
+        self.require_algorithm_enabled(object.info.algorithm)?;
         Ok(object)
     }
 
@@ -1379,6 +1985,7 @@ impl Device {
             })
             .ok_or(DeviceError::ObjectNotFound)?;
         authorization.require_visible(&object.info)?;
+        self.require_algorithm_enabled(object.info.algorithm)?;
         if !Algorithm::from_byte(object.info.algorithm).is_some_and(Algorithm::is_rsa_key) {
             return Err(DeviceError::InvalidData);
         }
@@ -1394,6 +2001,7 @@ impl Device {
             })
             .ok_or(DeviceError::ObjectNotFound)?;
         authorization.require_visible(&object.info)?;
+        self.require_algorithm_enabled(object.info.algorithm)?;
         if !matches!(
             Algorithm::from_byte(object.info.algorithm),
             Some(Algorithm::Aes128CcmWrap | Algorithm::Aes192CcmWrap | Algorithm::Aes256CcmWrap)
@@ -1472,6 +2080,7 @@ impl Device {
             })
             .ok_or(DeviceError::ObjectNotFound)?;
         authorization.require_visible(&object.info)?;
+        self.require_algorithm_enabled(object.info.algorithm)?;
         if !matches!(
             Algorithm::from_byte(object.info.algorithm),
             Some(Algorithm::Aes128 | Algorithm::Aes192 | Algorithm::Aes256)
@@ -1492,6 +2101,7 @@ impl Device {
             return Err(DeviceError::WrongLength);
         }
         let algorithm = Algorithm::from_byte(data[52]).ok_or(DeviceError::InvalidData)?;
+        self.require_algorithm_enabled(algorithm as u8)?;
         let key_length = match algorithm {
             Algorithm::Aes128YubicoOtp
             | Algorithm::Aes192YubicoOtp
@@ -1627,6 +2237,7 @@ impl Device {
             })
             .ok_or(DeviceError::ObjectNotFound)?;
         authorization.require_visible(&object.info)?;
+        self.require_algorithm_enabled(object.info.algorithm)?;
         Ok(object)
     }
 
@@ -1642,6 +2253,7 @@ impl Device {
         if data[52] != Algorithm::TemplateSsh as u8 {
             return Err(DeviceError::InvalidData);
         }
+        self.require_algorithm_enabled(data[52])?;
         let material = data[HEADER_LENGTH..].to_vec();
         let id = self.resolve_id(
             ObjectType::Template,
@@ -1732,6 +2344,7 @@ impl Device {
             })
             .ok_or(DeviceError::ObjectNotFound)?;
         authorization.require_visible(&object.info)?;
+        self.require_algorithm_enabled(object.info.algorithm)?;
         Ok(object)
     }
 
@@ -1745,6 +2358,7 @@ impl Device {
         }
         let id = u16::from_be_bytes(data[..2].try_into().unwrap());
         let algorithm = data[2];
+        self.require_algorithm_enabled(algorithm)?;
         let key_length = authentication_key_length(algorithm)?;
         if data.len() != 3 + key_length {
             return Err(DeviceError::WrongLength);
@@ -2014,6 +2628,98 @@ fn signing_key(object: &ObjectRecord) -> Result<SoftwareSigningKey> {
     }
     let (algorithm, _) = asymmetric_key_algorithm(object.info.algorithm)?;
     SoftwareSigningKey::from_serialized(algorithm, secret).map_err(|_| DeviceError::InvalidData)
+}
+
+fn object_subject_public_key_info(object: &ObjectRecord) -> Result<SubjectPublicKeyInfoOwned> {
+    if object.info.algorithm == Algorithm::X25519 as u8 {
+        return Ok(SubjectPublicKeyInfoOwned {
+            algorithm: AlgorithmIdentifierOwned {
+                oid: ObjectIdentifier::new_unwrap("1.3.101.110"),
+                parameters: None,
+            },
+            subject_public_key: BitString::from_bytes(&x25519_key(object)?.public_key())
+                .map_err(|_| DeviceError::InvalidData)?,
+        });
+    }
+    match signing_key(object)?.public_key() {
+        SoftwarePublicKey::Ec {
+            curve,
+            uncompressed,
+        } => ec_subject_public_key_info(curve, &uncompressed),
+        SoftwarePublicKey::Ed25519(public) => Ok(SubjectPublicKeyInfoOwned {
+            algorithm: AlgorithmIdentifierOwned {
+                oid: ObjectIdentifier::new_unwrap("1.3.101.112"),
+                parameters: None,
+            },
+            subject_public_key: BitString::from_bytes(&public)
+                .map_err(|_| DeviceError::InvalidData)?,
+        }),
+        SoftwarePublicKey::Rsa { modulus, exponent } => {
+            let public = RsaPublicKey::new(
+                BigUint::from_bytes_be(&modulus),
+                BigUint::from_bytes_be(&exponent),
+            )
+            .map_err(|_| DeviceError::InvalidData)?;
+            let encoded = public
+                .to_public_key_der()
+                .map_err(|_| DeviceError::InvalidData)?;
+            SubjectPublicKeyInfoOwned::from_der(encoded.as_bytes())
+                .map_err(|_| DeviceError::InvalidData)
+        }
+        SoftwarePublicKey::MlDsa { .. } => Err(DeviceError::InvalidData),
+    }
+}
+
+fn ec_subject_public_key_info(
+    curve: EcCurve,
+    uncompressed: &[u8],
+) -> Result<SubjectPublicKeyInfoOwned> {
+    let curve_oid = match curve {
+        EcCurve::P224 => "1.3.132.0.33",
+        EcCurve::P256 => "1.2.840.10045.3.1.7",
+        EcCurve::P384 => "1.3.132.0.34",
+        EcCurve::P521 => "1.3.132.0.35",
+        EcCurve::Secp256k1 => "1.3.132.0.10",
+        EcCurve::BrainpoolP256 => "1.3.36.3.3.2.8.1.1.7",
+        EcCurve::BrainpoolP384 => "1.3.36.3.3.2.8.1.1.11",
+        EcCurve::BrainpoolP512 => "1.3.36.3.3.2.8.1.1.13",
+    };
+    let curve_oid = ObjectIdentifier::new(curve_oid).map_err(|_| DeviceError::InvalidData)?;
+    Ok(SubjectPublicKeyInfoOwned {
+        algorithm: AlgorithmIdentifierOwned {
+            oid: ObjectIdentifier::new_unwrap("1.2.840.10045.2.1"),
+            parameters: Some(Any::encode_from(&curve_oid).map_err(|_| DeviceError::InvalidData)?),
+        },
+        subject_public_key: BitString::from_bytes(uncompressed)
+            .map_err(|_| DeviceError::InvalidData)?,
+    })
+}
+
+fn attestation_metadata_extensions(
+    config: &DeviceConfig,
+    target: &ObjectInfo,
+) -> Result<Vec<Extension>> {
+    const PREFIX: &str = "1.3.6.1.4.1.41482.4";
+    let values = [
+        (1, config.version.to_vec()),
+        (2, config.serial.to_be_bytes().to_vec()),
+        (3, vec![target.origin]),
+        (4, target.domains.to_be_bytes().to_vec()),
+        (5, target.capabilities.to_bytes().to_vec()),
+        (6, target.id.to_be_bytes().to_vec()),
+        (9, target.label.clone()),
+    ];
+    values
+        .into_iter()
+        .map(|(suffix, value)| {
+            Ok(Extension {
+                extn_id: ObjectIdentifier::new(&format!("{PREFIX}.{suffix}"))
+                    .map_err(|_| DeviceError::InvalidData)?,
+                critical: false,
+                extn_value: OctetString::new(value).map_err(|_| DeviceError::InvalidData)?,
+            })
+        })
+        .collect()
 }
 
 fn rsa_key(object: &ObjectRecord) -> Result<SoftwareSigningKey> {
@@ -2389,6 +3095,99 @@ fn take<'a>(data: &mut &'a [u8], length: usize) -> Result<&'a [u8]> {
 
 fn read_filter_u16(data: &mut &[u8]) -> Result<u16> {
     Ok(u16::from_be_bytes(take(data, 2)?.try_into().unwrap()))
+}
+
+fn valid_option_value(value: u8) -> bool {
+    matches!(value, OPTION_OFF | OPTION_ON | OPTION_FIX)
+}
+
+fn set_option_value(current: &mut u8, requested: u8) -> Result<()> {
+    if !valid_option_value(requested) {
+        return Err(DeviceError::InvalidData);
+    }
+    if *current == OPTION_FIX && requested != OPTION_FIX {
+        return Err(DeviceError::InsufficientPermissions);
+    }
+    *current = requested;
+    Ok(())
+}
+
+fn fips_disallowed_algorithm(algorithm: u8) -> bool {
+    matches!(
+        Algorithm::from_byte(algorithm),
+        Some(
+            Algorithm::RsaPkcs1Sha1
+                | Algorithm::RsaPssSha1
+                | Algorithm::EcdsaSha1
+                | Algorithm::EcK256
+                | Algorithm::RsaPkcs1Decrypt
+        )
+    )
+}
+
+fn command_changes_persistent_state(command: CommandCode) -> bool {
+    matches!(
+        command,
+        CommandCode::PutOpaque
+            | CommandCode::PutAuthenticationKey
+            | CommandCode::PutAsymmetricKey
+            | CommandCode::GenerateAsymmetricKey
+            | CommandCode::ImportWrapped
+            | CommandCode::PutWrapKey
+            | CommandCode::SetOption
+            | CommandCode::PutHmacKey
+            | CommandCode::GenerateHmacKey
+            | CommandCode::GenerateWrapKey
+            | CommandCode::DeleteObject
+            | CommandCode::PutTemplate
+            | CommandCode::PutOtpAeadKey
+            | CommandCode::GenerateOtpAeadKey
+            | CommandCode::SetLogIndex
+            | CommandCode::ChangeAuthenticationKey
+            | CommandCode::PutSymmetricKey
+            | CommandCode::GenerateSymmetricKey
+            | CommandCode::PutPublicWrapKey
+            | CommandCode::PutRsaWrappedKey
+            | CommandCode::ImportRsaWrapped
+            | CommandCode::ResetDevice
+    )
+}
+
+fn command_is_meta(command: CommandCode) -> bool {
+    matches!(
+        command,
+        CommandCode::Echo
+            | CommandCode::CreateSession
+            | CommandCode::AuthenticateSession
+            | CommandCode::SessionMessage
+            | CommandCode::GetDeviceInfo
+            | CommandCode::GetDevicePublicKey
+            | CommandCode::CloseSession
+    )
+}
+
+fn audit_key_ids(command: CommandCode, data: &[u8]) -> (u16, u16) {
+    let first = data
+        .get(..2)
+        .map(|bytes| u16::from_be_bytes(bytes.try_into().unwrap()))
+        .unwrap_or(0);
+    match command {
+        CommandCode::SignAttestationCertificate | CommandCode::RewrapOtpAead => {
+            let second = data
+                .get(2..4)
+                .map(|bytes| u16::from_be_bytes(bytes.try_into().unwrap()))
+                .unwrap_or(0);
+            (first, second)
+        }
+        CommandCode::ExportWrapped | CommandCode::ExportRsaWrapped => {
+            let target = data
+                .get(3..5)
+                .map(|bytes| u16::from_be_bytes(bytes.try_into().unwrap()))
+                .unwrap_or(0);
+            (target, first)
+        }
+        _ => (first, 0),
+    }
 }
 
 #[cfg(test)]
@@ -3457,5 +4256,175 @@ mod tests {
         let mut tampered = verify;
         *tampered.data.last_mut().unwrap() ^= 1;
         assert_eq!(device.execute_inner(admin, &tampered).data, [0]);
+    }
+
+    #[test]
+    fn persistent_state_round_trips_objects_options_audit_and_device_identity() {
+        let config = DeviceConfig {
+            serial: 77,
+            ..DeviceConfig::default()
+        };
+        let mut device =
+            Device::factory_default_with_device_static_private(config.clone(), [7; 32]).unwrap();
+        let admin = device.session_authorization(1).unwrap();
+        let put = put_opaque_request(
+            42,
+            1,
+            CapabilitySet::from_capabilities([Capability::GetOpaque]),
+        );
+        assert_eq!(device.execute_inner(admin, &put).data, 42_u16.to_be_bytes());
+        let set_audit = Frame::new(
+            CommandCode::SetOption as u8,
+            vec![
+                OPTION_COMMAND_AUDIT,
+                0,
+                2,
+                CommandCode::GetPseudoRandom as u8,
+                OPTION_ON,
+            ],
+        )
+        .unwrap();
+        assert!(device.execute_inner(admin, &set_audit).data.is_empty());
+        let random = Frame::new(CommandCode::GetPseudoRandom as u8, 4_u16.to_be_bytes()).unwrap();
+        assert_eq!(device.execute_inner(admin, &random).data.len(), 4);
+        assert!(device.take_persistent_change());
+
+        let encoded = device.persistent_state().unwrap();
+        let restored = Device::from_persistent_state(config.clone(), &encoded).unwrap();
+        assert_eq!(restored.active_session_count(), 0);
+        assert!(restored
+            .object(ObjectKey {
+                object_type: ObjectType::Opaque,
+                id: 42,
+            })
+            .is_some());
+        assert_eq!(restored.audit.entries.len(), 1);
+        assert_eq!(
+            restored.options.command_audit[&(CommandCode::GetPseudoRandom as u8)],
+            OPTION_ON
+        );
+        assert_eq!(restored.device_static_private.as_ref(), &[7; 32]);
+
+        let foreign = DeviceConfig {
+            serial: 78,
+            ..config
+        };
+        assert_eq!(
+            Device::from_persistent_state(foreign, &encoded).unwrap_err(),
+            DeviceError::InvalidData
+        );
+    }
+
+    #[test]
+    fn force_audit_enforces_capacity_and_log_index_releases_entries() {
+        let mut device = Device::factory_default(DeviceConfig {
+            log_capacity: 1,
+            ..DeviceConfig::default()
+        });
+        let admin = device.session_authorization(1).unwrap();
+        let audit_random = Frame::new(
+            CommandCode::SetOption as u8,
+            vec![
+                OPTION_COMMAND_AUDIT,
+                0,
+                2,
+                CommandCode::GetPseudoRandom as u8,
+                OPTION_ON,
+            ],
+        )
+        .unwrap();
+        assert!(device.execute_inner(admin, &audit_random).data.is_empty());
+        let force = Frame::new(
+            CommandCode::SetOption as u8,
+            vec![OPTION_FORCE_AUDIT, 0, 1, OPTION_ON],
+        )
+        .unwrap();
+        assert!(device.execute_inner(admin, &force).data.is_empty());
+        let random = Frame::new(CommandCode::GetPseudoRandom as u8, 1_u16.to_be_bytes()).unwrap();
+        assert_eq!(device.execute_inner(admin, &random).data.len(), 1);
+        assert_eq!(
+            device.execute_inner(admin, &random),
+            Frame::error(DeviceError::LogFull)
+        );
+
+        let get = Frame::new(CommandCode::GetLogEntries as u8, Vec::new()).unwrap();
+        let log = device.execute_inner(admin, &get).data;
+        assert_eq!(log[4], 1);
+        assert_eq!(log.len(), 5 + 32);
+        let number = u16::from_be_bytes(log[5..7].try_into().unwrap());
+        let set_index = Frame::new(CommandCode::SetLogIndex as u8, number.to_be_bytes()).unwrap();
+        assert!(device.execute_inner(admin, &set_index).data.is_empty());
+        assert!(device.audit.entries.is_empty());
+    }
+
+    #[test]
+    fn meta_commands_including_session_message_are_never_audited() {
+        let mut device = Device::factory_default(DeviceConfig::default());
+        let admin = device.session_authorization(1).unwrap();
+        let meta_commands = [
+            CommandCode::Echo,
+            CommandCode::CreateSession,
+            CommandCode::AuthenticateSession,
+            CommandCode::SessionMessage,
+            CommandCode::GetDeviceInfo,
+            CommandCode::GetDevicePublicKey,
+            CommandCode::CloseSession,
+        ];
+
+        for command in meta_commands {
+            let enable_audit = Frame::new(
+                CommandCode::SetOption as u8,
+                vec![OPTION_COMMAND_AUDIT, 0, 2, command as u8, OPTION_ON],
+            )
+            .unwrap();
+            assert_eq!(
+                device.execute_inner(admin, &enable_audit),
+                Frame::error(DeviceError::InvalidData)
+            );
+
+            // Keep the execution rule fail-safe even if an invalid option map
+            // somehow reaches memory through a future state migration.
+            device
+                .options
+                .command_audit
+                .insert(command as u8, OPTION_ON);
+            assert!(!device.should_audit(command));
+        }
+        assert!(device.audit.entries.is_empty());
+    }
+
+    #[test]
+    fn attestation_contains_the_generated_target_public_key() {
+        let mut device =
+            Device::factory_default_with_device_static_private(DeviceConfig::default(), [9; 32])
+                .unwrap();
+        let admin = device.session_authorization(1).unwrap();
+        let generate = generate_asymmetric_key_request(
+            88,
+            1,
+            CapabilitySet::from_capabilities([Capability::SignEcdsa]),
+            Algorithm::EcP256 as u8,
+        );
+        assert_eq!(
+            device.execute_inner(admin, &generate).data,
+            88_u16.to_be_bytes()
+        );
+        let attest = Frame::new(
+            CommandCode::SignAttestationCertificate as u8,
+            [88_u16.to_be_bytes(), 0_u16.to_be_bytes()].concat(),
+        )
+        .unwrap();
+        let response = device.execute_inner(admin, &attest);
+        let certificate = x509_cert::Certificate::from_der(&response.data).unwrap();
+        let target = device
+            .object(ObjectKey {
+                object_type: ObjectType::AsymmetricKey,
+                id: 88,
+            })
+            .unwrap();
+        assert_eq!(
+            certificate.tbs_certificate().subject_public_key_info(),
+            &object_subject_public_key_info(target).unwrap()
+        );
     }
 }

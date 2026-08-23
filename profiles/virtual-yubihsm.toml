@@ -1,0 +1,11 @@
+schema = 1
+name = "virtual-yubihsm"
+functionfs_mount = "/dev/ffs-virtual-yubihsm"
+
+[worker]
+command = "/absolute/path/to/virtual-yubihsm-worker"
+arguments = ["--serial", "12345678"]
+run_as = "worker-account"
+readiness_timeout_ms = 10000
+state_directory = "/var/lib/virtual-yubihsm"
+runtime_directory = "/run/virtual-yubihsm"
