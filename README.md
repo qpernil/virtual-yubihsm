@@ -69,7 +69,10 @@ within the session's domain and delegated-capability ceilings.
 - versioned CBOR persistence of objects, device identity, sequence metadata,
   options and audit state, with sessions and message counters kept volatile;
 - a complete unprivileged `usb-gadget-supervisor` worker exposing the official
-  `1050:0030` full-speed bulk endpoint pair over FunctionFS.
+  `1050:0030` full-speed bulk endpoint pair over FunctionFS;
+- a native ST7789 YubiHSM display with a green strap-hole LED, its normal
+  0.5 Hz blink, short command-activity pulses, and authenticated identification
+  blinking for the duration carried by the official `Blink Device` command.
 
 All officially registered cryptographic algorithms are now represented and
 their general-purpose cryptographic command families are implemented. SSH
@@ -102,13 +105,17 @@ It receives the supervisor control channel on file descriptor 3, publishes its
 USB personality, receives the FunctionFS bulk endpoint descriptors, and passes
 each complete YubiHSM transfer to `virtual-yubihsm-core`. It clears volatile
 sessions on bind, unbind and disable events, stalls unsupported control
-requests, and participates in the supervisor's quiesce handshake. It refuses
-to run as root.
+requests, and participates in the supervisor's quiesce handshake. The display
+is lit only while the USB generation is bound and awake. Suspend, unbind,
+eject, and shutdown turn it off; resume or reinsertion restarts its normal
+0.5 Hz blink. KEY3 uses the same detach/reinsert lifecycle as `virtual-yubikey`.
+The worker refuses to run as root.
 
 [`profiles/virtual-yubihsm.toml`](profiles/virtual-yubihsm.toml) is an
 installation template for the supervisor. Replace the worker command and
-account with deployment-specific absolute values; the worker needs no named
-hardware resources.
+account with deployment-specific absolute values. Its named display and KEY3
+resources intentionally match the `virtual-yubikey` profile so either worker
+can use the same display HAT wiring.
 
 ## Development
 

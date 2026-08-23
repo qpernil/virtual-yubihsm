@@ -18,7 +18,8 @@ use std::{
     thread,
     time::Duration,
 };
-use virtual_yubihsm_core::{Device, DeviceConfig};
+use usb_gadget_worker::UsbBusEvent;
+use virtual_yubihsm_core::{CommandCode, Device, DeviceConfig};
 
 const MAX_TRANSFER: usize = u16::MAX as usize + 3;
 const ENDPOINT_RETRY_DELAY: Duration = Duration::from_millis(10);
@@ -32,10 +33,7 @@ pub(crate) fn run_worker(serial: u32, stop: &'static AtomicBool) -> io::Result<(
         ));
     }
     let control = Channel::from_fixed_descriptor();
-    let resources = validate_initial_resources(control.receive()?)?;
-    if !resources.is_empty() {
-        return invalid("virtual-yubihsm does not accept named local resources");
-    }
+    let resources = InitialResources::parse(validate_initial_resources(control.receive()?)?)?;
     let state_directory = required_path(STATE_DIRECTORY_ENV)?;
     let state_path = state_directory.join(format!("yubihsm-{serial}.cbor"));
     let config = DeviceConfig {
@@ -44,45 +42,165 @@ pub(crate) fn run_worker(serial: u32, stop: &'static AtomicBool) -> io::Result<(
     };
     let device = Arc::new(Mutex::new(load_or_create_state(config, &state_path)?));
     let personality = crate::usb_identity::personality().to_cbor()?;
-    let configure_request = 1;
-    control.send(&Record::new(
-        Kind::Configure,
-        0,
-        configure_request,
-        personality,
-    ))?;
-    let endpoints_record = control.receive()?;
-    if endpoints_record.kind == Kind::ConfigurationRejected {
-        return invalid(format!(
-            "supervisor rejected USB personality: {}",
-            String::from_utf8_lossy(&endpoints_record.body)
-        ));
-    }
-    if endpoints_record.kind != Kind::UsbEndpoints
-        || endpoints_record.generation == 0
-        || endpoints_record.request_id != configure_request
-    {
-        return invalid("expected USB endpoints for the published personality");
-    }
-    let generation = endpoints_record.generation;
-    let endpoints = Endpoints::from_record(endpoints_record)?;
-    stop.store(false, Ordering::Relaxed);
-    let runtime = EndpointRuntime::start(endpoints, Arc::clone(&device), state_path, stop)?;
-    control.send(&Record::new(
-        Kind::Serving,
-        generation,
-        configure_request,
-        Vec::new(),
-    ))?;
+    let display =
+        crate::display::Controller::start(resources.display_spi, resources.display_control)?;
+    let buttons = match crate::buttons::Controller::start(resources.reconnect_button) {
+        Ok(buttons) => buttons,
+        Err(error) => {
+            let _ = display.shutdown();
+            return Err(error);
+        }
+    };
+    let mut configure_request = 1;
+    let result = (|| {
+        control.send(&Record::new(
+            Kind::Configure,
+            0,
+            configure_request,
+            personality.clone(),
+        ))?;
+        loop {
+            let endpoints_record = control.receive()?;
+            if endpoints_record.kind == Kind::ConfigurationRejected {
+                return invalid(format!(
+                    "supervisor rejected USB personality: {}",
+                    String::from_utf8_lossy(&endpoints_record.body)
+                ));
+            }
+            if endpoints_record.kind != Kind::UsbEndpoints
+                || endpoints_record.generation == 0
+                || endpoints_record.request_id != configure_request
+            {
+                return invalid("expected USB endpoints for the published personality");
+            }
+            let generation = endpoints_record.generation;
+            let endpoints = Endpoints::from_record(endpoints_record)?;
+            stop.store(false, Ordering::Relaxed);
+            let runtime = EndpointRuntime::start(
+                endpoints,
+                Arc::clone(&device),
+                state_path.clone(),
+                stop,
+                display.activity(),
+            )?;
+            control.send(&Record::new(
+                Kind::Serving,
+                generation,
+                configure_request,
+                Vec::new(),
+            ))?;
 
+            let control_result = serve_control(
+                &control,
+                generation,
+                &device,
+                &display,
+                &buttons,
+                &mut configure_request,
+                stop,
+            );
+            stop.store(true, Ordering::Relaxed);
+            let runtime_result = runtime.shutdown();
+            let outcome = control_result?;
+            runtime_result?;
+            match outcome {
+                ControlOutcome::Quiesce {
+                    request_id,
+                    ejected,
+                } => {
+                    control.send(&Record::new(
+                        Kind::Quiesced,
+                        generation,
+                        request_id,
+                        Vec::new(),
+                    ))?;
+                    if !ejected {
+                        return Ok(());
+                    }
+                    stop.store(false, Ordering::Relaxed);
+                    if !wait_for_reinsert(
+                        &control,
+                        generation,
+                        &buttons,
+                        &personality,
+                        &mut configure_request,
+                        stop,
+                    )? {
+                        return Ok(());
+                    }
+                }
+                ControlOutcome::Exit => return Ok(()),
+            }
+        }
+    })();
+    stop.store(true, Ordering::Relaxed);
+    let button_result = buttons.shutdown();
+    let display_result = display.shutdown();
+    result.and(button_result).and(display_result)
+}
+
+struct InitialResources {
+    display_spi: File,
+    display_control: File,
+    reconnect_button: File,
+}
+
+impl InitialResources {
+    fn parse(resources: Vec<(String, File)>) -> io::Result<Self> {
+        let mut display_spi = None;
+        let mut display_control = None;
+        let mut reconnect_button = None;
+        for (name, file) in resources {
+            let target = match name.as_str() {
+                "display-spi" => &mut display_spi,
+                "display-control" => &mut display_control,
+                "reconnect-button" => &mut reconnect_button,
+                _ => return invalid(format!("unexpected initial resource {name}")),
+            };
+            if target.replace(file).is_some() {
+                return invalid(format!("duplicate initial resource {name}"));
+            }
+        }
+        Ok(Self {
+            display_spi: display_spi.ok_or_else(|| data_error("missing display-spi resource"))?,
+            display_control: display_control
+                .ok_or_else(|| data_error("missing display-control resource"))?,
+            reconnect_button: reconnect_button
+                .ok_or_else(|| data_error("missing reconnect-button resource"))?,
+        })
+    }
+}
+
+enum ControlOutcome {
+    Quiesce { request_id: u32, ejected: bool },
+    Exit,
+}
+
+fn serve_control(
+    control: &Channel<'static>,
+    generation: u32,
+    device: &Arc<Mutex<Device>>,
+    display: &crate::display::Controller,
+    buttons: &crate::buttons::Controller,
+    configure_request: &mut u32,
+    stop: &'static AtomicBool,
+) -> io::Result<ControlOutcome> {
+    let mut unconfiguration_pending = false;
     loop {
-        let mut poll_fd = libc::pollfd {
-            fd: control.as_raw_fd(),
-            events: libc::POLLIN | libc::POLLHUP | libc::POLLERR,
-            revents: 0,
-        };
-        // SAFETY: poll_fd points to one initialized pollfd.
-        let ready = unsafe { libc::poll(&mut poll_fd, 1, 250) };
+        let mut poll_fds = [
+            libc::pollfd {
+                fd: control.as_raw_fd(),
+                events: libc::POLLIN | libc::POLLHUP | libc::POLLERR,
+                revents: 0,
+            },
+            libc::pollfd {
+                fd: buttons.reconnect_descriptor(),
+                events: libc::POLLIN,
+                revents: 0,
+            },
+        ];
+        // SAFETY: poll_fds contains valid descriptors for the duration of poll.
+        let ready = unsafe { libc::poll(poll_fds.as_mut_ptr(), poll_fds.len() as _, 250) };
         if ready < 0 {
             let error = io::Error::last_os_error();
             if error.kind() == io::ErrorKind::Interrupted {
@@ -91,64 +209,174 @@ pub(crate) fn run_worker(serial: u32, stop: &'static AtomicBool) -> io::Result<(
             return Err(error);
         }
         if stop.load(Ordering::Relaxed) {
-            return runtime
-                .shutdown()
-                .and_then(|()| Err(io::Error::other("YubiHSM endpoint worker stopped")));
+            return Err(io::Error::new(
+                io::ErrorKind::Interrupted,
+                "YubiHSM endpoint generation stopped",
+            ));
         }
         if ready == 0 {
             continue;
         }
-        if poll_fd.revents & libc::POLLIN == 0 {
-            if poll_fd.revents & libc::POLLHUP != 0 {
-                stop.store(true, Ordering::Relaxed);
-                return Ok(());
+
+        if poll_fds[0].revents & libc::POLLIN != 0 {
+            let record = match control.receive() {
+                Ok(record) => record,
+                Err(error) if error.kind() == io::ErrorKind::UnexpectedEof => {
+                    return Ok(ControlOutcome::Exit);
+                }
+                Err(error) => return Err(error),
+            };
+            if record.generation != generation || !record.files.is_empty() {
+                return invalid("supervisor sent a mismatched runtime record");
             }
+            match record.kind {
+                Kind::UsbBusEvent if record.request_id == 0 => {
+                    let (event, _) = UsbBusEvent::decode(&record.body)?;
+                    if matches!(
+                        event,
+                        UsbBusEvent::Bind | UsbBusEvent::Unbind | UsbBusEvent::Disable
+                    ) {
+                        device
+                            .lock()
+                            .map_err(|_| io::Error::other("device lock poisoned"))?
+                            .clear_sessions();
+                    }
+                    match event {
+                        UsbBusEvent::Bind => display.bind()?,
+                        UsbBusEvent::Unbind => display.unbind()?,
+                        UsbBusEvent::Suspend => display.suspend()?,
+                        UsbBusEvent::Resume => display.resume()?,
+                        _ => {}
+                    }
+                }
+                Kind::UsbControlRequest if record.request_id != 0 => {
+                    control.send(&Record::new(
+                        Kind::UsbControlResponse,
+                        generation,
+                        record.request_id,
+                        vec![0],
+                    ))?;
+                }
+                Kind::Quiesce if record.body.is_empty() => {
+                    display.unbind()?;
+                    return if record.request_id == 0 {
+                        Ok(ControlOutcome::Quiesce {
+                            request_id: 0,
+                            ejected: false,
+                        })
+                    } else if unconfiguration_pending && record.request_id == *configure_request {
+                        Ok(ControlOutcome::Quiesce {
+                            request_id: record.request_id,
+                            ejected: true,
+                        })
+                    } else {
+                        invalid("supervisor quiesced an unknown configuration request")
+                    };
+                }
+                _ => return invalid(format!("unexpected runtime record {:?}", record.kind)),
+            }
+        } else if poll_fds[0].revents != 0 {
+            return if poll_fds[0].revents & libc::POLLHUP != 0 {
+                Ok(ControlOutcome::Exit)
+            } else {
+                Err(io::Error::other(format!(
+                    "worker-control descriptor reported poll events 0x{:x}",
+                    poll_fds[0].revents
+                )))
+            };
+        }
+
+        if poll_fds[1].revents & libc::POLLIN != 0
+            && !unconfiguration_pending
+            && buttons.take_reconnect_transition()? == Some(true)
+        {
+            let request_id = configure_request
+                .checked_add(1)
+                .ok_or_else(|| io::Error::other("USB configuration request overflow"))?;
+            control.send(&Record::new(
+                Kind::Configure,
+                generation,
+                request_id,
+                Vec::new(),
+            ))?;
+            *configure_request = request_id;
+            unconfiguration_pending = true;
+        }
+        let unexpected = poll_fds[1].revents & !libc::POLLIN;
+        if unexpected != 0 {
             return Err(io::Error::other(format!(
-                "worker-control descriptor reported poll events 0x{:x}",
-                poll_fd.revents
+                "reconnect notification descriptor reported poll events 0x{unexpected:x}"
             )));
         }
-        let record = match control.receive() {
-            Ok(record) => record,
-            Err(error) if error.kind() == io::ErrorKind::UnexpectedEof => {
-                stop.store(true, Ordering::Relaxed);
-                return Ok(());
+    }
+}
+
+fn wait_for_reinsert(
+    control: &Channel<'static>,
+    generation: u32,
+    buttons: &crate::buttons::Controller,
+    personality: &[u8],
+    configure_request: &mut u32,
+    stop: &'static AtomicBool,
+) -> io::Result<bool> {
+    loop {
+        let mut poll_fds = [
+            libc::pollfd {
+                fd: control.as_raw_fd(),
+                events: libc::POLLIN | libc::POLLHUP | libc::POLLERR,
+                revents: 0,
+            },
+            libc::pollfd {
+                fd: buttons.reconnect_descriptor(),
+                events: libc::POLLIN,
+                revents: 0,
+            },
+        ];
+        // SAFETY: poll_fds contains valid descriptors for the duration of poll.
+        let ready = unsafe { libc::poll(poll_fds.as_mut_ptr(), poll_fds.len() as _, 250) };
+        if ready < 0 {
+            let error = io::Error::last_os_error();
+            if error.kind() == io::ErrorKind::Interrupted {
+                continue;
             }
-            Err(error) => return Err(error),
-        };
-        if record.generation != generation || !record.files.is_empty() {
-            return invalid("supervisor sent a mismatched runtime record");
+            return Err(error);
         }
-        match record.kind {
-            Kind::UsbBusEvent if record.request_id == 0 => {
-                let event = parse_bus_event(&record.body)?;
-                if matches!(event, 0 | 1 | 3) {
-                    device
-                        .lock()
-                        .map_err(|_| io::Error::other("device lock poisoned"))?
-                        .clear_sessions();
-                }
-            }
-            Kind::UsbControlRequest if record.request_id != 0 => {
-                control.send(&Record::new(
-                    Kind::UsbControlResponse,
-                    generation,
-                    record.request_id,
-                    vec![0],
-                ))?;
-            }
-            Kind::Quiesce if record.body.is_empty() => {
-                stop.store(true, Ordering::Relaxed);
-                runtime.shutdown()?;
-                control.send(&Record::new(
-                    Kind::Quiesced,
-                    generation,
-                    record.request_id,
-                    Vec::new(),
-                ))?;
-                return Ok(());
-            }
-            _ => return invalid(format!("unexpected runtime record {:?}", record.kind)),
+        if stop.load(Ordering::Relaxed) {
+            return Ok(false);
+        }
+        if ready == 0 {
+            continue;
+        }
+        if poll_fds[0].revents != 0 {
+            return match control.receive() {
+                Err(error) if error.kind() == io::ErrorKind::UnexpectedEof => Ok(false),
+                Err(error) => Err(error),
+                Ok(record) => invalid(format!(
+                    "unexpected supervisor message while USB is ejected: {:?}",
+                    record.kind
+                )),
+            };
+        }
+        if poll_fds[1].revents & libc::POLLIN != 0
+            && buttons.take_reconnect_transition()? == Some(false)
+        {
+            let request_id = configure_request
+                .checked_add(1)
+                .ok_or_else(|| io::Error::other("USB configuration request overflow"))?;
+            control.send(&Record::new(
+                Kind::Configure,
+                generation,
+                request_id,
+                personality.to_vec(),
+            ))?;
+            *configure_request = request_id;
+            return Ok(true);
+        }
+        let unexpected = poll_fds[1].revents & !libc::POLLIN;
+        if unexpected != 0 {
+            return Err(io::Error::other(format!(
+                "reconnect notification descriptor reported poll events 0x{unexpected:x}"
+            )));
         }
     }
 }
@@ -203,10 +431,13 @@ impl EndpointRuntime {
         device: Arc<Mutex<Device>>,
         state_path: PathBuf,
         stop: &'static AtomicBool,
+        display_activity: crate::display::Activity,
     ) -> io::Result<Self> {
         let thread = thread::Builder::new()
             .name("yubihsm-usb".to_owned())
-            .spawn(move || serve_endpoint(endpoints, device, &state_path, stop))?;
+            .spawn(move || {
+                serve_endpoint(endpoints, device, &state_path, stop, display_activity)
+            })?;
         Ok(Self { thread })
     }
 
@@ -222,6 +453,7 @@ fn serve_endpoint(
     device: Arc<Mutex<Device>>,
     state_path: &Path,
     stop: &'static AtomicBool,
+    display_activity: crate::display::Activity,
 ) -> io::Result<()> {
     let result = (|| {
         let mut request = vec![0_u8; MAX_TRANSFER];
@@ -229,11 +461,21 @@ fn serve_endpoint(
             match endpoints.output.read(&mut request) {
                 Ok(0) => {}
                 Ok(length) => {
+                    display_activity.pulse();
                     let response = {
                         let mut device = device
                             .lock()
                             .map_err(|_| io::Error::other("device lock poisoned"))?;
-                        let response = device.handle_encoded(&request[..length]);
+                        let response = device.handle_encoded_observing(
+                            &request[..length],
+                            |_, request, response| {
+                                if request.command == CommandCode::BlinkDevice as u8
+                                    && response.command == (CommandCode::BlinkDevice as u8 | 0x80)
+                                {
+                                    display_activity.identify(request.data[0]);
+                                }
+                            },
+                        );
                         if device.take_persistent_change() {
                             persist_device_state(&device, state_path)?;
                         }
@@ -327,13 +569,6 @@ fn endpoint_is_gone(error: &io::Error) -> bool {
     matches!(error.raw_os_error(), Some(19 | 32 | 108))
 }
 
-fn parse_bus_event(body: &[u8]) -> io::Result<u8> {
-    if body.len() != usb_gadget_worker::USB_BUS_EVENT_BODY_LENGTH || body[0] > 6 || body[0] == 4 {
-        return invalid("invalid USB bus event");
-    }
-    Ok(body[0])
-}
-
 fn required_path(name: &str) -> io::Result<PathBuf> {
     let path = env::var_os(name)
         .filter(|value| !value.is_empty())
@@ -370,11 +605,5 @@ mod tests {
             io::ErrorKind::InvalidData
         );
         env::remove_var(name);
-    }
-
-    #[test]
-    fn validates_bus_event_shape() {
-        assert_eq!(parse_bus_event(&[2, 0, 0, 0, 0, 0, 0, 0, 1]).unwrap(), 2);
-        assert!(parse_bus_event(&[4, 0, 0, 0, 0, 0, 0, 0, 1]).is_err());
     }
 }

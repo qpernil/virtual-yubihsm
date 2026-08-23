@@ -19,6 +19,9 @@ libc = "0.2.189"
 usb-gadget-worker = { path = "../usb-gadget-supervisor/crates/usb-gadget-worker" }
 virtual-yubihsm-core = { path = "crates/virtual-yubihsm-core" }
 
+[target.'cfg(target_os = "linux")'.dependencies]
+display-backends = { path = "../display-backends" }
+
 [[bin]]
 name = "virtual-yubihsm-worker"
 path = "src/main.rs"

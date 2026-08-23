@@ -266,6 +266,22 @@ impl Device {
         response.encode()
     }
 
+    /// Process a message with the built-in implementation and observe the
+    /// decrypted command and response. The observer cannot replace device
+    /// behavior, so authorization, auditing, and state changes remain owned by
+    /// the core. This is intended for transport-adjacent effects such as a
+    /// physical activity display.
+    pub fn handle_encoded_observing<O>(&mut self, encoded: &[u8], mut observer: O) -> Vec<u8>
+    where
+        O: FnMut(SessionAuthorization, &Frame, &Frame),
+    {
+        let response = match Frame::parse(encoded) {
+            Ok(request) => self.handle_frame_with_hooks(request, &mut |_, _| None, &mut observer),
+            Err(error) => Frame::error(error),
+        };
+        response.encode()
+    }
+
     /// Process one complete outer protocol frame.
     pub fn handle_frame(&mut self, request: Frame) -> Frame {
         self.handle_frame_with(request, &mut |_, _| None)
@@ -275,6 +291,19 @@ impl Device {
     where
         F: FnMut(SessionAuthorization, &Frame) -> Option<Frame>,
     {
+        self.handle_frame_with_hooks(request, handler, &mut |_, _, _| {})
+    }
+
+    fn handle_frame_with_hooks<F, O>(
+        &mut self,
+        request: Frame,
+        handler: &mut F,
+        observer: &mut O,
+    ) -> Frame
+    where
+        F: FnMut(SessionAuthorization, &Frame) -> Option<Frame>,
+        O: FnMut(SessionAuthorization, &Frame, &Frame),
+    {
         let result = match CommandCode::from_byte(request.command) {
             Some(
                 CommandCode::Echo | CommandCode::GetDeviceInfo | CommandCode::GetDevicePublicKey,
@@ -283,7 +312,9 @@ impl Device {
             }
             Some(CommandCode::CreateSession) => self.create_session(&request.data),
             Some(CommandCode::AuthenticateSession) => self.authenticate_session(&request),
-            Some(CommandCode::SessionMessage) => self.session_message_with(&request, handler),
+            Some(CommandCode::SessionMessage) => {
+                self.session_message_with(&request, handler, observer)
+            }
             Some(_) => Err(DeviceError::InvalidSession),
             None => Err(DeviceError::InvalidCommand),
         };
@@ -438,9 +469,15 @@ impl Device {
         ))
     }
 
-    fn session_message_with<F>(&mut self, request: &Frame, handler: &mut F) -> Result<Frame>
+    fn session_message_with<F, O>(
+        &mut self,
+        request: &Frame,
+        handler: &mut F,
+        observer: &mut O,
+    ) -> Result<Frame>
     where
         F: FnMut(SessionAuthorization, &Frame) -> Option<Frame>,
+        O: FnMut(SessionAuthorization, &Frame, &Frame),
     {
         let sid = request
             .data
@@ -465,6 +502,7 @@ impl Device {
         let handled_externally = handled_response.is_some();
         let response =
             handled_response.unwrap_or_else(|| self.execute_inner(entry.authorization, &inner));
+        observer(entry.authorization, &inner, &response);
         let closes_session = matches!(
             CommandCode::from_byte(inner.command),
             Some(CommandCode::CloseSession)
@@ -768,7 +806,12 @@ impl Device {
                 self.install_factory_authentication_key();
                 Ok(Vec::new())
             }
-            CommandCode::BlinkDevice => require_empty(&request.data).map(|()| Vec::new()),
+            CommandCode::BlinkDevice => {
+                if request.data.len() != 1 {
+                    return Err(DeviceError::WrongLength);
+                }
+                Ok(Vec::new())
+            }
             _ => Err(DeviceError::InvalidCommand),
         }
     }
@@ -4391,6 +4434,20 @@ mod tests {
             assert!(!device.should_audit(command));
         }
         assert!(device.audit.entries.is_empty());
+    }
+
+    #[test]
+    fn blink_device_uses_the_official_one_byte_duration() {
+        let mut device = Device::factory_default(DeviceConfig::default());
+        let admin = device.session_authorization(1).unwrap();
+        let blink = Frame::new(CommandCode::BlinkDevice as u8, vec![10]).unwrap();
+        assert!(device.execute_inner(admin, &blink).data.is_empty());
+
+        let missing_duration = Frame::new(CommandCode::BlinkDevice as u8, Vec::new()).unwrap();
+        assert_eq!(
+            device.execute_inner(admin, &missing_duration),
+            Frame::error(DeviceError::WrongLength)
+        );
     }
 
     #[test]

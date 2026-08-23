@@ -1,6 +1,10 @@
 //! Unprivileged YubiHSM 2 protocol worker for `usb-gadget-supervisor`.
 
+#[cfg(target_os = "linux")]
+mod buttons;
 #[cfg(any(target_os = "linux", test))]
+mod display;
+#[cfg(target_os = "linux")]
 mod functionfs;
 #[cfg(any(target_os = "linux", test))]
 mod usb_identity;

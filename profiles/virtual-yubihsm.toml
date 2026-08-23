@@ -9,3 +9,27 @@ run_as = "worker-account"
 readiness_timeout_ms = 10000
 state_directory = "/var/lib/virtual-yubihsm"
 runtime_directory = "/run/virtual-yubihsm"
+
+[[resources]]
+type = "character-device"
+name = "display-spi"
+path = "/dev/spidev0.0"
+access = "read-write"
+
+[[resources]]
+type = "gpio-lines"
+name = "display-control"
+path = "/dev/gpiochip0"
+offsets = [25, 27, 24]
+direction = "output"
+initial_values = [false, false, false]
+
+[[resources]]
+type = "gpio-lines"
+name = "reconnect-button"
+path = "/dev/gpiochip0"
+offsets = [16]
+direction = "input"
+active_low = true
+bias = "pull-up"
+edge = "both"
