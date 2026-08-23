@@ -3,8 +3,9 @@ use crate::{
         random_secret_key, SecureSession, SessionEntry, AUTHENTICATION_ALGORITHM_AES128_YUBICO,
         AUTHENTICATION_ALGORITHM_EC_P256, CHALLENGE_LENGTH, P256_PUBLIC_KEY_LENGTH,
     },
-    AuthenticationKeyMaterial, Capability, CapabilitySet, CommandCode, DeviceError, Frame,
-    ObjectInfo, ObjectKey, ObjectMaterial, ObjectRecord, ObjectType, Result, SessionAuthorization,
+    Algorithm, AuthenticationKeyMaterial, Capability, CapabilitySet, CommandCode, DeviceError,
+    Frame, ObjectInfo, ObjectKey, ObjectMaterial, ObjectRecord, ObjectType, Result,
+    SessionAuthorization,
 };
 use hmac::{Hmac, Mac};
 use p256::{elliptic_curve::sec1::ToSec1Point, SecretKey};
@@ -12,8 +13,14 @@ use pbkdf2::pbkdf2_hmac;
 use sha1::Sha1;
 use sha2::{Sha256, Sha384, Sha512};
 use software_key_core::{
-    software_key_agreement::derive_with_signing_key,
+    rsa_signing::RsaHashAlgorithm,
+    software_key_agreement::{derive_with_signing_key, SoftwareX25519Key},
     software_signing::{SoftwarePublicKey, SoftwareSigningAlgorithm, SoftwareSigningKey},
+    software_symmetric::{
+        decrypt_aes_cbc, decrypt_aes_ccm, decrypt_aes_ecb, decrypt_yubico_otp_aead,
+        encrypt_aes_cbc, encrypt_aes_ccm, encrypt_aes_ecb, encrypt_yubico_otp_aead, unwrap_aes_kwp,
+        wrap_aes_kwp, AES_BLOCK_SIZE, AES_CCM_NONCE_SIZE, AES_CCM_TAG_SIZE,
+    },
 };
 use std::collections::BTreeMap;
 use subtle::ConstantTimeEq;
@@ -39,11 +46,11 @@ impl Default for DeviceConfig {
             version: [2, 4, 1],
             serial: 12_345_678,
             log_capacity: 62,
-            algorithms: vec![
-                1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 12, 13, 14, 15, 19, 20, 21, 22, 23, 24, 25, 26, 27,
-                28, 29, 30, 31, 32, 33, 34, 35, 36, 38, 41, 42, 43, 46, 49, 50, 51, 52, 53, 54, 55,
-                56,
-            ],
+            algorithms: Algorithm::OFFICIAL
+                .into_iter()
+                .chain([Algorithm::X25519])
+                .map(|algorithm| algorithm as u8)
+                .collect(),
             part_number: *b"78CLUFX5000P\0",
         }
     }
@@ -417,13 +424,54 @@ impl Device {
                 self.put_asymmetric_key(authorization, &request.data, true)
             }
             CommandCode::GetPublicKey => self.get_public_key(authorization, &request.data),
+            CommandCode::SignPkcs1 => self.sign_pkcs1(authorization, &request.data),
+            CommandCode::SignPss => self.sign_pss(authorization, &request.data),
             CommandCode::SignEcdsa => self.sign_ecdsa(authorization, &request.data),
             CommandCode::SignEddsa => self.sign_eddsa(authorization, &request.data),
             CommandCode::DeriveEcdh => self.derive_ecdh(authorization, &request.data),
+            CommandCode::DecryptPkcs1 => self.decrypt_pkcs1(authorization, &request.data),
+            CommandCode::DecryptOaep => self.decrypt_oaep(authorization, &request.data),
             CommandCode::PutHmacKey => self.put_hmac_key(authorization, &request.data, false),
             CommandCode::GenerateHmacKey => self.put_hmac_key(authorization, &request.data, true),
             CommandCode::SignHmac => self.sign_hmac(authorization, &request.data),
             CommandCode::VerifyHmac => self.verify_hmac(authorization, &request.data),
+            CommandCode::PutWrapKey => self.put_wrap_key(authorization, &request.data, false),
+            CommandCode::GenerateWrapKey => self.put_wrap_key(authorization, &request.data, true),
+            CommandCode::PutPublicWrapKey => self.put_public_wrap_key(authorization, &request.data),
+            CommandCode::WrapData => self.wrap_data(authorization, &request.data),
+            CommandCode::UnwrapData => self.unwrap_data(authorization, &request.data),
+            CommandCode::ExportWrapped => self.export_wrapped(authorization, &request.data),
+            CommandCode::ImportWrapped => self.import_wrapped(authorization, &request.data),
+            CommandCode::GetRsaWrappedKey => {
+                self.export_rsa_wrapped(authorization, &request.data, true)
+            }
+            CommandCode::PutRsaWrappedKey => self.put_rsa_wrapped_key(authorization, &request.data),
+            CommandCode::ExportRsaWrapped => {
+                self.export_rsa_wrapped(authorization, &request.data, false)
+            }
+            CommandCode::ImportRsaWrapped => self.import_rsa_wrapped(authorization, &request.data),
+            CommandCode::PutSymmetricKey => {
+                self.put_symmetric_key(authorization, &request.data, false)
+            }
+            CommandCode::GenerateSymmetricKey => {
+                self.put_symmetric_key(authorization, &request.data, true)
+            }
+            CommandCode::EncryptEcb => self.crypt_aes_ecb(authorization, &request.data, true),
+            CommandCode::DecryptEcb => self.crypt_aes_ecb(authorization, &request.data, false),
+            CommandCode::EncryptCbc => self.crypt_aes_cbc(authorization, &request.data, true),
+            CommandCode::DecryptCbc => self.crypt_aes_cbc(authorization, &request.data, false),
+            CommandCode::PutOtpAeadKey => {
+                self.put_otp_aead_key(authorization, &request.data, false)
+            }
+            CommandCode::GenerateOtpAeadKey => {
+                self.put_otp_aead_key(authorization, &request.data, true)
+            }
+            CommandCode::CreateOtpAead => self.create_otp_aead(authorization, &request.data),
+            CommandCode::RandomizeOtpAead => self.randomize_otp_aead(authorization, &request.data),
+            CommandCode::DecryptOtp => self.decrypt_otp(authorization, &request.data),
+            CommandCode::RewrapOtpAead => self.rewrap_otp_aead(authorization, &request.data),
+            CommandCode::PutTemplate => self.put_template(authorization, &request.data),
+            CommandCode::GetTemplate => self.get_template(authorization, &request.data),
             CommandCode::GetOpaque => {
                 let id = parse_u16(&request.data)?;
                 let object = self
@@ -584,22 +632,12 @@ impl Device {
         if data.len() < HEADER_LENGTH || (generate && data.len() != HEADER_LENGTH) {
             return Err(DeviceError::WrongLength);
         }
-        let algorithm = data[52];
-        let (software_algorithm, expected_length) = asymmetric_key_algorithm(algorithm)?;
-        let secret = if generate {
-            SoftwareSigningKey::generate(software_algorithm)
-                .and_then(|key| key.serialized())
-                .map_err(|_| DeviceError::StorageFailed)?
-                .to_vec()
-        } else {
-            if data.len() != HEADER_LENGTH + expected_length {
-                return Err(DeviceError::WrongLength);
-            }
-            let secret = data[HEADER_LENGTH..].to_vec();
-            SoftwareSigningKey::from_serialized(software_algorithm, &secret)
-                .map_err(|_| DeviceError::InvalidData)?;
-            secret
-        };
+        let algorithm = Algorithm::from_byte(data[52]).ok_or(DeviceError::InvalidData)?;
+        let expected_length = algorithm
+            .asymmetric_key_length()
+            .ok_or(DeviceError::InvalidData)?;
+        let supplied = &data[HEADER_LENGTH..];
+        let secret = asymmetric_key_material(algorithm, generate, supplied)?;
         if secret.len() != expected_length {
             return Err(DeviceError::InvalidData);
         }
@@ -618,7 +656,7 @@ impl Device {
             length: expected_length as u16,
             domains: u16::from_be_bytes(data[42..44].try_into().unwrap()),
             object_type: ObjectType::AsymmetricKey,
-            algorithm,
+            algorithm: algorithm as u8,
             sequence: self.allocate_sequence(),
             origin: if generate { 1 } else { 2 },
             label: trim_label(&data[2..42]),
@@ -635,19 +673,81 @@ impl Device {
     }
 
     fn get_public_key(&self, authorization: SessionAuthorization, data: &[u8]) -> Result<Vec<u8>> {
-        let id = parse_u16(data)?;
-        let object = self.asymmetric_object(authorization, id)?;
-        let key = signing_key(object)?;
+        if !matches!(data.len(), 2 | 3) {
+            return Err(DeviceError::WrongLength);
+        }
+        let id = u16::from_be_bytes(data[..2].try_into().unwrap());
+        let object_type = match data.get(2) {
+            Some(value) => ObjectType::from_byte(*value).ok_or(DeviceError::InvalidData)?,
+            None => ObjectType::AsymmetricKey,
+        };
+        if !matches!(
+            object_type,
+            ObjectType::AsymmetricKey | ObjectType::WrapKey | ObjectType::PublicWrapKey
+        ) {
+            return Err(DeviceError::InvalidData);
+        }
+        let object = self
+            .objects
+            .get(&ObjectKey { object_type, id })
+            .ok_or(DeviceError::ObjectNotFound)?;
+        authorization.require_visible(&object.info)?;
         let mut output = vec![object.info.algorithm];
-        match key.public_key() {
-            SoftwarePublicKey::Ec { uncompressed, .. } => {
-                output.extend_from_slice(&uncompressed[1..]);
+        if object.info.object_type == ObjectType::PublicWrapKey {
+            match &object.material {
+                ObjectMaterial::Public(public) => output.extend_from_slice(public),
+                _ => return Err(DeviceError::InvalidData),
             }
-            SoftwarePublicKey::Ed25519(public) => output.extend_from_slice(&public),
-            SoftwarePublicKey::Rsa { modulus, .. } => output.extend_from_slice(&modulus),
-            SoftwarePublicKey::MlDsa { public_key, .. } => output.extend_from_slice(&public_key),
+        } else if object.info.algorithm == Algorithm::X25519 as u8 {
+            output.extend_from_slice(&x25519_key(object)?.public_key());
+        } else {
+            match signing_key(object)?.public_key() {
+                SoftwarePublicKey::Ec { uncompressed, .. } => {
+                    output.extend_from_slice(&uncompressed[1..]);
+                }
+                SoftwarePublicKey::Ed25519(public) => output.extend_from_slice(&public),
+                SoftwarePublicKey::Rsa { modulus, .. } => output.extend_from_slice(&modulus),
+                SoftwarePublicKey::MlDsa { public_key, .. } => {
+                    output.extend_from_slice(&public_key)
+                }
+            }
         }
         Ok(output)
+    }
+
+    fn sign_pkcs1(&self, authorization: SessionAuthorization, data: &[u8]) -> Result<Vec<u8>> {
+        if data.len() < 3 {
+            return Err(DeviceError::WrongLength);
+        }
+        let id = u16::from_be_bytes(data[..2].try_into().unwrap());
+        let object = self.asymmetric_object(authorization, id)?;
+        authorization.authorize_use(&object.info, Capability::SignPkcs, Capability::SignPkcs)?;
+        let key = rsa_key(object)?;
+        let payload = &data[2..];
+        let signature = match rsa_hash_from_digest_length(payload.len()) {
+            Some(hash) => key.sign_rsa_pkcs1v15_digest(hash, payload),
+            None => key.sign_rsa_pkcs1v15_payload(payload),
+        };
+        signature
+            .map(|signature| signature.into_bytes())
+            .map_err(|_| DeviceError::InvalidData)
+    }
+
+    fn sign_pss(&self, authorization: SessionAuthorization, data: &[u8]) -> Result<Vec<u8>> {
+        if data.len() < 6 {
+            return Err(DeviceError::WrongLength);
+        }
+        let id = u16::from_be_bytes(data[..2].try_into().unwrap());
+        let object = self.asymmetric_object(authorization, id)?;
+        authorization.authorize_use(&object.info, Capability::SignPss, Capability::SignPss)?;
+        let mgf_hash = rsa_mgf_hash(data[2])?;
+        let salt_length = u16::from_be_bytes(data[3..5].try_into().unwrap()) as usize;
+        let digest = &data[5..];
+        let hash = rsa_hash_from_digest_length(digest.len()).ok_or(DeviceError::WrongLength)?;
+        rsa_key(object)?
+            .sign_rsa_pss_digest(hash, mgf_hash, salt_length, digest)
+            .map(|signature| signature.into_bytes())
+            .map_err(|_| DeviceError::InvalidData)
     }
 
     fn sign_ecdsa(&self, authorization: SessionAuthorization, data: &[u8]) -> Result<Vec<u8>> {
@@ -694,8 +794,59 @@ impl Device {
             Capability::DeriveEcdh,
             Capability::DeriveEcdh,
         )?;
-        derive_with_signing_key(&signing_key(object)?, &data[2..])
-            .map(|secret| secret.to_vec())
+        if object.info.algorithm == Algorithm::X25519 as u8 {
+            x25519_key(object)?
+                .derive(&data[2..])
+                .map(|secret| secret.to_vec())
+                .map_err(|_| DeviceError::InvalidData)
+        } else {
+            derive_with_signing_key(&signing_key(object)?, &data[2..])
+                .map(|secret| secret.to_vec())
+                .map_err(|_| DeviceError::InvalidData)
+        }
+    }
+
+    fn decrypt_pkcs1(&self, authorization: SessionAuthorization, data: &[u8]) -> Result<Vec<u8>> {
+        if data.len() < 3 {
+            return Err(DeviceError::WrongLength);
+        }
+        let id = u16::from_be_bytes(data[..2].try_into().unwrap());
+        let object = self.asymmetric_object(authorization, id)?;
+        authorization.authorize_use(
+            &object.info,
+            Capability::DecryptPkcs,
+            Capability::DecryptPkcs,
+        )?;
+        rsa_key(object)?
+            .decrypt_rsa_pkcs1v15(&data[2..])
+            .map(|plaintext| plaintext.to_vec())
+            .map_err(|_| DeviceError::InvalidData)
+    }
+
+    fn decrypt_oaep(&self, authorization: SessionAuthorization, data: &[u8]) -> Result<Vec<u8>> {
+        if data.len() < 3 {
+            return Err(DeviceError::WrongLength);
+        }
+        let id = u16::from_be_bytes(data[..2].try_into().unwrap());
+        let object = self.asymmetric_object(authorization, id)?;
+        authorization.authorize_use(
+            &object.info,
+            Capability::DecryptOaep,
+            Capability::DecryptOaep,
+        )?;
+        let modulus_length = object.info.length as usize;
+        let digest_length = data
+            .len()
+            .checked_sub(3 + modulus_length)
+            .ok_or(DeviceError::WrongLength)?;
+        if !matches!(digest_length, 20 | 32 | 48 | 64) {
+            return Err(DeviceError::WrongLength);
+        }
+        let mgf_hash = rsa_mgf_hash(data[2])?;
+        let ciphertext_end = 3 + modulus_length;
+        rsa_key(object)?
+            .decrypt_rsa_oaep_digest(&data[3..ciphertext_end], &data[ciphertext_end..], mgf_hash)
+            .map(|plaintext| plaintext.to_vec())
             .map_err(|_| DeviceError::InvalidData)
     }
 
@@ -767,6 +918,778 @@ impl Device {
         record.validate()?;
         self.objects.insert(record.info.key(), record);
         Ok(id.to_be_bytes().to_vec())
+    }
+
+    fn put_symmetric_key(
+        &mut self,
+        authorization: SessionAuthorization,
+        data: &[u8],
+        generate: bool,
+    ) -> Result<Vec<u8>> {
+        const HEADER_LENGTH: usize = 53;
+        if data.len() < HEADER_LENGTH || (generate && data.len() != HEADER_LENGTH) {
+            return Err(DeviceError::WrongLength);
+        }
+        let algorithm = Algorithm::from_byte(data[52]).ok_or(DeviceError::InvalidData)?;
+        let key_length = algorithm
+            .aes_key_length()
+            .filter(|_| {
+                matches!(
+                    algorithm,
+                    Algorithm::Aes128 | Algorithm::Aes192 | Algorithm::Aes256
+                )
+            })
+            .ok_or(DeviceError::InvalidData)?;
+        let secret = if generate {
+            let mut secret = vec![0; key_length];
+            getrandom::fill(&mut secret).map_err(|_| DeviceError::StorageFailed)?;
+            secret
+        } else {
+            if data.len() != HEADER_LENGTH + key_length {
+                return Err(DeviceError::WrongLength);
+            }
+            data[HEADER_LENGTH..].to_vec()
+        };
+        let id = self.resolve_id(
+            ObjectType::SymmetricKey,
+            u16::from_be_bytes(data[..2].try_into().unwrap()),
+        )?;
+        let capability = if generate {
+            Capability::GenerateSymmetricKey
+        } else {
+            Capability::PutSymmetricKey
+        };
+        let info = ObjectInfo {
+            capabilities: CapabilitySet::from_bytes(data[44..52].try_into().unwrap()),
+            id,
+            length: key_length as u16,
+            domains: u16::from_be_bytes(data[42..44].try_into().unwrap()),
+            object_type: ObjectType::SymmetricKey,
+            algorithm: algorithm as u8,
+            sequence: self.allocate_sequence(),
+            origin: if generate { 1 } else { 2 },
+            label: trim_label(&data[2..42]),
+            delegated_capabilities: CapabilitySet::NONE,
+        };
+        authorization.authorize_create(&info, capability)?;
+        let record = ObjectRecord {
+            info,
+            material: ObjectMaterial::Secret(secret),
+        };
+        record.validate()?;
+        self.objects.insert(record.info.key(), record);
+        Ok(id.to_be_bytes().to_vec())
+    }
+
+    fn put_wrap_key(
+        &mut self,
+        authorization: SessionAuthorization,
+        data: &[u8],
+        generate: bool,
+    ) -> Result<Vec<u8>> {
+        const HEADER_LENGTH: usize = 61;
+        if data.len() < HEADER_LENGTH || (generate && data.len() != HEADER_LENGTH) {
+            return Err(DeviceError::WrongLength);
+        }
+        let algorithm = Algorithm::from_byte(data[52]).ok_or(DeviceError::InvalidData)?;
+        let key_length = match algorithm {
+            Algorithm::Aes128CcmWrap | Algorithm::Aes192CcmWrap | Algorithm::Aes256CcmWrap => {
+                algorithm.aes_key_length().unwrap()
+            }
+            Algorithm::Rsa2048 | Algorithm::Rsa3072 | Algorithm::Rsa4096 => {
+                algorithm.asymmetric_key_length().unwrap()
+            }
+            _ => return Err(DeviceError::InvalidData),
+        };
+        let secret = if algorithm.is_rsa_key() {
+            asymmetric_key_material(algorithm, generate, &data[HEADER_LENGTH..])?
+        } else if generate {
+            let mut secret = vec![0; key_length];
+            getrandom::fill(&mut secret).map_err(|_| DeviceError::StorageFailed)?;
+            secret
+        } else {
+            if data.len() != HEADER_LENGTH + key_length {
+                return Err(DeviceError::WrongLength);
+            }
+            data[HEADER_LENGTH..].to_vec()
+        };
+        let id = self.resolve_id(
+            ObjectType::WrapKey,
+            u16::from_be_bytes(data[..2].try_into().unwrap()),
+        )?;
+        let capability = if generate {
+            Capability::GenerateWrapKey
+        } else {
+            Capability::PutWrapKey
+        };
+        let info = ObjectInfo {
+            capabilities: CapabilitySet::from_bytes(data[44..52].try_into().unwrap()),
+            id,
+            length: key_length as u16,
+            domains: u16::from_be_bytes(data[42..44].try_into().unwrap()),
+            object_type: ObjectType::WrapKey,
+            algorithm: algorithm as u8,
+            sequence: self.allocate_sequence(),
+            origin: if generate { 1 } else { 2 },
+            label: trim_label(&data[2..42]),
+            delegated_capabilities: CapabilitySet::from_bytes(data[53..61].try_into().unwrap()),
+        };
+        authorization.authorize_create(&info, capability)?;
+        let record = ObjectRecord {
+            info,
+            material: ObjectMaterial::Secret(secret),
+        };
+        record.validate()?;
+        self.objects.insert(record.info.key(), record);
+        Ok(id.to_be_bytes().to_vec())
+    }
+
+    fn put_public_wrap_key(
+        &mut self,
+        authorization: SessionAuthorization,
+        data: &[u8],
+    ) -> Result<Vec<u8>> {
+        const HEADER_LENGTH: usize = 61;
+        if data.len() < HEADER_LENGTH {
+            return Err(DeviceError::WrongLength);
+        }
+        let algorithm = Algorithm::from_byte(data[52]).ok_or(DeviceError::InvalidData)?;
+        if !algorithm.is_rsa_key() {
+            return Err(DeviceError::InvalidData);
+        }
+        let key_length = algorithm.asymmetric_key_length().unwrap();
+        if data.len() != HEADER_LENGTH + key_length {
+            return Err(DeviceError::WrongLength);
+        }
+        let id = self.resolve_id(
+            ObjectType::PublicWrapKey,
+            u16::from_be_bytes(data[..2].try_into().unwrap()),
+        )?;
+        let info = ObjectInfo {
+            capabilities: CapabilitySet::from_bytes(data[44..52].try_into().unwrap()),
+            id,
+            length: key_length as u16,
+            domains: u16::from_be_bytes(data[42..44].try_into().unwrap()),
+            object_type: ObjectType::PublicWrapKey,
+            algorithm: algorithm as u8,
+            sequence: self.allocate_sequence(),
+            origin: 2,
+            label: trim_label(&data[2..42]),
+            delegated_capabilities: CapabilitySet::from_bytes(data[53..61].try_into().unwrap()),
+        };
+        authorization.authorize_create(&info, Capability::PutPublicWrapKey)?;
+        let record = ObjectRecord {
+            info,
+            material: ObjectMaterial::Public(data[HEADER_LENGTH..].to_vec()),
+        };
+        record.validate()?;
+        self.objects.insert(record.info.key(), record);
+        Ok(id.to_be_bytes().to_vec())
+    }
+
+    fn wrap_data(&self, authorization: SessionAuthorization, data: &[u8]) -> Result<Vec<u8>> {
+        if data.len() < 2 {
+            return Err(DeviceError::WrongLength);
+        }
+        let id = u16::from_be_bytes(data[..2].try_into().unwrap());
+        let object = self.ccm_wrap_key(authorization, id)?;
+        authorization.authorize_use(&object.info, Capability::WrapData, Capability::WrapData)?;
+        let mut nonce = [0; AES_CCM_NONCE_SIZE];
+        getrandom::fill(&mut nonce).map_err(|_| DeviceError::StorageFailed)?;
+        let encrypted = encrypt_aes_ccm(object_secret(object)?, &nonce, &data[2..])
+            .map_err(|_| DeviceError::InvalidData)?;
+        let mut output = Vec::with_capacity(1 + AES_CCM_NONCE_SIZE + encrypted.len());
+        output.push(1);
+        output.extend_from_slice(&nonce);
+        output.extend_from_slice(&encrypted);
+        Ok(output)
+    }
+
+    fn unwrap_data(&self, authorization: SessionAuthorization, data: &[u8]) -> Result<Vec<u8>> {
+        const OVERHEAD: usize = 1 + AES_CCM_NONCE_SIZE + AES_CCM_TAG_SIZE;
+        if data.len() < 2 + OVERHEAD || data[2] != 1 {
+            return Err(DeviceError::WrongLength);
+        }
+        let id = u16::from_be_bytes(data[..2].try_into().unwrap());
+        let object = self.ccm_wrap_key(authorization, id)?;
+        authorization.authorize_use(
+            &object.info,
+            Capability::UnwrapData,
+            Capability::UnwrapData,
+        )?;
+        decrypt_aes_ccm(
+            object_secret(object)?,
+            &data[3..3 + AES_CCM_NONCE_SIZE],
+            &data[3 + AES_CCM_NONCE_SIZE..],
+        )
+        .map_err(|_| DeviceError::InvalidData)
+    }
+
+    fn export_wrapped(&self, authorization: SessionAuthorization, data: &[u8]) -> Result<Vec<u8>> {
+        if !matches!(data.len(), 5 | 6) || data.get(5).is_some_and(|format| *format > 1) {
+            return Err(DeviceError::WrongLength);
+        }
+        let wrap_id = u16::from_be_bytes(data[..2].try_into().unwrap());
+        let target_key = ObjectKey {
+            object_type: ObjectType::from_byte(data[2]).ok_or(DeviceError::InvalidData)?,
+            id: u16::from_be_bytes(data[3..5].try_into().unwrap()),
+        };
+        let wrap_key = self.ccm_wrap_key(authorization, wrap_id)?;
+        let target = self
+            .objects
+            .get(&target_key)
+            .ok_or(DeviceError::ObjectNotFound)?;
+        authorization.authorize_wrapped_export(target, wrap_key)?;
+        let plaintext = encode_wrapped_object(target)?;
+        let mut nonce = [0; AES_CCM_NONCE_SIZE];
+        getrandom::fill(&mut nonce).map_err(|_| DeviceError::StorageFailed)?;
+        let encrypted = encrypt_aes_ccm(object_secret(wrap_key)?, &nonce, &plaintext)
+            .map_err(|_| DeviceError::InvalidData)?;
+        Ok([&[1], nonce.as_slice(), encrypted.as_slice()].concat())
+    }
+
+    fn import_wrapped(
+        &mut self,
+        authorization: SessionAuthorization,
+        data: &[u8],
+    ) -> Result<Vec<u8>> {
+        const MINIMUM_LENGTH: usize = 2 + 1 + AES_CCM_NONCE_SIZE + AES_CCM_TAG_SIZE;
+        if data.len() < MINIMUM_LENGTH || data[2] != 1 {
+            return Err(DeviceError::WrongLength);
+        }
+        let wrap_id = u16::from_be_bytes(data[..2].try_into().unwrap());
+        let mut record = {
+            let wrap_key = self.ccm_wrap_key(authorization, wrap_id)?;
+            let plaintext = decrypt_aes_ccm(
+                object_secret(wrap_key)?,
+                &data[3..3 + AES_CCM_NONCE_SIZE],
+                &data[3 + AES_CCM_NONCE_SIZE..],
+            )
+            .map_err(|_| DeviceError::InvalidData)?;
+            let record = decode_wrapped_object(&plaintext)?;
+            authorization.authorize_wrapped_import(&record.info, wrap_key)?;
+            record
+        };
+        record.info.id = self.resolve_id(record.info.object_type, record.info.id)?;
+        record.info.sequence = self.allocate_sequence();
+        record.info.origin |= 0x10;
+        record.validate()?;
+        let response = [
+            &[record.info.object_type as u8],
+            record.info.id.to_be_bytes().as_slice(),
+        ]
+        .concat();
+        self.objects.insert(record.info.key(), record);
+        Ok(response)
+    }
+
+    fn export_rsa_wrapped(
+        &self,
+        authorization: SessionAuthorization,
+        data: &[u8],
+        key_material_only: bool,
+    ) -> Result<Vec<u8>> {
+        if data.len() < 8 {
+            return Err(DeviceError::WrongLength);
+        }
+        let label_length = rsa_oaep_hash(data[6])?.output_length();
+        if data.len() != 8 + label_length {
+            return Err(DeviceError::WrongLength);
+        }
+        let wrap_id = u16::from_be_bytes(data[..2].try_into().unwrap());
+        let target_key = ObjectKey {
+            object_type: ObjectType::from_byte(data[2]).ok_or(DeviceError::InvalidData)?,
+            id: u16::from_be_bytes(data[3..5].try_into().unwrap()),
+        };
+        if key_material_only
+            && !matches!(
+                target_key.object_type,
+                ObjectType::AsymmetricKey | ObjectType::SymmetricKey
+            )
+        {
+            return Err(DeviceError::InvalidData);
+        }
+        let aes_length = rsa_wrap_aes_length(data[5])?;
+        let mgf_hash = rsa_mgf_hash(data[7])?;
+        let wrap_key = self.rsa_public_wrap_key(authorization, wrap_id)?;
+        let target = self
+            .objects
+            .get(&target_key)
+            .ok_or(DeviceError::ObjectNotFound)?;
+        authorization.authorize_wrapped_export(target, wrap_key)?;
+        let plaintext = if key_material_only {
+            match target_key.object_type {
+                ObjectType::AsymmetricKey => signing_key(target)?
+                    .to_pkcs8_der()
+                    .map_err(|_| DeviceError::InvalidData)?
+                    .to_vec(),
+                ObjectType::SymmetricKey => object_secret(target)?.to_vec(),
+                _ => return Err(DeviceError::InvalidData),
+            }
+        } else {
+            encode_wrapped_object(target)?
+        };
+        let public = match &wrap_key.material {
+            ObjectMaterial::Public(modulus) => SoftwarePublicKey::Rsa {
+                modulus: modulus.clone(),
+                exponent: vec![1, 0, 1],
+            },
+            _ => return Err(DeviceError::InvalidData),
+        };
+        rsa_aes_wrap(&public, aes_length, &plaintext, &data[8..], mgf_hash)
+    }
+
+    fn import_rsa_wrapped(
+        &mut self,
+        authorization: SessionAuthorization,
+        data: &[u8],
+    ) -> Result<Vec<u8>> {
+        if data.len() < 4 {
+            return Err(DeviceError::WrongLength);
+        }
+        let label_length = rsa_oaep_hash(data[2])?.output_length();
+        let wrap_id = u16::from_be_bytes(data[..2].try_into().unwrap());
+        let mgf_hash = rsa_mgf_hash(data[3])?;
+        let mut record = {
+            let wrap_key = self.rsa_private_wrap_key(authorization, wrap_id)?;
+            let modulus_length = wrap_key.info.length as usize;
+            if data.len() < 4 + modulus_length + 16 + label_length {
+                return Err(DeviceError::WrongLength);
+            }
+            let wrapped_end = data.len() - label_length;
+            let plaintext = rsa_aes_unwrap(
+                &signing_key(wrap_key)?,
+                &data[4..wrapped_end],
+                modulus_length,
+                &data[wrapped_end..],
+                mgf_hash,
+            )?;
+            let record = decode_wrapped_object(&plaintext)?;
+            authorization.authorize_wrapped_import(&record.info, wrap_key)?;
+            record
+        };
+        record.info.id = self.resolve_id(record.info.object_type, record.info.id)?;
+        record.info.sequence = self.allocate_sequence();
+        record.info.origin |= 0x10;
+        record.validate()?;
+        let response = [
+            &[record.info.object_type as u8],
+            record.info.id.to_be_bytes().as_slice(),
+        ]
+        .concat();
+        self.objects.insert(record.info.key(), record);
+        Ok(response)
+    }
+
+    fn put_rsa_wrapped_key(
+        &mut self,
+        authorization: SessionAuthorization,
+        data: &[u8],
+    ) -> Result<Vec<u8>> {
+        const HEADER_LENGTH: usize = 58;
+        if data.len() < HEADER_LENGTH {
+            return Err(DeviceError::WrongLength);
+        }
+        let object_type = ObjectType::from_byte(data[2]).ok_or(DeviceError::InvalidData)?;
+        if !matches!(
+            object_type,
+            ObjectType::AsymmetricKey | ObjectType::SymmetricKey
+        ) {
+            return Err(DeviceError::InvalidData);
+        }
+        let algorithm = Algorithm::from_byte(data[55]).ok_or(DeviceError::InvalidData)?;
+        let label_digest_length = rsa_oaep_hash(data[56])?.output_length();
+        let mgf_hash = rsa_mgf_hash(data[57])?;
+        let wrap_id = u16::from_be_bytes(data[..2].try_into().unwrap());
+        let (material, logical_length) = {
+            let wrap_key = self.rsa_private_wrap_key(authorization, wrap_id)?;
+            let modulus_length = wrap_key.info.length as usize;
+            if data.len() <= HEADER_LENGTH + modulus_length + label_digest_length {
+                return Err(DeviceError::WrongLength);
+            }
+            let wrapped_end = data.len() - label_digest_length;
+            let plaintext = rsa_aes_unwrap(
+                &signing_key(wrap_key)?,
+                &data[HEADER_LENGTH..wrapped_end],
+                modulus_length,
+                &data[wrapped_end..],
+                mgf_hash,
+            )?;
+            import_rsa_wrapped_key_material(object_type, algorithm, &plaintext)?
+        };
+        let id = self.resolve_id(
+            object_type,
+            u16::from_be_bytes(data[3..5].try_into().unwrap()),
+        )?;
+        let info = ObjectInfo {
+            capabilities: CapabilitySet::from_bytes(data[47..55].try_into().unwrap()),
+            id,
+            length: logical_length
+                .try_into()
+                .map_err(|_| DeviceError::WrongLength)?,
+            domains: u16::from_be_bytes(data[45..47].try_into().unwrap()),
+            object_type,
+            algorithm: algorithm as u8,
+            sequence: self.allocate_sequence(),
+            origin: 0x12,
+            label: trim_label(&data[5..45]),
+            delegated_capabilities: CapabilitySet::NONE,
+        };
+        {
+            let wrap_key = self.rsa_private_wrap_key(authorization, wrap_id)?;
+            authorization.authorize_wrapped_import(&info, wrap_key)?;
+        }
+        let record = ObjectRecord { info, material };
+        record.validate()?;
+        let response = [
+            &[object_type as u8],
+            record.info.id.to_be_bytes().as_slice(),
+        ]
+        .concat();
+        self.objects.insert(record.info.key(), record);
+        Ok(response)
+    }
+
+    fn rsa_public_wrap_key(
+        &self,
+        authorization: SessionAuthorization,
+        id: u16,
+    ) -> Result<&ObjectRecord> {
+        let object = self
+            .objects
+            .get(&ObjectKey {
+                object_type: ObjectType::PublicWrapKey,
+                id,
+            })
+            .ok_or(DeviceError::ObjectNotFound)?;
+        authorization.require_visible(&object.info)?;
+        Ok(object)
+    }
+
+    fn rsa_private_wrap_key(
+        &self,
+        authorization: SessionAuthorization,
+        id: u16,
+    ) -> Result<&ObjectRecord> {
+        let object = self
+            .objects
+            .get(&ObjectKey {
+                object_type: ObjectType::WrapKey,
+                id,
+            })
+            .ok_or(DeviceError::ObjectNotFound)?;
+        authorization.require_visible(&object.info)?;
+        if !Algorithm::from_byte(object.info.algorithm).is_some_and(Algorithm::is_rsa_key) {
+            return Err(DeviceError::InvalidData);
+        }
+        Ok(object)
+    }
+
+    fn ccm_wrap_key(&self, authorization: SessionAuthorization, id: u16) -> Result<&ObjectRecord> {
+        let object = self
+            .objects
+            .get(&ObjectKey {
+                object_type: ObjectType::WrapKey,
+                id,
+            })
+            .ok_or(DeviceError::ObjectNotFound)?;
+        authorization.require_visible(&object.info)?;
+        if !matches!(
+            Algorithm::from_byte(object.info.algorithm),
+            Some(Algorithm::Aes128CcmWrap | Algorithm::Aes192CcmWrap | Algorithm::Aes256CcmWrap)
+        ) {
+            return Err(DeviceError::InvalidData);
+        }
+        Ok(object)
+    }
+
+    fn crypt_aes_ecb(
+        &self,
+        authorization: SessionAuthorization,
+        data: &[u8],
+        encrypt: bool,
+    ) -> Result<Vec<u8>> {
+        if data.len() < 2 + AES_BLOCK_SIZE || (data.len() - 2) % AES_BLOCK_SIZE != 0 {
+            return Err(DeviceError::WrongLength);
+        }
+        let id = u16::from_be_bytes(data[..2].try_into().unwrap());
+        let object = self.symmetric_object(authorization, id)?;
+        let capability = if encrypt {
+            Capability::EncryptEcb
+        } else {
+            Capability::DecryptEcb
+        };
+        authorization.authorize_use(&object.info, capability, capability)?;
+        let key = object_secret(object)?;
+        let result = if encrypt {
+            encrypt_aes_ecb(key, &data[2..])
+        } else {
+            decrypt_aes_ecb(key, &data[2..])
+        };
+        result.map_err(|_| DeviceError::InvalidData)
+    }
+
+    fn crypt_aes_cbc(
+        &self,
+        authorization: SessionAuthorization,
+        data: &[u8],
+        encrypt: bool,
+    ) -> Result<Vec<u8>> {
+        if data.len() < 2 + AES_BLOCK_SIZE * 2
+            || (data.len() - 2 - AES_BLOCK_SIZE) % AES_BLOCK_SIZE != 0
+        {
+            return Err(DeviceError::WrongLength);
+        }
+        let id = u16::from_be_bytes(data[..2].try_into().unwrap());
+        let object = self.symmetric_object(authorization, id)?;
+        let capability = if encrypt {
+            Capability::EncryptCbc
+        } else {
+            Capability::DecryptCbc
+        };
+        authorization.authorize_use(&object.info, capability, capability)?;
+        let key = object_secret(object)?;
+        let iv = &data[2..2 + AES_BLOCK_SIZE];
+        let input = &data[2 + AES_BLOCK_SIZE..];
+        let result = if encrypt {
+            encrypt_aes_cbc(key, iv, input)
+        } else {
+            decrypt_aes_cbc(key, iv, input)
+        };
+        result.map_err(|_| DeviceError::InvalidData)
+    }
+
+    fn symmetric_object(
+        &self,
+        authorization: SessionAuthorization,
+        id: u16,
+    ) -> Result<&ObjectRecord> {
+        let object = self
+            .objects
+            .get(&ObjectKey {
+                object_type: ObjectType::SymmetricKey,
+                id,
+            })
+            .ok_or(DeviceError::ObjectNotFound)?;
+        authorization.require_visible(&object.info)?;
+        if !matches!(
+            Algorithm::from_byte(object.info.algorithm),
+            Some(Algorithm::Aes128 | Algorithm::Aes192 | Algorithm::Aes256)
+        ) {
+            return Err(DeviceError::InvalidData);
+        }
+        Ok(object)
+    }
+
+    fn put_otp_aead_key(
+        &mut self,
+        authorization: SessionAuthorization,
+        data: &[u8],
+        generate: bool,
+    ) -> Result<Vec<u8>> {
+        const HEADER_LENGTH: usize = 57;
+        if data.len() < HEADER_LENGTH || (generate && data.len() != HEADER_LENGTH) {
+            return Err(DeviceError::WrongLength);
+        }
+        let algorithm = Algorithm::from_byte(data[52]).ok_or(DeviceError::InvalidData)?;
+        let key_length = match algorithm {
+            Algorithm::Aes128YubicoOtp
+            | Algorithm::Aes192YubicoOtp
+            | Algorithm::Aes256YubicoOtp => algorithm.aes_key_length().unwrap(),
+            _ => return Err(DeviceError::InvalidData),
+        };
+        let key = if generate {
+            let mut key = vec![0; key_length];
+            getrandom::fill(&mut key).map_err(|_| DeviceError::StorageFailed)?;
+            key
+        } else {
+            if data.len() != HEADER_LENGTH + key_length {
+                return Err(DeviceError::WrongLength);
+            }
+            data[HEADER_LENGTH..].to_vec()
+        };
+        let id = self.resolve_id(
+            ObjectType::OtpAeadKey,
+            u16::from_be_bytes(data[..2].try_into().unwrap()),
+        )?;
+        let capability = if generate {
+            Capability::GenerateOtpAeadKey
+        } else {
+            Capability::PutOtpAeadKey
+        };
+        let info = ObjectInfo {
+            capabilities: CapabilitySet::from_bytes(data[44..52].try_into().unwrap()),
+            id,
+            length: key_length as u16,
+            domains: u16::from_be_bytes(data[42..44].try_into().unwrap()),
+            object_type: ObjectType::OtpAeadKey,
+            algorithm: algorithm as u8,
+            sequence: self.allocate_sequence(),
+            origin: if generate { 1 } else { 2 },
+            label: trim_label(&data[2..42]),
+            delegated_capabilities: CapabilitySet::NONE,
+        };
+        authorization.authorize_create(&info, capability)?;
+        let record = ObjectRecord {
+            info,
+            material: ObjectMaterial::OtpAeadKey {
+                nonce_id: data[53..57].try_into().unwrap(),
+                key,
+            },
+        };
+        record.validate()?;
+        self.objects.insert(record.info.key(), record);
+        Ok(id.to_be_bytes().to_vec())
+    }
+
+    fn create_otp_aead(&self, authorization: SessionAuthorization, data: &[u8]) -> Result<Vec<u8>> {
+        if data.len() != 24 {
+            return Err(DeviceError::WrongLength);
+        }
+        let id = u16::from_be_bytes(data[..2].try_into().unwrap());
+        let object = self.otp_aead_key(authorization, id)?;
+        authorization.authorize_use(
+            &object.info,
+            Capability::CreateOtpAead,
+            Capability::CreateOtpAead,
+        )?;
+        otp_aead_encrypt(object, &data[2..24])
+    }
+
+    fn randomize_otp_aead(
+        &self,
+        authorization: SessionAuthorization,
+        data: &[u8],
+    ) -> Result<Vec<u8>> {
+        let id = parse_u16(data)?;
+        let object = self.otp_aead_key(authorization, id)?;
+        authorization.authorize_use(
+            &object.info,
+            Capability::RandomizeOtpAead,
+            Capability::RandomizeOtpAead,
+        )?;
+        let mut credential = [0; 22];
+        getrandom::fill(&mut credential).map_err(|_| DeviceError::StorageFailed)?;
+        otp_aead_encrypt(object, &credential)
+    }
+
+    fn decrypt_otp(&self, authorization: SessionAuthorization, data: &[u8]) -> Result<Vec<u8>> {
+        if data.len() != 54 {
+            return Err(DeviceError::WrongLength);
+        }
+        let id = u16::from_be_bytes(data[..2].try_into().unwrap());
+        let object = self.otp_aead_key(authorization, id)?;
+        authorization.authorize_use(
+            &object.info,
+            Capability::DecryptOtp,
+            Capability::DecryptOtp,
+        )?;
+        let credential = otp_aead_decrypt(object, &data[2..38])?;
+        let token = decrypt_aes_ecb(&credential[..16], &data[38..54])
+            .map_err(|_| DeviceError::InvalidData)?;
+        if token[..6] != credential[16..22] || yubico_crc16(&token) != 0xf0b8 {
+            return Err(DeviceError::InvalidOtp);
+        }
+        Ok([&token[6..8], &token[11..12], &token[10..11], &token[8..10]].concat())
+    }
+
+    fn rewrap_otp_aead(&self, authorization: SessionAuthorization, data: &[u8]) -> Result<Vec<u8>> {
+        if data.len() != 40 {
+            return Err(DeviceError::WrongLength);
+        }
+        let from = self.otp_aead_key(
+            authorization,
+            u16::from_be_bytes(data[..2].try_into().unwrap()),
+        )?;
+        let to = self.otp_aead_key(
+            authorization,
+            u16::from_be_bytes(data[2..4].try_into().unwrap()),
+        )?;
+        authorization.authorize_use(
+            &from.info,
+            Capability::RewrapFromOtpAeadKey,
+            Capability::RewrapFromOtpAeadKey,
+        )?;
+        authorization.authorize_use(
+            &to.info,
+            Capability::RewrapToOtpAeadKey,
+            Capability::RewrapToOtpAeadKey,
+        )?;
+        otp_aead_encrypt(to, &otp_aead_decrypt(from, &data[4..])?)
+    }
+
+    fn otp_aead_key(&self, authorization: SessionAuthorization, id: u16) -> Result<&ObjectRecord> {
+        let object = self
+            .objects
+            .get(&ObjectKey {
+                object_type: ObjectType::OtpAeadKey,
+                id,
+            })
+            .ok_or(DeviceError::ObjectNotFound)?;
+        authorization.require_visible(&object.info)?;
+        Ok(object)
+    }
+
+    fn put_template(
+        &mut self,
+        authorization: SessionAuthorization,
+        data: &[u8],
+    ) -> Result<Vec<u8>> {
+        const HEADER_LENGTH: usize = 53;
+        if data.len() <= HEADER_LENGTH {
+            return Err(DeviceError::WrongLength);
+        }
+        if data[52] != Algorithm::TemplateSsh as u8 {
+            return Err(DeviceError::InvalidData);
+        }
+        let material = data[HEADER_LENGTH..].to_vec();
+        let id = self.resolve_id(
+            ObjectType::Template,
+            u16::from_be_bytes(data[..2].try_into().unwrap()),
+        )?;
+        let info = ObjectInfo {
+            capabilities: CapabilitySet::from_bytes(data[44..52].try_into().unwrap()),
+            id,
+            length: material
+                .len()
+                .try_into()
+                .map_err(|_| DeviceError::WrongLength)?,
+            domains: u16::from_be_bytes(data[42..44].try_into().unwrap()),
+            object_type: ObjectType::Template,
+            algorithm: data[52],
+            sequence: self.allocate_sequence(),
+            origin: 2,
+            label: trim_label(&data[2..42]),
+            delegated_capabilities: CapabilitySet::NONE,
+        };
+        authorization.authorize_create(&info, Capability::PutTemplate)?;
+        let record = ObjectRecord {
+            info,
+            material: ObjectMaterial::Opaque(material),
+        };
+        record.validate()?;
+        self.objects.insert(record.info.key(), record);
+        Ok(id.to_be_bytes().to_vec())
+    }
+
+    fn get_template(&self, authorization: SessionAuthorization, data: &[u8]) -> Result<Vec<u8>> {
+        let id = parse_u16(data)?;
+        let object = self
+            .objects
+            .get(&ObjectKey {
+                object_type: ObjectType::Template,
+                id,
+            })
+            .ok_or(DeviceError::ObjectNotFound)?;
+        authorization.authorize_use(
+            &object.info,
+            Capability::GetTemplate,
+            Capability::GetTemplate,
+        )?;
+        match &object.material {
+            ObjectMaterial::Opaque(template) => Ok(template.clone()),
+            _ => Err(DeviceError::InvalidData),
+        }
     }
 
     fn sign_hmac(&self, authorization: SessionAuthorization, data: &[u8]) -> Result<Vec<u8>> {
@@ -937,21 +1860,399 @@ fn parse_authentication_key_material(
 
 fn asymmetric_key_algorithm(algorithm: u8) -> Result<(SoftwareSigningAlgorithm, usize)> {
     match algorithm {
+        47 => Ok((SoftwareSigningAlgorithm::EcdsaP224Sha224, 28)),
         12 => Ok((SoftwareSigningAlgorithm::EcdsaP256Sha256, 32)),
         13 => Ok((SoftwareSigningAlgorithm::EcdsaP384Sha384, 48)),
         14 => Ok((SoftwareSigningAlgorithm::EcdsaP521Sha512, 66)),
         15 => Ok((SoftwareSigningAlgorithm::EcdsaSecp256k1Sha256, 32)),
+        16 => Ok((SoftwareSigningAlgorithm::EcdsaBrainpoolP256Sha256, 32)),
+        17 => Ok((SoftwareSigningAlgorithm::EcdsaBrainpoolP384Sha384, 48)),
+        18 => Ok((SoftwareSigningAlgorithm::EcdsaBrainpoolP512Sha512, 64)),
         46 => Ok((SoftwareSigningAlgorithm::Ed25519, 32)),
         _ => Err(DeviceError::InvalidData),
     }
+}
+
+fn asymmetric_key_material(
+    algorithm: Algorithm,
+    generate: bool,
+    supplied: &[u8],
+) -> Result<Vec<u8>> {
+    let expected_length = algorithm
+        .asymmetric_key_length()
+        .ok_or(DeviceError::InvalidData)?;
+    if generate && !supplied.is_empty() {
+        return Err(DeviceError::WrongLength);
+    }
+    if algorithm == Algorithm::X25519 {
+        let key = if generate {
+            SoftwareX25519Key::generate().map_err(|_| DeviceError::StorageFailed)?
+        } else {
+            if supplied.len() != expected_length {
+                return Err(DeviceError::WrongLength);
+            }
+            SoftwareX25519Key::from_serialized(supplied).map_err(|_| DeviceError::InvalidData)?
+        };
+        return Ok(key.serialized().to_vec());
+    }
+    if algorithm.is_rsa_key() {
+        let key = if generate {
+            SoftwareSigningKey::generate_rsa(expected_length * 8)
+                .map_err(|_| DeviceError::StorageFailed)?
+        } else {
+            if supplied.len() != expected_length {
+                return Err(DeviceError::WrongLength);
+            }
+            let (p, q) = supplied.split_at(expected_length / 2);
+            SoftwareSigningKey::from_rsa_primes(p, q, &[1, 0, 1])
+                .map_err(|_| DeviceError::InvalidData)?
+        };
+        let [p, q, _, _, _] = key
+            .rsa_crt_components()
+            .map_err(|_| DeviceError::InvalidData)?;
+        let component_length = expected_length / 2;
+        let mut encoded = left_pad_component(&p, component_length)?;
+        encoded.extend_from_slice(&left_pad_component(&q, component_length)?);
+        return Ok(encoded);
+    }
+    let (software_algorithm, _) = asymmetric_key_algorithm(algorithm as u8)?;
+    let key = if generate {
+        SoftwareSigningKey::generate(software_algorithm).map_err(|_| DeviceError::StorageFailed)?
+    } else {
+        if supplied.len() != expected_length {
+            return Err(DeviceError::WrongLength);
+        }
+        SoftwareSigningKey::from_serialized(software_algorithm, supplied)
+            .map_err(|_| DeviceError::InvalidData)?
+    };
+    let secret = key
+        .serialized()
+        .map_err(|_| DeviceError::InvalidData)?
+        .to_vec();
+    if secret.len() != expected_length {
+        return Err(DeviceError::InvalidData);
+    }
+    Ok(secret)
+}
+
+fn import_rsa_wrapped_key_material(
+    object_type: ObjectType,
+    algorithm: Algorithm,
+    plaintext: &[u8],
+) -> Result<(ObjectMaterial, usize)> {
+    match object_type {
+        ObjectType::AsymmetricKey => {
+            if algorithm == Algorithm::X25519 {
+                return Err(DeviceError::InvalidData);
+            }
+            let (software_algorithm, _) = if algorithm.is_rsa_key() {
+                (SoftwareSigningAlgorithm::RsaPssSha256, 0)
+            } else {
+                asymmetric_key_algorithm(algorithm as u8)?
+            };
+            let key = SoftwareSigningKey::from_pkcs8_der(software_algorithm, plaintext)
+                .map_err(|_| DeviceError::InvalidData)?;
+            let material = if algorithm.is_rsa_key() {
+                let [p, q, _, _, _] = key
+                    .rsa_crt_components()
+                    .map_err(|_| DeviceError::InvalidData)?;
+                let logical_length = algorithm.asymmetric_key_length().unwrap();
+                let component_length = logical_length / 2;
+                let mut encoded = left_pad_component(&p, component_length)?;
+                encoded.extend_from_slice(&left_pad_component(&q, component_length)?);
+                encoded
+            } else {
+                key.serialized()
+                    .map_err(|_| DeviceError::InvalidData)?
+                    .to_vec()
+            };
+            let logical_length = algorithm
+                .asymmetric_key_length()
+                .ok_or(DeviceError::InvalidData)?;
+            if material.len() != logical_length {
+                return Err(DeviceError::InvalidData);
+            }
+            Ok((ObjectMaterial::Secret(material), logical_length))
+        }
+        ObjectType::SymmetricKey => {
+            let key_length = match algorithm {
+                Algorithm::Aes128 | Algorithm::Aes192 | Algorithm::Aes256 => {
+                    algorithm.aes_key_length().unwrap()
+                }
+                _ => return Err(DeviceError::InvalidData),
+            };
+            if plaintext.len() != key_length {
+                return Err(DeviceError::WrongLength);
+            }
+            Ok((ObjectMaterial::Secret(plaintext.to_vec()), key_length))
+        }
+        _ => Err(DeviceError::InvalidData),
+    }
+}
+
+fn left_pad_component(component: &[u8], length: usize) -> Result<Vec<u8>> {
+    if component.len() > length {
+        return Err(DeviceError::InvalidData);
+    }
+    let mut padded = vec![0; length];
+    padded[length - component.len()..].copy_from_slice(component);
+    Ok(padded)
 }
 
 fn signing_key(object: &ObjectRecord) -> Result<SoftwareSigningKey> {
     let ObjectMaterial::Secret(secret) = &object.material else {
         return Err(DeviceError::InvalidData);
     };
+    let algorithm = Algorithm::from_byte(object.info.algorithm).ok_or(DeviceError::InvalidData)?;
+    if algorithm.is_rsa_key() {
+        if secret.len() != object.info.length as usize || secret.len() % 2 != 0 {
+            return Err(DeviceError::InvalidData);
+        }
+        let (p, q) = secret.split_at(secret.len() / 2);
+        return SoftwareSigningKey::from_rsa_primes(p, q, &[1, 0, 1])
+            .map_err(|_| DeviceError::InvalidData);
+    }
     let (algorithm, _) = asymmetric_key_algorithm(object.info.algorithm)?;
     SoftwareSigningKey::from_serialized(algorithm, secret).map_err(|_| DeviceError::InvalidData)
+}
+
+fn rsa_key(object: &ObjectRecord) -> Result<SoftwareSigningKey> {
+    let algorithm = Algorithm::from_byte(object.info.algorithm).ok_or(DeviceError::InvalidData)?;
+    if !algorithm.is_rsa_key() {
+        return Err(DeviceError::InvalidData);
+    }
+    signing_key(object)
+}
+
+fn x25519_key(object: &ObjectRecord) -> Result<SoftwareX25519Key> {
+    if object.info.algorithm != Algorithm::X25519 as u8 {
+        return Err(DeviceError::InvalidData);
+    }
+    let ObjectMaterial::Secret(secret) = &object.material else {
+        return Err(DeviceError::InvalidData);
+    };
+    SoftwareX25519Key::from_serialized(secret).map_err(|_| DeviceError::InvalidData)
+}
+
+fn object_secret(object: &ObjectRecord) -> Result<&[u8]> {
+    match &object.material {
+        ObjectMaterial::Secret(secret) => Ok(secret),
+        _ => Err(DeviceError::InvalidData),
+    }
+}
+
+fn otp_aead_material(object: &ObjectRecord) -> Result<(&[u8; 4], &[u8])> {
+    match &object.material {
+        ObjectMaterial::OtpAeadKey { nonce_id, key } => Ok((nonce_id, key)),
+        _ => Err(DeviceError::InvalidData),
+    }
+}
+
+fn otp_aead_encrypt(object: &ObjectRecord, credential: &[u8]) -> Result<Vec<u8>> {
+    if credential.len() != 22 {
+        return Err(DeviceError::WrongLength);
+    }
+    let (nonce_id, key) = otp_aead_material(object)?;
+    let mut nonce = [0; AES_CCM_NONCE_SIZE];
+    nonce[..4].copy_from_slice(nonce_id);
+    getrandom::fill(&mut nonce[4..10]).map_err(|_| DeviceError::StorageFailed)?;
+    let encrypted =
+        encrypt_yubico_otp_aead(key, &nonce, credential).map_err(|_| DeviceError::InvalidData)?;
+    Ok([&nonce[4..10], encrypted.as_slice()].concat())
+}
+
+fn otp_aead_decrypt(object: &ObjectRecord, aead: &[u8]) -> Result<Vec<u8>> {
+    if aead.len() != 36 {
+        return Err(DeviceError::WrongLength);
+    }
+    let (nonce_id, key) = otp_aead_material(object)?;
+    let mut nonce = [0; AES_CCM_NONCE_SIZE];
+    nonce[..4].copy_from_slice(nonce_id);
+    nonce[4..10].copy_from_slice(&aead[..6]);
+    decrypt_yubico_otp_aead(key, &nonce, &aead[6..]).map_err(|_| DeviceError::InvalidOtp)
+}
+
+fn yubico_crc16(data: &[u8]) -> u16 {
+    let mut crc = 0xffff_u16;
+    for byte in data {
+        crc ^= u16::from(*byte);
+        for _ in 0..8 {
+            crc = if crc & 1 != 0 {
+                (crc >> 1) ^ 0x8408
+            } else {
+                crc >> 1
+            };
+        }
+    }
+    crc
+}
+
+fn encode_wrapped_object(object: &ObjectRecord) -> Result<Vec<u8>> {
+    let (material_kind, payload) = match &object.material {
+        ObjectMaterial::Secret(value) => (0, value.clone()),
+        ObjectMaterial::Opaque(value) => (1, value.clone()),
+        ObjectMaterial::Public(value) => (2, value.clone()),
+        ObjectMaterial::Authentication(AuthenticationKeyMaterial::Symmetric(value)) => {
+            (3, value.clone())
+        }
+        ObjectMaterial::Authentication(AuthenticationKeyMaterial::Asymmetric(value)) => {
+            (4, value.clone())
+        }
+        ObjectMaterial::OtpAeadKey { nonce_id, key } => {
+            (5, [nonce_id.as_slice(), key.as_slice()].concat())
+        }
+    };
+    let payload_length: u16 = payload
+        .len()
+        .try_into()
+        .map_err(|_| DeviceError::WrongLength)?;
+    let mut output = Vec::with_capacity(71 + payload.len());
+    output.extend_from_slice(b"VYH2");
+    output.push(object.info.object_type as u8);
+    output.extend_from_slice(&object.info.id.to_be_bytes());
+    output.extend_from_slice(&object.info.domains.to_be_bytes());
+    output.extend_from_slice(&object.info.capabilities.to_bytes());
+    output.push(object.info.algorithm);
+    output.push(object.info.origin & 0x0f);
+    let mut label = [0; 40];
+    label[..object.info.label.len()].copy_from_slice(&object.info.label);
+    output.extend_from_slice(&label);
+    output.extend_from_slice(&object.info.delegated_capabilities.to_bytes());
+    output.push(material_kind);
+    output.extend_from_slice(&payload_length.to_be_bytes());
+    output.extend_from_slice(&payload);
+    Ok(output)
+}
+
+fn decode_wrapped_object(mut data: &[u8]) -> Result<ObjectRecord> {
+    let version = take(&mut data, 4)?;
+    if !matches!(version, b"VYH1" | b"VYH2") {
+        return Err(DeviceError::InvalidData);
+    }
+    let object_type =
+        ObjectType::from_byte(take(&mut data, 1)?[0]).ok_or(DeviceError::InvalidData)?;
+    let id = u16::from_be_bytes(take(&mut data, 2)?.try_into().unwrap());
+    let domains = u16::from_be_bytes(take(&mut data, 2)?.try_into().unwrap());
+    let capabilities = CapabilitySet::from_bytes(take(&mut data, 8)?.try_into().unwrap());
+    let algorithm = take(&mut data, 1)?[0];
+    let origin = if version == b"VYH2" {
+        take(&mut data, 1)?[0] & 0x0f
+    } else {
+        0
+    };
+    let label = trim_label(take(&mut data, 40)?);
+    let delegated_capabilities = CapabilitySet::from_bytes(take(&mut data, 8)?.try_into().unwrap());
+    let material_kind = take(&mut data, 1)?[0];
+    let payload_length = u16::from_be_bytes(take(&mut data, 2)?.try_into().unwrap()) as usize;
+    let payload = take(&mut data, payload_length)?;
+    if !data.is_empty() {
+        return Err(DeviceError::WrongLength);
+    }
+    let material = match material_kind {
+        0 => ObjectMaterial::Secret(payload.to_vec()),
+        1 => ObjectMaterial::Opaque(payload.to_vec()),
+        2 => ObjectMaterial::Public(payload.to_vec()),
+        3 => ObjectMaterial::Authentication(AuthenticationKeyMaterial::Symmetric(payload.to_vec())),
+        4 => {
+            ObjectMaterial::Authentication(AuthenticationKeyMaterial::Asymmetric(payload.to_vec()))
+        }
+        5 if payload.len() >= 4 => ObjectMaterial::OtpAeadKey {
+            nonce_id: payload[..4].try_into().unwrap(),
+            key: payload[4..].to_vec(),
+        },
+        _ => return Err(DeviceError::InvalidData),
+    };
+    let record = ObjectRecord {
+        info: ObjectInfo {
+            capabilities,
+            id,
+            length: material.len() as u16,
+            domains,
+            object_type,
+            algorithm,
+            sequence: 0,
+            origin,
+            label,
+            delegated_capabilities,
+        },
+        material,
+    };
+    record.validate()?;
+    Ok(record)
+}
+
+fn rsa_oaep_hash(algorithm: u8) -> Result<RsaHashAlgorithm> {
+    match Algorithm::from_byte(algorithm) {
+        Some(Algorithm::RsaOaepSha1) => Ok(RsaHashAlgorithm::Sha1),
+        Some(Algorithm::RsaOaepSha256) => Ok(RsaHashAlgorithm::Sha256),
+        Some(Algorithm::RsaOaepSha384) => Ok(RsaHashAlgorithm::Sha384),
+        Some(Algorithm::RsaOaepSha512) => Ok(RsaHashAlgorithm::Sha512),
+        _ => Err(DeviceError::InvalidData),
+    }
+}
+
+fn rsa_wrap_aes_length(algorithm: u8) -> Result<usize> {
+    match Algorithm::from_byte(algorithm) {
+        Some(Algorithm::Aes128) => Ok(16),
+        Some(Algorithm::Aes192) => Ok(24),
+        Some(Algorithm::Aes256) => Ok(32),
+        _ => Err(DeviceError::InvalidData),
+    }
+}
+
+fn rsa_aes_wrap(
+    public_key: &SoftwarePublicKey,
+    aes_length: usize,
+    plaintext: &[u8],
+    label_digest: &[u8],
+    mgf_hash: RsaHashAlgorithm,
+) -> Result<Vec<u8>> {
+    let mut aes_key = Zeroizing::new(vec![0; aes_length]);
+    getrandom::fill(&mut aes_key).map_err(|_| DeviceError::StorageFailed)?;
+    let encrypted_key = public_key
+        .encrypt_rsa_oaep_digest(&aes_key, label_digest, mgf_hash)
+        .map_err(|_| DeviceError::InvalidData)?;
+    let wrapped = wrap_aes_kwp(&aes_key, plaintext).map_err(|_| DeviceError::InvalidData)?;
+    Ok([encrypted_key.as_slice(), wrapped.as_slice()].concat())
+}
+
+fn rsa_aes_unwrap(
+    private_key: &SoftwareSigningKey,
+    wrapped: &[u8],
+    modulus_length: usize,
+    label_digest: &[u8],
+    mgf_hash: RsaHashAlgorithm,
+) -> Result<Vec<u8>> {
+    if wrapped.len() <= modulus_length {
+        return Err(DeviceError::WrongLength);
+    }
+    let aes_key = private_key
+        .decrypt_rsa_oaep_digest(&wrapped[..modulus_length], label_digest, mgf_hash)
+        .map_err(|_| DeviceError::InvalidData)?;
+    if !matches!(aes_key.len(), 16 | 24 | 32) {
+        return Err(DeviceError::InvalidData);
+    }
+    unwrap_aes_kwp(&aes_key, &wrapped[modulus_length..]).map_err(|_| DeviceError::InvalidData)
+}
+
+fn rsa_hash_from_digest_length(length: usize) -> Option<RsaHashAlgorithm> {
+    match length {
+        20 => Some(RsaHashAlgorithm::Sha1),
+        32 => Some(RsaHashAlgorithm::Sha256),
+        48 => Some(RsaHashAlgorithm::Sha384),
+        64 => Some(RsaHashAlgorithm::Sha512),
+        _ => None,
+    }
+}
+
+fn rsa_mgf_hash(algorithm: u8) -> Result<RsaHashAlgorithm> {
+    match Algorithm::from_byte(algorithm) {
+        Some(Algorithm::Mgf1Sha1) => Ok(RsaHashAlgorithm::Sha1),
+        Some(Algorithm::Mgf1Sha256) => Ok(RsaHashAlgorithm::Sha256),
+        Some(Algorithm::Mgf1Sha384) => Ok(RsaHashAlgorithm::Sha384),
+        Some(Algorithm::Mgf1Sha512) => Ok(RsaHashAlgorithm::Sha512),
+        _ => Err(DeviceError::InvalidData),
+    }
 }
 
 fn hmac_length(algorithm: u8) -> Result<usize> {
@@ -1145,6 +2446,62 @@ mod tests {
         data.extend_from_slice(&capabilities.to_bytes());
         data.push(algorithm);
         Frame::new(CommandCode::GenerateAsymmetricKey as u8, data).unwrap()
+    }
+
+    fn put_symmetric_key_request(
+        id: u16,
+        domains: u16,
+        capabilities: CapabilitySet,
+        algorithm: Algorithm,
+        key: &[u8],
+    ) -> Frame {
+        let mut data = Vec::new();
+        data.extend_from_slice(&id.to_be_bytes());
+        data.extend_from_slice(b"symmetric key");
+        data.resize(42, 0);
+        data.extend_from_slice(&domains.to_be_bytes());
+        data.extend_from_slice(&capabilities.to_bytes());
+        data.push(algorithm as u8);
+        data.extend_from_slice(key);
+        Frame::new(CommandCode::PutSymmetricKey as u8, data).unwrap()
+    }
+
+    fn put_wrap_key_request(
+        id: u16,
+        algorithm: Algorithm,
+        capabilities: CapabilitySet,
+        delegated_capabilities: CapabilitySet,
+        key: &[u8],
+    ) -> Frame {
+        let mut data = Vec::new();
+        data.extend_from_slice(&id.to_be_bytes());
+        data.extend_from_slice(b"wrap key");
+        data.resize(42, 0);
+        data.extend_from_slice(&1_u16.to_be_bytes());
+        data.extend_from_slice(&capabilities.to_bytes());
+        data.push(algorithm as u8);
+        data.extend_from_slice(&delegated_capabilities.to_bytes());
+        data.extend_from_slice(key);
+        Frame::new(CommandCode::PutWrapKey as u8, data).unwrap()
+    }
+
+    fn put_otp_aead_key_request(
+        id: u16,
+        capabilities: CapabilitySet,
+        algorithm: Algorithm,
+        nonce_id: u32,
+        key: &[u8],
+    ) -> Frame {
+        let mut data = Vec::new();
+        data.extend_from_slice(&id.to_be_bytes());
+        data.extend_from_slice(b"OTP AEAD key");
+        data.resize(42, 0);
+        data.extend_from_slice(&1_u16.to_be_bytes());
+        data.extend_from_slice(&capabilities.to_bytes());
+        data.push(algorithm as u8);
+        data.extend_from_slice(&nonce_id.to_le_bytes());
+        data.extend_from_slice(key);
+        Frame::new(CommandCode::PutOtpAeadKey as u8, data).unwrap()
     }
 
     #[test]
@@ -1425,6 +2782,568 @@ mod tests {
             device.execute_inner(wrong_domain, &sign),
             Frame::error(DeviceError::ObjectNotFound)
         );
+    }
+
+    #[test]
+    fn rsa_generation_and_pkcs1_signing_use_the_official_wire_format() {
+        let mut device = Device::factory_default(DeviceConfig::default());
+        let admin = device.session_authorization(1).unwrap();
+        let capabilities = CapabilitySet::from_capabilities([
+            Capability::SignPkcs,
+            Capability::SignPss,
+            Capability::DecryptPkcs,
+            Capability::DecryptOaep,
+        ]);
+        let generate =
+            generate_asymmetric_key_request(43, 1, capabilities, Algorithm::Rsa2048 as u8);
+        assert_eq!(
+            device.execute_inner(admin, &generate).data,
+            43_u16.to_be_bytes()
+        );
+
+        let get_public = Frame::new(CommandCode::GetPublicKey as u8, 43_u16.to_be_bytes()).unwrap();
+        let public_response = device.execute_inner(admin, &get_public);
+        assert_eq!(public_response.data[0], Algorithm::Rsa2048 as u8);
+        assert_eq!(public_response.data.len(), 257);
+        let public = SoftwarePublicKey::Rsa {
+            modulus: public_response.data[1..].to_vec(),
+            exponent: vec![1, 0, 1],
+        };
+        let digest = Sha256::digest(b"virtual YubiHSM RSA command");
+        let sign = Frame::new(
+            CommandCode::SignPkcs1 as u8,
+            [43_u16.to_be_bytes().as_slice(), digest.as_slice()].concat(),
+        )
+        .unwrap();
+        let signature = device.execute_inner(admin, &sign);
+        assert_eq!(signature.data.len(), 256);
+        public
+            .verify_prehash(
+                SoftwareSigningAlgorithm::RsaPkcs1Sha256,
+                &digest,
+                &signature.data,
+            )
+            .unwrap();
+
+        let plaintext = b"RSA decryption command";
+        let ciphertext = public.encrypt_rsa_pkcs1v15(plaintext).unwrap();
+        let decrypt = Frame::new(
+            CommandCode::DecryptPkcs1 as u8,
+            [43_u16.to_be_bytes().as_slice(), ciphertext.as_slice()].concat(),
+        )
+        .unwrap();
+        assert_eq!(device.execute_inner(admin, &decrypt).data, plaintext);
+
+        let label_digest = RsaHashAlgorithm::Sha256.digest(b"OAEP label");
+        let ciphertext = public
+            .encrypt_rsa_oaep_digest(plaintext, &label_digest, RsaHashAlgorithm::Sha384)
+            .unwrap();
+        let decrypt = Frame::new(
+            CommandCode::DecryptOaep as u8,
+            [
+                43_u16.to_be_bytes().as_slice(),
+                &[Algorithm::Mgf1Sha384 as u8],
+                ciphertext.as_slice(),
+                label_digest.as_slice(),
+            ]
+            .concat(),
+        )
+        .unwrap();
+        assert_eq!(device.execute_inner(admin, &decrypt).data, plaintext);
+    }
+
+    #[test]
+    fn x25519_extension_generates_exports_and_derives_raw_shared_secrets() {
+        let mut device = Device::factory_default(DeviceConfig::default());
+        let admin = device.session_authorization(1).unwrap();
+        let capabilities = CapabilitySet::from_capabilities([Capability::DeriveEcdh]);
+        for id in [44, 45] {
+            let request =
+                generate_asymmetric_key_request(id, 1, capabilities, Algorithm::X25519 as u8);
+            assert_eq!(device.execute_inner(admin, &request).data, id.to_be_bytes());
+        }
+        let public = |device: &mut Device, id: u16| {
+            let request = Frame::new(CommandCode::GetPublicKey as u8, id.to_be_bytes()).unwrap();
+            let response = device.execute_inner(admin, &request);
+            assert_eq!(response.data[0], Algorithm::X25519 as u8);
+            response.data[1..].to_vec()
+        };
+        let first_public = public(&mut device, 44);
+        let second_public = public(&mut device, 45);
+        let derive = |device: &mut Device, id: u16, peer: &[u8]| {
+            let request = Frame::new(
+                CommandCode::DeriveEcdh as u8,
+                [id.to_be_bytes().as_slice(), peer].concat(),
+            )
+            .unwrap();
+            device.execute_inner(admin, &request).data
+        };
+        assert_eq!(
+            derive(&mut device, 44, &second_public),
+            derive(&mut device, 45, &first_public)
+        );
+    }
+
+    #[test]
+    fn every_official_ec_key_algorithm_is_available_through_device_commands() {
+        let mut device = Device::factory_default(DeviceConfig::default());
+        let admin = device.session_authorization(1).unwrap();
+        let capabilities =
+            CapabilitySet::from_capabilities([Capability::SignEcdsa, Capability::DeriveEcdh]);
+        for (id, algorithm, coordinate_length) in [
+            (80, Algorithm::EcP224, 28),
+            (81, Algorithm::EcP256, 32),
+            (82, Algorithm::EcP384, 48),
+            (83, Algorithm::EcP521, 66),
+            (84, Algorithm::EcK256, 32),
+            (85, Algorithm::EcBrainpoolP256, 32),
+            (86, Algorithm::EcBrainpoolP384, 48),
+            (87, Algorithm::EcBrainpoolP512, 64),
+        ] {
+            let generate = generate_asymmetric_key_request(id, 1, capabilities, algorithm as u8);
+            assert_eq!(
+                device.execute_inner(admin, &generate).data,
+                id.to_be_bytes()
+            );
+            let public = Frame::new(CommandCode::GetPublicKey as u8, id.to_be_bytes()).unwrap();
+            let public = device.execute_inner(admin, &public).data;
+            assert_eq!(public[0], algorithm as u8);
+            assert_eq!(public.len(), 1 + coordinate_length * 2);
+            let sign = Frame::new(
+                CommandCode::SignEcdsa as u8,
+                [id.to_be_bytes().as_slice(), &[0x5a; 64]].concat(),
+            )
+            .unwrap();
+            assert_eq!(
+                device.execute_inner(admin, &sign).data.len(),
+                coordinate_length * 2
+            );
+        }
+    }
+
+    #[test]
+    fn symmetric_key_commands_cover_aes_128_192_and_256_ecb_and_cbc() {
+        let mut device = Device::factory_default(DeviceConfig::default());
+        let admin = device.session_authorization(1).unwrap();
+        let capabilities = CapabilitySet::from_capabilities([
+            Capability::EncryptEcb,
+            Capability::DecryptEcb,
+            Capability::EncryptCbc,
+            Capability::DecryptCbc,
+        ]);
+        let plaintext = [0x5a; AES_BLOCK_SIZE * 2];
+        let iv = [0xa5; AES_BLOCK_SIZE];
+        for (id, algorithm, key_length) in [
+            (50, Algorithm::Aes128, 16),
+            (51, Algorithm::Aes192, 24),
+            (52, Algorithm::Aes256, 32),
+        ] {
+            let key = vec![id as u8; key_length];
+            let put = put_symmetric_key_request(id, 1, capabilities, algorithm, &key);
+            assert_eq!(device.execute_inner(admin, &put).data, id.to_be_bytes());
+
+            let ecb_encrypt = Frame::new(
+                CommandCode::EncryptEcb as u8,
+                [id.to_be_bytes().as_slice(), plaintext.as_slice()].concat(),
+            )
+            .unwrap();
+            let ciphertext = device.execute_inner(admin, &ecb_encrypt).data;
+            assert_ne!(ciphertext, plaintext);
+            let ecb_decrypt = Frame::new(
+                CommandCode::DecryptEcb as u8,
+                [id.to_be_bytes().as_slice(), ciphertext.as_slice()].concat(),
+            )
+            .unwrap();
+            assert_eq!(device.execute_inner(admin, &ecb_decrypt).data, plaintext);
+
+            let cbc_encrypt = Frame::new(
+                CommandCode::EncryptCbc as u8,
+                [
+                    id.to_be_bytes().as_slice(),
+                    iv.as_slice(),
+                    plaintext.as_slice(),
+                ]
+                .concat(),
+            )
+            .unwrap();
+            let ciphertext = device.execute_inner(admin, &cbc_encrypt).data;
+            let cbc_decrypt = Frame::new(
+                CommandCode::DecryptCbc as u8,
+                [
+                    id.to_be_bytes().as_slice(),
+                    iv.as_slice(),
+                    ciphertext.as_slice(),
+                ]
+                .concat(),
+            )
+            .unwrap();
+            assert_eq!(device.execute_inner(admin, &cbc_decrypt).data, plaintext);
+        }
+    }
+
+    #[test]
+    fn aes_ccm_wrap_data_uses_version_nonce_ciphertext_and_tag() {
+        let mut device = Device::factory_default(DeviceConfig::default());
+        let admin = device.session_authorization(1).unwrap();
+        let capabilities =
+            CapabilitySet::from_capabilities([Capability::WrapData, Capability::UnwrapData]);
+        for (id, algorithm, key_length) in [
+            (60, Algorithm::Aes128CcmWrap, 16),
+            (61, Algorithm::Aes192CcmWrap, 24),
+            (62, Algorithm::Aes256CcmWrap, 32),
+        ] {
+            let put = put_wrap_key_request(
+                id,
+                algorithm,
+                capabilities,
+                CapabilitySet::NONE,
+                &vec![id as u8; key_length],
+            );
+            assert_eq!(device.execute_inner(admin, &put).data, id.to_be_bytes());
+            let plaintext = b"arbitrary authenticated data";
+            let wrap = Frame::new(
+                CommandCode::WrapData as u8,
+                [id.to_be_bytes().as_slice(), plaintext.as_slice()].concat(),
+            )
+            .unwrap();
+            let wrapped = device.execute_inner(admin, &wrap).data;
+            assert_eq!(wrapped[0], 1);
+            assert_eq!(wrapped.len(), plaintext.len() + 1 + 13 + 16);
+            let unwrap = Frame::new(
+                CommandCode::UnwrapData as u8,
+                [id.to_be_bytes().as_slice(), wrapped.as_slice()].concat(),
+            )
+            .unwrap();
+            assert_eq!(device.execute_inner(admin, &unwrap).data, plaintext);
+
+            let mut tampered = wrapped;
+            *tampered.last_mut().unwrap() ^= 1;
+            let unwrap = Frame::new(
+                CommandCode::UnwrapData as u8,
+                [id.to_be_bytes().as_slice(), tampered.as_slice()].concat(),
+            )
+            .unwrap();
+            assert_eq!(
+                device.execute_inner(admin, &unwrap),
+                Frame::error(DeviceError::InvalidData)
+            );
+        }
+    }
+
+    #[test]
+    fn wrapped_object_round_trip_preserves_policy_and_material() {
+        let mut device = Device::factory_default(DeviceConfig::default());
+        let admin = device.session_authorization(1).unwrap();
+        let target_capabilities = CapabilitySet::from_capabilities([
+            Capability::GetOpaque,
+            Capability::ExportableUnderWrap,
+        ]);
+        let wrap_capabilities = CapabilitySet::from_capabilities([
+            Capability::ExportWrapped,
+            Capability::ImportWrapped,
+        ]);
+        let put_wrap = put_wrap_key_request(
+            65,
+            Algorithm::Aes256CcmWrap,
+            wrap_capabilities,
+            target_capabilities,
+            &[0x65; 32],
+        );
+        assert_eq!(
+            device.execute_inner(admin, &put_wrap).data,
+            65_u16.to_be_bytes()
+        );
+        let put_target = put_opaque_request(66, 1, target_capabilities);
+        assert_eq!(
+            device.execute_inner(admin, &put_target).data,
+            66_u16.to_be_bytes()
+        );
+
+        let export = Frame::new(
+            CommandCode::ExportWrapped as u8,
+            [
+                65_u16.to_be_bytes().as_slice(),
+                &[ObjectType::Opaque as u8],
+                66_u16.to_be_bytes().as_slice(),
+            ]
+            .concat(),
+        )
+        .unwrap();
+        let wrapped = device.execute_inner(admin, &export).data;
+        let delete = Frame::new(
+            CommandCode::DeleteObject as u8,
+            [66_u16.to_be_bytes().as_slice(), &[ObjectType::Opaque as u8]].concat(),
+        )
+        .unwrap();
+        assert!(device.execute_inner(admin, &delete).data.is_empty());
+
+        let import = Frame::new(
+            CommandCode::ImportWrapped as u8,
+            [65_u16.to_be_bytes().as_slice(), wrapped.as_slice()].concat(),
+        )
+        .unwrap();
+        assert_eq!(
+            device.execute_inner(admin, &import).data,
+            [ObjectType::Opaque as u8, 0, 66]
+        );
+        let restored = device
+            .object(ObjectKey {
+                object_type: ObjectType::Opaque,
+                id: 66,
+            })
+            .unwrap();
+        assert_eq!(restored.info.origin, 0x12);
+        assert_eq!(restored.info.capabilities, target_capabilities);
+        assert_eq!(
+            restored.material,
+            ObjectMaterial::Opaque(b"payload".to_vec())
+        );
+    }
+
+    #[test]
+    fn rsa_aes_key_wrap_round_trip_uses_oaep_and_aes_kwp() {
+        let mut device = Device::factory_default(DeviceConfig::default());
+        let admin = device.session_authorization(1).unwrap();
+        let opaque_capabilities = CapabilitySet::from_capabilities([
+            Capability::GetOpaque,
+            Capability::ExportableUnderWrap,
+        ]);
+        let delegated_capabilities = CapabilitySet::from_capabilities([
+            Capability::GetOpaque,
+            Capability::SignEcdsa,
+            Capability::ExportableUnderWrap,
+        ]);
+
+        let mut generate_private = Vec::new();
+        generate_private.extend_from_slice(&90_u16.to_be_bytes());
+        generate_private.extend_from_slice(b"RSA private wrap");
+        generate_private.resize(42, 0);
+        generate_private.extend_from_slice(&1_u16.to_be_bytes());
+        generate_private.extend_from_slice(
+            &CapabilitySet::from_capabilities([Capability::ImportWrapped]).to_bytes(),
+        );
+        generate_private.push(Algorithm::Rsa2048 as u8);
+        generate_private.extend_from_slice(&delegated_capabilities.to_bytes());
+        let generate_private =
+            Frame::new(CommandCode::GenerateWrapKey as u8, generate_private).unwrap();
+        assert_eq!(
+            device.execute_inner(admin, &generate_private).data,
+            90_u16.to_be_bytes()
+        );
+
+        let private_public = Frame::new(
+            CommandCode::GetPublicKey as u8,
+            [
+                90_u16.to_be_bytes().as_slice(),
+                &[ObjectType::WrapKey as u8],
+            ]
+            .concat(),
+        )
+        .unwrap();
+        let private_public = device.execute_inner(admin, &private_public).data;
+        assert_eq!(private_public[0], Algorithm::Rsa2048 as u8);
+        let mut put_public = Vec::new();
+        put_public.extend_from_slice(&91_u16.to_be_bytes());
+        put_public.extend_from_slice(b"RSA public wrap");
+        put_public.resize(42, 0);
+        put_public.extend_from_slice(&1_u16.to_be_bytes());
+        put_public.extend_from_slice(
+            &CapabilitySet::from_capabilities([Capability::ExportWrapped]).to_bytes(),
+        );
+        put_public.push(Algorithm::Rsa2048 as u8);
+        put_public.extend_from_slice(&delegated_capabilities.to_bytes());
+        put_public.extend_from_slice(&private_public[1..]);
+        let put_public = Frame::new(CommandCode::PutPublicWrapKey as u8, put_public).unwrap();
+        assert_eq!(
+            device.execute_inner(admin, &put_public).data,
+            91_u16.to_be_bytes()
+        );
+
+        assert_eq!(
+            device
+                .execute_inner(admin, &put_opaque_request(92, 1, opaque_capabilities))
+                .data,
+            92_u16.to_be_bytes()
+        );
+        let label_digest = RsaHashAlgorithm::Sha256.digest(b"hybrid wrap label");
+        let export = Frame::new(
+            CommandCode::ExportRsaWrapped as u8,
+            [
+                91_u16.to_be_bytes().as_slice(),
+                &[ObjectType::Opaque as u8],
+                92_u16.to_be_bytes().as_slice(),
+                &[
+                    Algorithm::Aes256 as u8,
+                    Algorithm::RsaOaepSha256 as u8,
+                    Algorithm::Mgf1Sha384 as u8,
+                ],
+                label_digest.as_slice(),
+            ]
+            .concat(),
+        )
+        .unwrap();
+        let wrapped = device.execute_inner(admin, &export).data;
+        assert!(wrapped.len() > 256);
+
+        let delete = Frame::new(
+            CommandCode::DeleteObject as u8,
+            [92_u16.to_be_bytes().as_slice(), &[ObjectType::Opaque as u8]].concat(),
+        )
+        .unwrap();
+        assert!(device.execute_inner(admin, &delete).data.is_empty());
+        let import = Frame::new(
+            CommandCode::ImportRsaWrapped as u8,
+            [
+                90_u16.to_be_bytes().as_slice(),
+                &[Algorithm::RsaOaepSha256 as u8, Algorithm::Mgf1Sha384 as u8],
+                wrapped.as_slice(),
+                label_digest.as_slice(),
+            ]
+            .concat(),
+        )
+        .unwrap();
+        assert_eq!(
+            device.execute_inner(admin, &import).data,
+            [ObjectType::Opaque as u8, 0, 92]
+        );
+
+        let ec_capabilities = CapabilitySet::from_capabilities([
+            Capability::SignEcdsa,
+            Capability::ExportableUnderWrap,
+        ]);
+        let generate =
+            generate_asymmetric_key_request(93, 1, ec_capabilities, Algorithm::EcP256 as u8);
+        assert_eq!(
+            device.execute_inner(admin, &generate).data,
+            93_u16.to_be_bytes()
+        );
+        let get_wrapped_key = Frame::new(
+            CommandCode::GetRsaWrappedKey as u8,
+            [
+                91_u16.to_be_bytes().as_slice(),
+                &[ObjectType::AsymmetricKey as u8],
+                93_u16.to_be_bytes().as_slice(),
+                &[
+                    Algorithm::Aes256 as u8,
+                    Algorithm::RsaOaepSha256 as u8,
+                    Algorithm::Mgf1Sha384 as u8,
+                ],
+                label_digest.as_slice(),
+            ]
+            .concat(),
+        )
+        .unwrap();
+        let wrapped_key = device.execute_inner(admin, &get_wrapped_key).data;
+        assert!(wrapped_key.len() > 256);
+        let delete = Frame::new(
+            CommandCode::DeleteObject as u8,
+            [
+                93_u16.to_be_bytes().as_slice(),
+                &[ObjectType::AsymmetricKey as u8],
+            ]
+            .concat(),
+        )
+        .unwrap();
+        assert!(device.execute_inner(admin, &delete).data.is_empty());
+
+        let mut put_wrapped_key = Vec::new();
+        put_wrapped_key.extend_from_slice(&90_u16.to_be_bytes());
+        put_wrapped_key.push(ObjectType::AsymmetricKey as u8);
+        put_wrapped_key.extend_from_slice(&93_u16.to_be_bytes());
+        put_wrapped_key.extend_from_slice(b"PKCS8 wrapped key");
+        put_wrapped_key.resize(45, 0);
+        put_wrapped_key.extend_from_slice(&1_u16.to_be_bytes());
+        put_wrapped_key.extend_from_slice(&ec_capabilities.to_bytes());
+        put_wrapped_key.extend_from_slice(&[
+            Algorithm::EcP256 as u8,
+            Algorithm::RsaOaepSha256 as u8,
+            Algorithm::Mgf1Sha384 as u8,
+        ]);
+        put_wrapped_key.extend_from_slice(&wrapped_key);
+        put_wrapped_key.extend_from_slice(&label_digest);
+        let put_wrapped_key =
+            Frame::new(CommandCode::PutRsaWrappedKey as u8, put_wrapped_key).unwrap();
+        assert_eq!(
+            device.execute_inner(admin, &put_wrapped_key).data,
+            [ObjectType::AsymmetricKey as u8, 0, 93]
+        );
+        assert_eq!(
+            device
+                .object(ObjectKey {
+                    object_type: ObjectType::AsymmetricKey,
+                    id: 93,
+                })
+                .unwrap()
+                .info
+                .origin,
+            0x12
+        );
+        let sign = Frame::new(
+            CommandCode::SignEcdsa as u8,
+            [93_u16.to_be_bytes().as_slice(), &[0x5a; 32]].concat(),
+        )
+        .unwrap();
+        assert_eq!(device.execute_inner(admin, &sign).data.len(), 64);
+    }
+
+    #[test]
+    fn yubico_otp_aead_matches_the_official_credential_and_otp_layout() {
+        let mut device = Device::factory_default(DeviceConfig::default());
+        let admin = device.session_authorization(1).unwrap();
+        let capabilities = CapabilitySet::from_capabilities([
+            Capability::CreateOtpAead,
+            Capability::RandomizeOtpAead,
+            Capability::DecryptOtp,
+            Capability::RewrapFromOtpAeadKey,
+            Capability::RewrapToOtpAeadKey,
+        ]);
+        let master_key: Vec<u8> = (0x80..=0x8f).collect();
+        let put = put_otp_aead_key_request(
+            70,
+            capabilities,
+            Algorithm::Aes128YubicoOtp,
+            0x1234_5678,
+            &master_key,
+        );
+        assert_eq!(device.execute_inner(admin, &put).data, 70_u16.to_be_bytes());
+
+        let credential_key: Vec<u8> = (0..=15).collect();
+        let private_id = [1, 2, 3, 4, 5, 6];
+        let create = Frame::new(
+            CommandCode::CreateOtpAead as u8,
+            [
+                70_u16.to_be_bytes().as_slice(),
+                credential_key.as_slice(),
+                private_id.as_slice(),
+            ]
+            .concat(),
+        )
+        .unwrap();
+        let aead = device.execute_inner(admin, &create).data;
+        assert_eq!(aead.len(), 36);
+
+        let otp = [
+            0x2f, 0x5d, 0x71, 0xa4, 0x91, 0x5d, 0xec, 0x30, 0x4a, 0xa1, 0x3c, 0xcf, 0x97, 0xbb,
+            0x0d, 0xbb,
+        ];
+        let decrypt = Frame::new(
+            CommandCode::DecryptOtp as u8,
+            [
+                70_u16.to_be_bytes().as_slice(),
+                aead.as_slice(),
+                otp.as_slice(),
+            ]
+            .concat(),
+        )
+        .unwrap();
+        assert_eq!(
+            device.execute_inner(admin, &decrypt).data,
+            [1, 0, 1, 1, 1, 0]
+        );
+
+        let randomize =
+            Frame::new(CommandCode::RandomizeOtpAead as u8, 70_u16.to_be_bytes()).unwrap();
+        assert_eq!(device.execute_inner(admin, &randomize).data.len(), 36);
     }
 
     #[test]

@@ -117,6 +117,7 @@ pub enum ObjectMaterial {
     Secret(Vec<u8>),
     Opaque(Vec<u8>),
     Public(Vec<u8>),
+    OtpAeadKey { nonce_id: [u8; 4], key: Vec<u8> },
 }
 
 impl ObjectMaterial {
@@ -127,6 +128,7 @@ impl ObjectMaterial {
             | Self::Secret(value)
             | Self::Opaque(value)
             | Self::Public(value) => value.len(),
+            Self::OtpAeadKey { key, .. } => key.len(),
         }
     }
 

@@ -50,14 +50,30 @@ within the session's domain and delegated-capability ceilings.
 - capability, delegated-capability and domain authorization;
 - Authentication Key create/change and Opaque object lifecycle;
 - list/get-info/delete object behavior with cross-domain hiding;
-- EC and Ed25519 import/generation, public projection, ECDSA, EdDSA and ECDH
-  through the path-dependent `software-key-core` crate;
-- HMAC SHA-1/SHA-256/SHA-384/SHA-512 import/generation/sign/verify.
+- RSA-2048/3072/4096 import and generation, public projection, PKCS #1 v1.5
+  and PSS signing, and PKCS #1 v1.5 and OAEP decryption;
+- P-224/P-256/P-384/P-521, secp256k1, Brainpool P-256/P-384/P-512 and
+  Ed25519 import/generation, public projection, ECDSA, EdDSA and raw ECDH;
+- X25519 key import/generation, public projection and contributory key
+  agreement as the first virtual extension algorithm;
+- HMAC SHA-1/SHA-256/SHA-384/SHA-512 import/generation/sign/verify;
+- AES-128/192/256 symmetric keys and ECB/CBC commands;
+- AES-CCM wrap keys, authenticated arbitrary-data wrapping, policy-preserving
+  wrapped-object export/import, RSA-OAEP plus AES-KWP hybrid wrapping, and the
+  PKCS#8 key-only RSA wrap/import format;
+- Yubico OTP AES-128/192/256 AEAD keys, credential creation/randomization,
+  rewrapping and OTP decryption with private-ID and CRC validation;
+- SSH template storage and retrieval.
 
-Still to implement before claiming device compatibility: RSA, AES and wrap
-commands, templates, OTP AEAD, device options and audit log, durable encrypted
-state, and the final FunctionFS worker adapter. Unsupported commands return the
-documented `INVALID COMMAND` response rather than pretending to succeed.
+All officially registered cryptographic algorithms are now represented and
+their general-purpose cryptographic command families are implemented. Still to
+implement before claiming complete device compatibility: SSH certificate
+request validation/signing, attestation-certificate construction, options and
+audit log, durable encrypted state, and the final FunctionFS worker adapter. The
+wrapped-object plaintext representation is versioned for virtual-device
+round-trips; interoperability fixtures from physical YubiHSM exports remain a
+separate validation step. Unsupported commands return the documented
+`INVALID COMMAND` response rather than pretending to succeed.
 
 ## Persistence checkpoint and next step
 

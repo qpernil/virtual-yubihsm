@@ -4,6 +4,7 @@
 //! crate. The core accepts and returns YubiHSM protocol frames and owns the
 //! device's sessions, authorization policy, objects, audit state, and options.
 
+mod algorithm;
 mod authorization;
 mod capability;
 mod device;
@@ -14,6 +15,7 @@ mod protocol;
 mod secure_channel_crypto;
 mod session;
 
+pub use algorithm::Algorithm;
 pub use authorization::SessionAuthorization;
 pub use capability::{Capability, CapabilitySet};
 pub use device::{Device, DeviceConfig};
