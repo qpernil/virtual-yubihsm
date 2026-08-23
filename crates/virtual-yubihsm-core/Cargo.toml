@@ -1,0 +1,22 @@
+[package]
+name = "virtual-yubihsm-core"
+version = "0.1.0"
+edition = "2021"
+rust-version = "1.85"
+description = "Transport-neutral YubiHSM 2 compatible software device core"
+license = "MIT OR Apache-2.0"
+publish = false
+
+[dependencies]
+aes = "0.8.4"
+cmac = "0.7.2"
+getrandom = "0.4.3"
+hmac = "0.13.0"
+p256 = { version = "0.14.0", features = ["ecdh"] }
+pbkdf2 = { version = "0.13.0", features = ["hmac"] }
+serde = { version = "1.0.228", features = ["derive"] }
+sha2 = "0.11.0"
+sha1 = "0.11.0"
+software-key-core = { workspace = true }
+subtle = "2.6.1"
+zeroize = { version = "1.9.0", features = ["derive"] }

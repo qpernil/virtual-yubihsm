@@ -1,0 +1,24 @@
+[package]
+name = "virtual-yubihsm"
+version = "0.1.0"
+edition = "2021"
+rust-version = "1.85"
+description = "A privilege-separated software implementation of the YubiHSM 2 device protocol"
+license = "MIT OR Apache-2.0"
+publish = false
+
+[workspace]
+members = ["crates/virtual-yubihsm-core"]
+resolver = "2"
+
+[workspace.dependencies]
+software-key-core = { path = "../software-key-core" }
+
+[dependencies]
+libc = "0.2.189"
+usb-gadget-worker = { path = "../usb-gadget-supervisor/crates/usb-gadget-worker" }
+virtual-yubihsm-core = { path = "crates/virtual-yubihsm-core" }
+
+[[bin]]
+name = "virtual-yubihsm-worker"
+path = "src/main.rs"
