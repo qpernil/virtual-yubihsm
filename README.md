@@ -19,7 +19,8 @@ virtual-yubihsm-core
     |-- SCP11-style P-256 authentication
     |-- shared SCP03-style secure message channel
     |-- session authorization snapshot
-    |-- object store, commands, options, audit and persistence
+    |-- in-memory object store and implemented commands
+    |-- durable encrypted state, options and audit (planned)
     v
 software-key-core (path dependency)
 ```
@@ -66,4 +67,4 @@ cargo clippy --workspace --all-targets -- -D warnings
 
 The factory Authentication Key is object ID 1, all capabilities, all delegated
 capabilities and all domains. Its compatibility password is `password`; change
-or delete it before using persistent deployments.
+or delete it before connecting the core to any persistent deployment.

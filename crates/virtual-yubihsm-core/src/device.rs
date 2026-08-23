@@ -61,15 +61,29 @@ pub struct Device {
 impl Device {
     pub fn factory_default(config: DeviceConfig) -> Self {
         let static_key = random_secret_key().expect("operating-system random source unavailable");
+        Self::factory_default_with_device_static_private(config, static_key.to_bytes().into())
+            .expect("generated P-256 device key is invalid")
+    }
+
+    /// Construct a device with an explicitly supplied P-256 static key.
+    ///
+    /// This is primarily useful for persisted device identities and
+    /// deterministic compatibility fixtures. The key is copied into
+    /// zeroizing device storage and is never exposed again.
+    pub fn factory_default_with_device_static_private(
+        config: DeviceConfig,
+        device_static_private: [u8; 32],
+    ) -> Result<Self> {
+        SecretKey::from_slice(&device_static_private).map_err(|_| DeviceError::InvalidData)?;
         let mut device = Self {
             config,
             objects: BTreeMap::new(),
             sessions: BTreeMap::new(),
-            device_static_private: Zeroizing::new(static_key.to_bytes().into()),
+            device_static_private: Zeroizing::new(device_static_private),
             next_sequence: 1,
         };
         device.install_factory_authentication_key();
-        device
+        Ok(device)
     }
 
     /// Process one complete YubiHSM connector message.
@@ -81,8 +95,33 @@ impl Device {
         response.encode()
     }
 
+    /// Process a message while allowing a transport or compatibility fixture
+    /// to handle selected decrypted commands. Returning `None` delegates the
+    /// command to the built-in device implementation.
+    ///
+    /// The core always enforces the command's session capability before the
+    /// handler runs. A handler which overrides an object command remains
+    /// responsible for the selected object's capabilities and domains.
+    pub fn handle_encoded_with<F>(&mut self, encoded: &[u8], mut handler: F) -> Vec<u8>
+    where
+        F: FnMut(SessionAuthorization, &Frame) -> Option<Frame>,
+    {
+        let response = match Frame::parse(encoded) {
+            Ok(request) => self.handle_frame_with(request, &mut handler),
+            Err(error) => Frame::error(error),
+        };
+        response.encode()
+    }
+
     /// Process one complete outer protocol frame.
     pub fn handle_frame(&mut self, request: Frame) -> Frame {
+        self.handle_frame_with(request, &mut |_, _| None)
+    }
+
+    fn handle_frame_with<F>(&mut self, request: Frame, handler: &mut F) -> Frame
+    where
+        F: FnMut(SessionAuthorization, &Frame) -> Option<Frame>,
+    {
         let result = match CommandCode::from_byte(request.command) {
             Some(
                 CommandCode::Echo | CommandCode::GetDeviceInfo | CommandCode::GetDevicePublicKey,
@@ -91,7 +130,7 @@ impl Device {
             }
             Some(CommandCode::CreateSession) => self.create_session(&request.data),
             Some(CommandCode::AuthenticateSession) => self.authenticate_session(&request),
-            Some(CommandCode::SessionMessage) => self.session_message(&request),
+            Some(CommandCode::SessionMessage) => self.session_message_with(&request, handler),
             Some(_) => Err(DeviceError::InvalidSession),
             None => Err(DeviceError::InvalidCommand),
         };
@@ -244,7 +283,10 @@ impl Device {
         ))
     }
 
-    fn session_message(&mut self, request: &Frame) -> Result<Frame> {
+    fn session_message_with<F>(&mut self, request: &Frame, handler: &mut F) -> Result<Frame>
+    where
+        F: FnMut(SessionAuthorization, &Frame) -> Option<Frame>,
+    {
         let sid = request
             .data
             .first()
@@ -258,11 +300,24 @@ impl Device {
             return Err(DeviceError::InvalidSession);
         }
         let inner = entry.secure.decrypt_request(request)?;
+        let authorization_error = CommandCode::from_byte(inner.command)
+            .and_then(CommandCode::required_session_capability)
+            .and_then(|required| entry.authorization.require_capability(required).err());
+        let handled_response = match authorization_error {
+            Some(error) => Some(Frame::error(error)),
+            None => handler(entry.authorization, &inner),
+        };
+        let handled_externally = handled_response.is_some();
+        let response =
+            handled_response.unwrap_or_else(|| self.execute_inner(entry.authorization, &inner));
         let closes_session = matches!(
             CommandCode::from_byte(inner.command),
-            Some(CommandCode::CloseSession | CommandCode::ResetDevice)
-        );
-        let response = self.execute_inner(entry.authorization, &inner);
+            Some(CommandCode::CloseSession)
+        ) || (matches!(
+            CommandCode::from_byte(inner.command),
+            Some(CommandCode::ResetDevice)
+        ) && !handled_externally
+            && response.command != crate::frame::ERROR_COMMAND);
         let outer = entry.secure.encrypt_response(&response)?;
         if !closes_session {
             self.sessions.insert(sid, entry);
@@ -296,6 +351,23 @@ impl Device {
 
     pub fn objects(&self) -> impl Iterator<Item = &ObjectRecord> {
         self.objects.values()
+    }
+
+    /// Install or replace an object as part of trusted device provisioning.
+    /// Normal protocol clients must use the authorized PUT/GENERATE commands.
+    pub fn provision_object(&mut self, object: ObjectRecord) -> Result<()> {
+        object.validate()?;
+        self.objects.insert(object.info.key(), object);
+        Ok(())
+    }
+
+    pub fn active_session_count(&self) -> usize {
+        self.sessions.len()
+    }
+
+    /// Invalidate every volatile secure session without changing objects.
+    pub fn clear_sessions(&mut self) {
+        self.sessions.clear();
     }
 
     fn execute_inner_result(
