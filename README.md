@@ -20,7 +20,8 @@ virtual-yubihsm-core
     |-- shared SCP03-style secure message channel
     |-- session authorization snapshot
     |-- in-memory object store and implemented commands
-    |-- durable encrypted state, options and audit (planned)
+    |-- durable encrypted device state (next step)
+    |-- options and audit (planned)
     v
 software-key-core (path dependency)
 ```
@@ -57,6 +58,24 @@ Still to implement before claiming device compatibility: RSA, AES and wrap
 commands, templates, OTP AEAD, device options and audit log, durable encrypted
 state, and the final FunctionFS worker adapter. Unsupported commands return the
 documented `INVALID COMMAND` response rather than pretending to succeed.
+
+## Persistence checkpoint and next step
+
+Persistence is intentionally in memory for the current checkpoint. A `Device`
+owns its objects for the lifetime of that instance: closing or expiring a
+secure session does not remove them, but dropping the device or restarting the
+process does. `ResetDevice` clears the in-memory objects and sessions and then
+reinstalls the factory Authentication Key. The device static P-256 identity is
+also regenerated when a new factory-default device is constructed unless an
+explicit deterministic key is supplied for a test fixture.
+
+The next persistence step is a versioned, encrypted image of the complete
+device state. It will contain the device identity, objects, sequence metadata,
+options and audit state, while secure sessions and message counters remain
+volatile. Mutating commands must publish the new image atomically before
+returning success and must leave the previous state intact if storage fails.
+The encryption key will be supplied from outside the image so an Authentication
+Key is never required to decrypt the state which contains that same key.
 
 ## Development
 
