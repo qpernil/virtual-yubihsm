@@ -1303,6 +1303,7 @@ name = "virtual-yubihsm"
 version = "0.1.0"
 dependencies = [
  "display-backends",
+ "gpiocdev-uapi",
  "libc",
  "usb-gadget-worker",
  "virtual-yubihsm-core",

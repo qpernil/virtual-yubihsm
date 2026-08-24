@@ -9,6 +9,7 @@ use std::{
     env, fs,
     fs::{File, OpenOptions},
     io::{self, Read, Write},
+    os::fd::AsRawFd,
     os::unix::fs::OpenOptionsExt,
     path::{Path, PathBuf},
     sync::{
@@ -16,16 +17,13 @@ use std::{
         Arc, Mutex,
     },
     thread,
-    time::Duration,
 };
-use usb_gadget_worker::UsbBusEvent;
+use usb_gadget_worker::{EndpointLifecycle, UsbBusEvent};
 use virtual_yubihsm_core::{
     CommandCode, Device, DeviceConfig, DeviceError, Frame, SessionAuthorization,
 };
 
 const MAX_TRANSFER: usize = u16::MAX as usize + 3;
-const ENDPOINT_RETRY_DELAY: Duration = Duration::from_millis(10);
-
 fn publish_personality(
     control: &Channel<'static>,
     generation: u32,
@@ -75,7 +73,23 @@ pub(crate) fn run_worker(serial: u32, stop: &'static AtomicBool) -> io::Result<(
     };
     let mut configure_request = 1;
     let result = (|| {
-        publish_personality(&control, 0, configure_request, &personality, &display)?;
+        if buttons.reconnect_pressed() {
+            eprintln!("virtual-yubihsm-worker: USB absent at startup while KEY3 is held");
+            publish_personality(&control, 0, configure_request, &[], &display)?;
+            if !wait_for_reinsert(
+                &control,
+                0,
+                &buttons,
+                &display,
+                &personality,
+                &mut configure_request,
+                stop,
+            )? {
+                return Ok(());
+            }
+        } else {
+            publish_personality(&control, 0, configure_request, &personality, &display)?;
+        }
         loop {
             let endpoints_record = control.receive()?;
             if endpoints_record.kind == Kind::ConfigurationRejected {
@@ -93,12 +107,14 @@ pub(crate) fn run_worker(serial: u32, stop: &'static AtomicBool) -> io::Result<(
             let generation = endpoints_record.generation;
             let endpoints = Endpoints::from_record(endpoints_record)?;
             stop.store(false, Ordering::Relaxed);
+            let lifecycle = Arc::new(EndpointLifecycle::new());
             let runtime = EndpointRuntime::start(
                 endpoints,
                 Arc::clone(&device),
                 state_path.clone(),
                 stop,
                 display.activity(),
+                Arc::clone(&lifecycle),
             )?;
             control.send(&Record::new(
                 Kind::Serving,
@@ -110,13 +126,17 @@ pub(crate) fn run_worker(serial: u32, stop: &'static AtomicBool) -> io::Result<(
             let control_result = serve_control(
                 &control,
                 generation,
-                &device,
-                &display,
-                &buttons,
                 &mut configure_request,
-                stop,
+                ControlServices {
+                    device: &device,
+                    display: &display,
+                    buttons: &buttons,
+                    stop,
+                    lifecycle: &lifecycle,
+                },
             );
             stop.store(true, Ordering::Relaxed);
+            lifecycle.stop();
             let runtime_result = runtime.shutdown();
             let outcome = control_result?;
             runtime_result?;
@@ -194,15 +214,27 @@ enum ControlOutcome {
     Exit,
 }
 
+struct ControlServices<'a> {
+    device: &'a Arc<Mutex<Device>>,
+    display: &'a crate::display::Controller,
+    buttons: &'a crate::buttons::Controller,
+    stop: &'static AtomicBool,
+    lifecycle: &'a EndpointLifecycle,
+}
+
 fn serve_control(
     control: &Channel<'static>,
     generation: u32,
-    device: &Arc<Mutex<Device>>,
-    display: &crate::display::Controller,
-    buttons: &crate::buttons::Controller,
     configure_request: &mut u32,
-    stop: &'static AtomicBool,
+    services: ControlServices<'_>,
 ) -> io::Result<ControlOutcome> {
+    let ControlServices {
+        device,
+        display,
+        buttons,
+        stop,
+        lifecycle,
+    } = services;
     let mut unconfiguration_pending = false;
     loop {
         let mut poll_fds = [
@@ -249,7 +281,13 @@ fn serve_control(
             }
             match record.kind {
                 Kind::UsbBusEvent if record.request_id == 0 => {
-                    let (event, _) = UsbBusEvent::decode(&record.body)?;
+                    let (event, activation) = UsbBusEvent::decode(&record.body)?;
+                    eprintln!(
+                        "virtual-yubihsm-worker: USB bus event {event:?} generation={generation} activation={activation}"
+                    );
+                    if event == UsbBusEvent::Enable {
+                        lifecycle.activate(activation);
+                    }
                     if matches!(
                         event,
                         UsbBusEvent::Bind | UsbBusEvent::Unbind | UsbBusEvent::Disable
@@ -276,6 +314,11 @@ fn serve_control(
                     ))?;
                 }
                 Kind::Quiesce if record.body.is_empty() => {
+                    eprintln!(
+                        "virtual-yubihsm-worker: quiescing generation={generation} request={}",
+                        record.request_id
+                    );
+                    lifecycle.stop();
                     display.unbind()?;
                     return if record.request_id == 0 {
                         Ok(ControlOutcome::Quiesce {
@@ -306,7 +349,7 @@ fn serve_control(
 
         if poll_fds[1].revents & libc::POLLIN != 0
             && !unconfiguration_pending
-            && buttons.take_reconnect_transition()? == Some(true)
+            && buttons.take_reconnect_state()?
         {
             let request_id = configure_request
                 .checked_add(1)
@@ -314,6 +357,9 @@ fn serve_control(
             publish_personality(control, generation, request_id, &[], display)?;
             *configure_request = request_id;
             unconfiguration_pending = true;
+            eprintln!(
+                "virtual-yubihsm-worker: KEY3 requested USB eject generation={generation} request={request_id}"
+            );
         }
         let unexpected = poll_fds[1].revents & !libc::POLLIN;
         if unexpected != 0 {
@@ -371,14 +417,15 @@ fn wait_for_reinsert(
                 )),
             };
         }
-        if poll_fds[1].revents & libc::POLLIN != 0
-            && buttons.take_reconnect_transition()? == Some(false)
-        {
+        if poll_fds[1].revents & libc::POLLIN != 0 && !buttons.take_reconnect_state()? {
             let request_id = configure_request
                 .checked_add(1)
                 .ok_or_else(|| io::Error::other("USB configuration request overflow"))?;
             publish_personality(control, generation, request_id, personality, display)?;
             *configure_request = request_id;
+            eprintln!(
+                "virtual-yubihsm-worker: KEY3 requested USB insertion generation={generation} request={request_id}"
+            );
             return Ok(true);
         }
         let unexpected = poll_fds[1].revents & !libc::POLLIN;
@@ -408,6 +455,7 @@ impl Endpoints {
         let mut output = None;
         let mut input = None;
         for (entry, file) in record.body[2..].chunks_exact(4).zip(record.files) {
+            set_nonblocking(&file)?;
             let address = entry[0];
             let transfer_type = entry[1];
             let packet_size = u16::from_be_bytes(entry[2..4].try_into().unwrap());
@@ -441,11 +489,19 @@ impl EndpointRuntime {
         state_path: PathBuf,
         stop: &'static AtomicBool,
         display_activity: crate::display::Activity,
+        lifecycle: Arc<EndpointLifecycle>,
     ) -> io::Result<Self> {
         let thread = thread::Builder::new()
             .name("yubihsm-usb".to_owned())
             .spawn(move || {
-                serve_endpoint(endpoints, device, &state_path, stop, display_activity)
+                serve_endpoint(
+                    endpoints,
+                    device,
+                    &state_path,
+                    stop,
+                    display_activity,
+                    lifecycle,
+                )
             })?;
         Ok(Self { thread })
     }
@@ -463,48 +519,57 @@ fn serve_endpoint(
     state_path: &Path,
     stop: &'static AtomicBool,
     display_activity: crate::display::Activity,
+    lifecycle: Arc<EndpointLifecycle>,
 ) -> io::Result<()> {
     let result = (|| {
         let mut request = vec![0_u8; MAX_TRANSFER];
-        while !stop.load(Ordering::Relaxed) {
-            match endpoints.output.read(&mut request) {
-                Ok(0) => {}
-                Ok(length) => {
-                    let activity = display_activity.begin();
-                    let response = {
-                        let mut device = device
-                            .lock()
-                            .map_err(|_| io::Error::other("device lock poisoned"))?;
-                        let outer_request = Frame::parse(&request[..length]);
-                        let session_id = outer_request.as_ref().ok().and_then(session_id);
-                        let response = device.handle_encoded_observing(
-                            &request[..length],
-                            |authorization, request, response| {
-                                log_authenticated_failure(
-                                    session_id,
-                                    authorization,
-                                    request,
-                                    response,
-                                );
-                                if request.command == CommandCode::BlinkDevice as u8
-                                    && response.command == (CommandCode::BlinkDevice as u8 | 0x80)
-                                {
-                                    display_activity.identify(request.data[0]);
-                                }
-                            },
-                        );
-                        log_outer_failure(outer_request.as_ref(), &response, length);
-                        if device.take_persistent_change() {
-                            persist_device_state(&device, state_path)?;
-                        }
-                        response
-                    };
-                    write_transfer(&mut endpoints.input, &response)?;
-                    drop(activity);
+        let mut activation = 0;
+        while let Some(next_activation) = lifecycle.wait_for_activation_after(activation) {
+            activation = next_activation;
+            loop {
+                if stop.load(Ordering::Relaxed) {
+                    return Ok(());
                 }
-                Err(error) if error.kind() == io::ErrorKind::Interrupted => {}
-                Err(error) if endpoint_is_gone(&error) => thread::sleep(ENDPOINT_RETRY_DELAY),
-                Err(error) => return Err(error),
+                match endpoints.output.read(&mut request) {
+                    Ok(0) => {}
+                    Ok(length) => {
+                        let activity = display_activity.begin();
+                        let response = {
+                            let mut device = device
+                                .lock()
+                                .map_err(|_| io::Error::other("device lock poisoned"))?;
+                            let outer_request = Frame::parse(&request[..length]);
+                            let session_id = outer_request.as_ref().ok().and_then(session_id);
+                            let response = device.handle_encoded_observing(
+                                &request[..length],
+                                |authorization, request, response| {
+                                    log_authenticated_failure(
+                                        session_id,
+                                        authorization,
+                                        request,
+                                        response,
+                                    );
+                                    if request.command == CommandCode::BlinkDevice as u8
+                                        && response.command
+                                            == (CommandCode::BlinkDevice as u8 | 0x80)
+                                    {
+                                        display_activity.identify(request.data[0]);
+                                    }
+                                },
+                            );
+                            log_outer_failure(outer_request.as_ref(), &response, length);
+                            if device.take_persistent_change() {
+                                persist_device_state(&device, state_path)?;
+                            }
+                            response
+                        };
+                        write_transfer(&mut endpoints.input, &response)?;
+                        drop(activity);
+                    }
+                    Err(error) if error.kind() == io::ErrorKind::Interrupted => {}
+                    Err(error) if endpoint_is_unavailable(&error) => break,
+                    Err(error) => return Err(error),
+                }
             }
         }
         Ok(())
@@ -665,14 +730,27 @@ fn write_transfer(file: &mut File, bytes: &[u8]) -> io::Result<()> {
                 ));
             }
             Err(error) if error.kind() == io::ErrorKind::Interrupted => {}
-            Err(error) if endpoint_is_gone(&error) => return Ok(()),
+            Err(error) if endpoint_is_unavailable(&error) => return Ok(()),
             Err(error) => return Err(error),
         }
     }
 }
 
-fn endpoint_is_gone(error: &io::Error) -> bool {
-    matches!(error.raw_os_error(), Some(19 | 32 | 108))
+fn endpoint_is_unavailable(error: &io::Error) -> bool {
+    matches!(error.raw_os_error(), Some(11 | 19 | 32 | 108))
+}
+
+fn set_nonblocking(file: &File) -> io::Result<()> {
+    // FunctionFS still blocks for a queued transfer while enabled. O_NONBLOCK
+    // only prevents a new operation from sleeping while its endpoint is down.
+    let flags = unsafe { libc::fcntl(file.as_raw_fd(), libc::F_GETFL) };
+    if flags < 0 {
+        return Err(io::Error::last_os_error());
+    }
+    if unsafe { libc::fcntl(file.as_raw_fd(), libc::F_SETFL, flags | libc::O_NONBLOCK) } < 0 {
+        return Err(io::Error::last_os_error());
+    }
+    Ok(())
 }
 
 fn required_path(name: &str) -> io::Result<PathBuf> {

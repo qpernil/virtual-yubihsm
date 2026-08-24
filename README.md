@@ -122,6 +122,16 @@ requests, and participates in the supervisor's quiesce handshake. The display
 power state follows the published USB personality rather than any particular
 button. KEY3 uses the same detach/reinsert lifecycle as `virtual-yubikey`, so
 ejecting is one way to publish no personality and reinsertion restores it.
+KEY3 is tracked as a current logical level rather than a queue of edges: the
+worker samples its initial active-low GPIO value, coalesces notifications, and
+always converges USB presence to the latest physical state. A dropped wake can
+therefore never strand the worker in the ejected state.
+
+The bulk endpoint thread starts only after the supervisor reports `Enable`.
+If FunctionFS cancels I/O on disable or unbind, the thread parks until a newer
+endpoint activation arrives. Quiescence wakes it to exit, so the worker never
+re-enters a disabled endpoint while the supervisor is waiting for
+`Quiesced`.
 Worker shutdown also powers the display off. The worker refuses to run as root.
 
 ### Display and blink lifecycle

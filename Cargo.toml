@@ -21,6 +21,7 @@ virtual-yubihsm-core = { path = "crates/virtual-yubihsm-core" }
 
 [target.'cfg(target_os = "linux")'.dependencies]
 display-backends = { path = "../display-backends" }
+gpiocdev-uapi = "0.7.0"
 
 [[bin]]
 name = "virtual-yubihsm-worker"
