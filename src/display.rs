@@ -83,6 +83,14 @@ impl Controller {
         }
     }
 
+    pub(crate) fn personality_present(&self) -> io::Result<()> {
+        send_command(&self.sender, Command::PersonalityPresent)
+    }
+
+    pub(crate) fn personality_absent(&self) -> io::Result<()> {
+        send_command(&self.sender, Command::PersonalityAbsent)
+    }
+
     pub(crate) fn bind(&self) -> io::Result<()> {
         send_command(&self.sender, Command::Bind)
     }
@@ -113,6 +121,8 @@ enum Command {
     ActivityStart,
     ActivityEnd,
     Identify(u8),
+    PersonalityPresent,
+    PersonalityAbsent,
     Bind,
     Unbind,
     Suspend,
@@ -130,6 +140,7 @@ fn send_command(sender: &Sender<Command>, command: Command) -> io::Result<()> {
 #[cfg(target_os = "linux")]
 fn display_loop(bus: File, control: File, receiver: Receiver<Command>) {
     let mut hardware = Hardware::new(bus, control);
+    let mut personality_present = false;
     let mut bound = false;
     let mut suspended = false;
     let mut normal_lit = false;
@@ -204,7 +215,12 @@ fn display_loop(bus: File, control: File, receiver: Receiver<Command>) {
         match command {
             Command::ActivityStart => {
                 activity_count = activity_count.saturating_add(1);
-                if activity_count == 1 && bound && !suspended && identify_until.is_none() {
+                if activity_count == 1
+                    && personality_present
+                    && bound
+                    && !suspended
+                    && identify_until.is_none()
+                {
                     let now = Instant::now();
                     activity_lit = true;
                     activity_due = Some(now + ACTIVITY_BLINK_HALF_PERIOD);
@@ -216,7 +232,7 @@ fn display_loop(bus: File, control: File, receiver: Receiver<Command>) {
                 activity_count = activity_count.saturating_sub(1);
                 if activity_count == 0 {
                     activity_due = None;
-                    if bound && !suspended && identify_until.is_none() {
+                    if personality_present && bound && !suspended && identify_until.is_none() {
                         let now = Instant::now();
                         normal_lit = false;
                         normal_due = Some(now + NORMAL_BLINK_HALF_PERIOD);
@@ -225,7 +241,7 @@ fn display_loop(bus: File, control: File, receiver: Receiver<Command>) {
                 }
             }
             Command::Identify(seconds) => {
-                if bound && !suspended && seconds != 0 {
+                if personality_present && bound && !suspended && seconds != 0 {
                     let now = Instant::now();
                     identify_lit = true;
                     identify_until = Some(now + Duration::from_secs(u64::from(seconds)));
@@ -235,16 +251,41 @@ fn display_loop(bus: File, control: File, receiver: Receiver<Command>) {
                     hardware.render(true);
                 }
             }
-            Command::Bind => {
-                bound = true;
+            Command::PersonalityPresent => {
+                personality_present = true;
+                bound = false;
                 suspended = false;
                 normal_lit = false;
-                normal_due = Some(Instant::now() + NORMAL_BLINK_HALF_PERIOD);
+                normal_due = None;
                 activity_count = 0;
                 activity_due = None;
                 identify_until = None;
                 identify_due = None;
                 hardware.render(false);
+            }
+            Command::PersonalityAbsent => {
+                personality_present = false;
+                bound = false;
+                suspended = false;
+                normal_due = None;
+                activity_count = 0;
+                activity_due = None;
+                identify_until = None;
+                identify_due = None;
+                hardware.turn_off("USB personality absent");
+            }
+            Command::Bind => {
+                bound = true;
+                suspended = false;
+                normal_lit = false;
+                normal_due = personality_present.then(|| Instant::now() + NORMAL_BLINK_HALF_PERIOD);
+                activity_count = 0;
+                activity_due = None;
+                identify_until = None;
+                identify_due = None;
+                if personality_present {
+                    hardware.render(false);
+                }
             }
             Command::Unbind => {
                 bound = false;
@@ -254,7 +295,9 @@ fn display_loop(bus: File, control: File, receiver: Receiver<Command>) {
                 activity_due = None;
                 identify_until = None;
                 identify_due = None;
-                hardware.turn_off("USB unbind");
+                if personality_present {
+                    hardware.render(false);
+                }
             }
             Command::Suspend => {
                 suspended = true;
@@ -262,12 +305,12 @@ fn display_loop(bus: File, control: File, receiver: Receiver<Command>) {
                 activity_due = None;
                 identify_until = None;
                 identify_due = None;
-                if bound {
-                    hardware.turn_off("USB suspend");
+                if personality_present {
+                    hardware.render(false);
                 }
             }
             Command::Resume => {
-                if bound && suspended {
+                if personality_present && bound && suspended {
                     suspended = false;
                     let now = Instant::now();
                     if activity_count != 0 {

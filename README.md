@@ -107,10 +107,13 @@ USB personality, receives the FunctionFS bulk endpoint descriptors, and passes
 each complete YubiHSM transfer to `virtual-yubihsm-core`. It clears volatile
 sessions on bind, unbind and disable events, stalls unsupported control
 requests, and participates in the supervisor's quiesce handshake. The display
-is lit only while the USB generation is bound and awake. Suspend, unbind,
-eject, and shutdown turn it off; resume or reinsertion restarts its normal
-0.5 Hz blink. KEY3 uses the same detach/reinsert lifecycle as `virtual-yubikey`.
-The worker refuses to run as root.
+keeps showing the YubiHSM with its LED off while USB is suspended, unbound, or
+otherwise inactive. Only publishing no USB personality powers the display off;
+republishing the personality restores the image, and bind or resume restarts
+its normal 0.5 Hz blink. KEY3 uses the same detach/reinsert lifecycle as
+`virtual-yubikey`, so ejecting publishes no personality and reinsertion restores
+it. Worker shutdown also powers the display off. The worker refuses to run as
+root.
 
 When a protocol command fails, the worker writes a diagnostic to the service
 journal containing the command name and byte, the returned device error, and,

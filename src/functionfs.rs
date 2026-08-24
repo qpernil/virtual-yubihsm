@@ -26,6 +26,26 @@ use virtual_yubihsm_core::{
 const MAX_TRANSFER: usize = u16::MAX as usize + 3;
 const ENDPOINT_RETRY_DELAY: Duration = Duration::from_millis(10);
 
+fn publish_personality(
+    control: &Channel<'static>,
+    generation: u32,
+    request_id: u32,
+    personality: &[u8],
+    display: &crate::display::Controller,
+) -> io::Result<()> {
+    control.send(&Record::new(
+        Kind::Configure,
+        generation,
+        request_id,
+        personality.to_vec(),
+    ))?;
+    if personality.is_empty() {
+        display.personality_absent()
+    } else {
+        display.personality_present()
+    }
+}
+
 pub(crate) fn run_worker(serial: u32, stop: &'static AtomicBool) -> io::Result<()> {
     // SAFETY: geteuid has no preconditions.
     if unsafe { libc::geteuid() } == 0 {
@@ -55,12 +75,7 @@ pub(crate) fn run_worker(serial: u32, stop: &'static AtomicBool) -> io::Result<(
     };
     let mut configure_request = 1;
     let result = (|| {
-        control.send(&Record::new(
-            Kind::Configure,
-            0,
-            configure_request,
-            personality.clone(),
-        ))?;
+        publish_personality(&control, 0, configure_request, &personality, &display)?;
         loop {
             let endpoints_record = control.receive()?;
             if endpoints_record.kind == Kind::ConfigurationRejected {
@@ -124,6 +139,7 @@ pub(crate) fn run_worker(serial: u32, stop: &'static AtomicBool) -> io::Result<(
                         &control,
                         generation,
                         &buttons,
+                        &display,
                         &personality,
                         &mut configure_request,
                         stop,
@@ -295,12 +311,7 @@ fn serve_control(
             let request_id = configure_request
                 .checked_add(1)
                 .ok_or_else(|| io::Error::other("USB configuration request overflow"))?;
-            control.send(&Record::new(
-                Kind::Configure,
-                generation,
-                request_id,
-                Vec::new(),
-            ))?;
+            publish_personality(control, generation, request_id, &[], display)?;
             *configure_request = request_id;
             unconfiguration_pending = true;
         }
@@ -317,6 +328,7 @@ fn wait_for_reinsert(
     control: &Channel<'static>,
     generation: u32,
     buttons: &crate::buttons::Controller,
+    display: &crate::display::Controller,
     personality: &[u8],
     configure_request: &mut u32,
     stop: &'static AtomicBool,
@@ -365,12 +377,7 @@ fn wait_for_reinsert(
             let request_id = configure_request
                 .checked_add(1)
                 .ok_or_else(|| io::Error::other("USB configuration request overflow"))?;
-            control.send(&Record::new(
-                Kind::Configure,
-                generation,
-                request_id,
-                personality.to_vec(),
-            ))?;
+            publish_personality(control, generation, request_id, personality, display)?;
             *configure_request = request_id;
             return Ok(true);
         }
