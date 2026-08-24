@@ -70,10 +70,12 @@ within the session's domain and delegated-capability ceilings.
   options and audit state, with sessions and message counters kept volatile;
 - a complete unprivileged `usb-gadget-supervisor` worker exposing the official
   `1050:0030` full-speed bulk endpoint pair over FunctionFS;
-- a native ST7789 YubiHSM display with a green strap-hole LED, its normal
-  0.333 Hz blink with a three-second cycle, an operation-scoped fast blink throughout command execution,
-  and authenticated identification blinking for the duration carried by the
-  official `Blink Device` command.
+- a native ST7789 YubiHSM display with a green strap-hole LED and one
+  invert-only blink scheduler: stopped with the LED off while USB is inactive,
+  a 0.333 Hz three-second cycle while idle, and a fast cadence throughout
+  command execution. Command entry and exit each add an immediate inversion;
+  authenticated `Blink Device` requests extend the fast cadence for their
+  requested duration.
 
 All officially registered cryptographic algorithms are now represented and
 their general-purpose cryptographic command families are implemented. SSH

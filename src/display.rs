@@ -13,7 +13,11 @@ use std::io;
 #[cfg(target_os = "linux")]
 use std::os::fd::AsRawFd;
 #[cfg(target_os = "linux")]
-use std::sync::mpsc::{self, Receiver, RecvTimeoutError, Sender};
+use std::sync::{
+    atomic::{AtomicBool, AtomicUsize, Ordering},
+    mpsc::{self, Receiver, RecvTimeoutError, Sender},
+    Arc,
+};
 #[cfg(target_os = "linux")]
 use std::thread::{self, JoinHandle};
 #[cfg(target_os = "linux")]
@@ -23,40 +27,71 @@ use std::time::{Duration, Instant};
 const ACTIVITY_BLINK_HALF_PERIOD: Duration = Duration::from_millis(60);
 #[cfg(target_os = "linux")]
 const NORMAL_BLINK_HALF_PERIOD: Duration = Duration::from_millis(1_500);
-#[cfg(target_os = "linux")]
-const IDENTIFY_BLINK_HALF_PERIOD: Duration = Duration::from_millis(125);
 
 #[cfg(target_os = "linux")]
 #[derive(Clone)]
 pub(crate) struct Activity {
+    state: Arc<ActivityState>,
+}
+
+#[cfg(target_os = "linux")]
+struct ActivityState {
     sender: Sender<Command>,
+    active_count: AtomicUsize,
+    notification_pending: AtomicBool,
+}
+
+#[cfg(target_os = "linux")]
+impl ActivityState {
+    fn notify(&self) {
+        if !self.notification_pending.swap(true, Ordering::AcqRel)
+            && self.sender.send(Command::ActivityChanged).is_err()
+        {
+            self.notification_pending.store(false, Ordering::Release);
+        }
+    }
 }
 
 #[cfg(target_os = "linux")]
 impl Activity {
     pub(crate) fn begin(&self) -> ActivityGuard {
+        let previous = self
+            .state
+            .active_count
+            .fetch_update(Ordering::AcqRel, Ordering::Acquire, |count| {
+                Some(count.saturating_add(1))
+            })
+            .unwrap();
+        if previous == 0 {
+            self.state.notify();
+        }
         ActivityGuard {
-            sender: self.sender.clone(),
-            started: self.sender.send(Command::ActivityStart).is_ok(),
+            state: Arc::clone(&self.state),
         }
     }
 
     pub(crate) fn identify(&self, seconds: u8) {
-        let _ = self.sender.send(Command::Identify(seconds));
+        let _ = self.state.sender.send(Command::Identify(seconds));
     }
 }
 
 #[cfg(target_os = "linux")]
 pub(crate) struct ActivityGuard {
-    sender: Sender<Command>,
-    started: bool,
+    state: Arc<ActivityState>,
 }
 
 #[cfg(target_os = "linux")]
 impl Drop for ActivityGuard {
     fn drop(&mut self) {
-        if self.started {
-            let _ = self.sender.send(Command::ActivityEnd);
+        let previous = self
+            .state
+            .active_count
+            .fetch_update(Ordering::AcqRel, Ordering::Acquire, |count| {
+                Some(count.saturating_sub(1))
+            })
+            .unwrap();
+        if previous == 1 {
+            self.state.notify();
         }
     }
 }
@@ -64,6 +99,7 @@ impl Drop for ActivityGuard {
 #[cfg(target_os = "linux")]
 pub(crate) struct Controller {
     sender: Sender<Command>,
+    activity_state: Arc<ActivityState>,
     thread: JoinHandle<()>,
 }
 
@@ -71,15 +107,25 @@ pub(crate) struct Controller {
 impl Controller {
     pub(crate) fn start(bus: File, control: File) -> io::Result<Self> {
         let (sender, receiver) = mpsc::channel();
+        let activity_state = Arc::new(ActivityState {
+            sender: sender.clone(),
+            active_count: AtomicUsize::new(0),
+            notification_pending: AtomicBool::new(false),
+        });
+        let display_activity_state = Arc::clone(&activity_state);
         let thread = thread::Builder::new()
             .name("yubihsm-display".to_owned())
-            .spawn(move || display_loop(bus, control, receiver))?;
-        Ok(Self { sender, thread })
+            .spawn(move || display_loop(bus, control, receiver, display_activity_state))?;
+        Ok(Self {
+            sender,
+            activity_state,
+            thread,
+        })
     }
 
     pub(crate) fn activity(&self) -> Activity {
         Activity {
-            sender: self.sender.clone(),
+            state: Arc::clone(&self.activity_state),
         }
     }
 
@@ -118,8 +164,7 @@ impl Controller {
 #[cfg(target_os = "linux")]
 #[derive(Clone, Copy)]
 enum Command {
-    ActivityStart,
-    ActivityEnd,
+    ActivityChanged,
     Identify(u8),
     PersonalityPresent,
     PersonalityAbsent,
@@ -138,28 +183,23 @@ fn send_command(sender: &Sender<Command>, command: Command) -> io::Result<()> {
 }
 
 #[cfg(target_os = "linux")]
-fn display_loop(bus: File, control: File, receiver: Receiver<Command>) {
+fn display_loop(
+    bus: File,
+    control: File,
+    receiver: Receiver<Command>,
+    activity_state: Arc<ActivityState>,
+) {
     let mut hardware = Hardware::new(bus, control);
     let mut personality_present = false;
     let mut bound = false;
     let mut suspended = false;
-    let mut normal_lit = false;
-    let mut normal_due = None;
+    let mut lit = false;
     let mut activity_count = 0_usize;
-    let mut activity_due = None;
-    let mut activity_lit = false;
     let mut identify_until = None;
-    let mut identify_due = None;
-    let mut identify_lit = false;
+    let mut blink_due = None;
 
     loop {
-        let deadline = if identify_until.is_some() {
-            earliest(identify_due, identify_until)
-        } else if activity_count != 0 {
-            activity_due
-        } else {
-            normal_due
-        };
+        let deadline = earliest(blink_due, identify_until);
         let received = match deadline {
             Some(deadline) => receiver
                 .recv_timeout(deadline.saturating_duration_since(Instant::now()))
@@ -174,38 +214,28 @@ fn display_loop(bus: File, control: File, receiver: Receiver<Command>) {
             Ok(None) => unreachable!(),
             Err(RecvTimeoutError::Timeout) => {
                 let now = Instant::now();
-                if let Some(until) = identify_until {
-                    if now >= until {
-                        identify_until = None;
-                        identify_due = None;
-                        identify_lit = false;
-                        if activity_count != 0 {
-                            activity_lit = true;
-                            activity_due = Some(now + ACTIVITY_BLINK_HALF_PERIOD);
-                            hardware.render(true);
-                        } else {
-                            normal_lit = false;
-                            normal_due = Some(now + NORMAL_BLINK_HALF_PERIOD);
-                            hardware.render(false);
-                        }
-                    } else if identify_due.is_some_and(|due| now >= due) {
-                        identify_lit = !identify_lit;
-                        hardware.render(identify_lit);
-                        identify_due = Some(now + IDENTIFY_BLINK_HALF_PERIOD);
+                if identify_until.is_some_and(|until| now >= until) {
+                    identify_until = None;
+                    if activity_count == 0 {
+                        blink_due = selected_blink_period(
+                            personality_present,
+                            bound,
+                            suspended,
+                            activity_count,
+                            identify_until,
+                        )
+                        .map(|period| now + period);
                     }
-                } else if activity_count != 0 {
-                    if activity_due.is_some_and(|due| now >= due) {
-                        activity_lit = !activity_lit;
-                        activity_due = Some(now + ACTIVITY_BLINK_HALF_PERIOD);
-                        hardware.render(activity_lit);
-                    }
-                } else {
-                    let normal_changed = normal_due.is_some_and(|due| now >= due);
-                    if normal_changed {
-                        normal_lit = !normal_lit;
-                        normal_due = Some(now + NORMAL_BLINK_HALF_PERIOD);
-                        hardware.render(normal_lit);
-                    }
+                } else if blink_due.is_some_and(|due| now >= due) {
+                    invert_led(&mut hardware, &mut lit);
+                    blink_due = selected_blink_period(
+                        personality_present,
+                        bound,
+                        suspended,
+                        activity_count,
+                        identify_until,
+                    )
+                    .map(|period| Instant::now() + period);
                 }
                 continue;
             }
@@ -213,76 +243,68 @@ fn display_loop(bus: File, control: File, receiver: Receiver<Command>) {
         };
 
         match command {
-            Command::ActivityStart => {
-                activity_count = activity_count.saturating_add(1);
-                if activity_count == 1
-                    && personality_present
-                    && bound
-                    && !suspended
-                    && identify_until.is_none()
-                {
-                    let now = Instant::now();
-                    activity_lit = true;
-                    activity_due = Some(now + ACTIVITY_BLINK_HALF_PERIOD);
-                    normal_due = None;
-                    hardware.render(true);
-                }
-            }
-            Command::ActivityEnd => {
-                activity_count = activity_count.saturating_sub(1);
-                if activity_count == 0 {
-                    activity_due = None;
-                    if personality_present && bound && !suspended && identify_until.is_none() {
-                        let now = Instant::now();
-                        normal_lit = false;
-                        normal_due = Some(now + NORMAL_BLINK_HALF_PERIOD);
-                        hardware.render(false);
+            Command::ActivityChanged => {
+                activity_state
+                    .notification_pending
+                    .store(false, Ordering::Release);
+                let current_count = activity_state.active_count.load(Ordering::Acquire);
+                let was_active = activity_count != 0;
+                let is_active = current_count != 0;
+                activity_count = current_count;
+                if was_active != is_active {
+                    if personality_present && bound && !suspended {
+                        invert_led(&mut hardware, &mut lit);
                     }
+                    let now = Instant::now();
+                    if identify_until.is_some_and(|until| now >= until) {
+                        identify_until = None;
+                    }
+                    blink_due = selected_blink_period(
+                        personality_present,
+                        bound,
+                        suspended,
+                        activity_count,
+                        identify_until,
+                    )
+                    .map(|period| now + period);
                 }
             }
             Command::Identify(seconds) => {
                 if personality_present && bound && !suspended && seconds != 0 {
                     let now = Instant::now();
-                    identify_lit = true;
                     identify_until = Some(now + Duration::from_secs(u64::from(seconds)));
-                    identify_due = Some(now + IDENTIFY_BLINK_HALF_PERIOD);
-                    normal_due = None;
-                    activity_due = None;
-                    hardware.render(true);
+                    if activity_count == 0 {
+                        blink_due = Some(now + ACTIVITY_BLINK_HALF_PERIOD);
+                    }
                 }
             }
             Command::PersonalityPresent => {
                 personality_present = true;
                 bound = false;
                 suspended = false;
-                normal_lit = false;
-                normal_due = None;
+                lit = false;
                 activity_count = 0;
-                activity_due = None;
                 identify_until = None;
-                identify_due = None;
+                blink_due = None;
                 hardware.render(false);
             }
             Command::PersonalityAbsent => {
                 personality_present = false;
                 bound = false;
                 suspended = false;
-                normal_due = None;
                 activity_count = 0;
-                activity_due = None;
                 identify_until = None;
-                identify_due = None;
+                blink_due = None;
+                lit = false;
                 hardware.turn_off("USB personality absent");
             }
             Command::Bind => {
                 bound = true;
                 suspended = false;
-                normal_lit = false;
-                normal_due = personality_present.then(|| Instant::now() + NORMAL_BLINK_HALF_PERIOD);
+                lit = false;
                 activity_count = 0;
-                activity_due = None;
                 identify_until = None;
-                identify_due = None;
+                blink_due = personality_present.then(|| Instant::now() + NORMAL_BLINK_HALF_PERIOD);
                 if personality_present {
                     hardware.render(false);
                 }
@@ -290,38 +312,37 @@ fn display_loop(bus: File, control: File, receiver: Receiver<Command>) {
             Command::Unbind => {
                 bound = false;
                 suspended = false;
-                normal_due = None;
                 activity_count = 0;
-                activity_due = None;
                 identify_until = None;
-                identify_due = None;
+                blink_due = None;
                 if personality_present {
+                    lit = false;
                     hardware.render(false);
                 }
             }
             Command::Suspend => {
                 suspended = true;
-                normal_due = None;
-                activity_due = None;
                 identify_until = None;
-                identify_due = None;
+                blink_due = None;
                 if personality_present {
+                    lit = false;
                     hardware.render(false);
                 }
             }
             Command::Resume => {
                 if personality_present && bound && suspended {
                     suspended = false;
-                    let now = Instant::now();
-                    if activity_count != 0 {
-                        activity_lit = true;
-                        activity_due = Some(now + ACTIVITY_BLINK_HALF_PERIOD);
-                        hardware.render(true);
-                    } else {
-                        normal_lit = false;
-                        normal_due = Some(now + NORMAL_BLINK_HALF_PERIOD);
-                        hardware.render(false);
-                    }
+                    lit = false;
+                    hardware.render(false);
+                    activity_count = activity_state.active_count.load(Ordering::Acquire);
+                    blink_due = selected_blink_period(
+                        personality_present,
+                        bound,
+                        suspended,
+                        activity_count,
+                        identify_until,
+                    )
+                    .map(|period| Instant::now() + period);
                 }
             }
             Command::Shutdown => {
@@ -329,6 +350,29 @@ fn display_loop(bus: File, control: File, receiver: Receiver<Command>) {
                 break;
             }
         }
+    }
+}
+
+#[cfg(target_os = "linux")]
+fn invert_led(hardware: &mut Hardware, lit: &mut bool) {
+    *lit = !*lit;
+    hardware.render(*lit);
+}
+
+#[cfg(target_os = "linux")]
+fn selected_blink_period(
+    personality_present: bool,
+    bound: bool,
+    suspended: bool,
+    activity_count: usize,
+    identify_until: Option<Instant>,
+) -> Option<Duration> {
+    if !personality_present || !bound || suspended {
+        None
+    } else if activity_count != 0 || identify_until.is_some() {
+        Some(ACTIVITY_BLINK_HALF_PERIOD)
+    } else {
+        Some(NORMAL_BLINK_HALF_PERIOD)
     }
 }
 
@@ -429,14 +473,54 @@ mod tests {
 
     #[cfg(target_os = "linux")]
     #[test]
-    fn activity_guard_brackets_work_and_uses_the_fast_cadence() {
+    fn activity_guard_tracks_current_state_without_queuing_history() {
         let (sender, receiver) = mpsc::channel();
-        let activity = Activity { sender };
-        {
-            let _guard = activity.begin();
-            assert!(matches!(receiver.recv().unwrap(), Command::ActivityStart));
-        }
-        assert!(matches!(receiver.recv().unwrap(), Command::ActivityEnd));
+        let state = Arc::new(ActivityState {
+            sender,
+            active_count: AtomicUsize::new(0),
+            notification_pending: AtomicBool::new(false),
+        });
+        let activity = Activity {
+            state: Arc::clone(&state),
+        };
+
+        let first = activity.begin();
+        let second = activity.begin();
+        assert_eq!(state.active_count.load(Ordering::Acquire), 2);
+        assert!(matches!(receiver.recv().unwrap(), Command::ActivityChanged));
+        assert!(receiver.try_recv().is_err());
+
+        state.notification_pending.store(false, Ordering::Release);
+        drop(first);
+        assert_eq!(state.active_count.load(Ordering::Acquire), 1);
+        assert!(receiver.try_recv().is_err());
+
+        drop(second);
+        assert_eq!(state.active_count.load(Ordering::Acquire), 0);
+        assert!(matches!(receiver.recv().unwrap(), Command::ActivityChanged));
+        assert!(receiver.try_recv().is_err());
+
         assert_eq!(ACTIVITY_BLINK_HALF_PERIOD, Duration::from_millis(60));
+        assert!(ACTIVITY_BLINK_HALF_PERIOD < NORMAL_BLINK_HALF_PERIOD);
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn blink_scheduler_selects_stopped_idle_and_activity_cadences() {
+        let now = Instant::now();
+        assert_eq!(selected_blink_period(true, true, true, 0, None), None);
+        assert_eq!(selected_blink_period(true, false, false, 0, None), None);
+        assert_eq!(
+            selected_blink_period(true, true, false, 0, None),
+            Some(NORMAL_BLINK_HALF_PERIOD)
+        );
+        assert_eq!(
+            selected_blink_period(true, true, false, 1, None),
+            Some(ACTIVITY_BLINK_HALF_PERIOD)
+        );
+        assert_eq!(
+            selected_blink_period(true, true, false, 0, Some(now)),
+            Some(ACTIVITY_BLINK_HALF_PERIOD)
+        );
     }
 }
