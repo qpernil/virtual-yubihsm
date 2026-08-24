@@ -1,6 +1,8 @@
 //! Worker-owned USB identity for the YubiHSM 2 bulk protocol.
 
-use usb_gadget_worker::{StringDescriptor, UsbPersonality, UsbSpeed};
+use usb_gadget_worker::{
+    MicrosoftCompatibleId, MicrosoftOs10, StringDescriptor, UsbPersonality, UsbSpeed,
+};
 
 pub(crate) const BULK_OUT: u8 = 0x01;
 pub(crate) const BULK_IN: u8 = 0x81;
@@ -33,6 +35,10 @@ pub(crate) fn personality(serial: u32) -> UsbPersonality {
             0x0409,
             string_descriptor(&serial.to_string()),
         ))
+        .with_microsoft_os_1(
+            MicrosoftOs10::new(0x27)
+                .with_compatible_id(MicrosoftCompatibleId::new(0, "WINUSB", "")),
+        )
 }
 
 fn configuration_descriptor() -> Vec<u8> {
@@ -93,6 +99,15 @@ mod tests {
         assert_eq!(personality.configuration_descriptor[4], 1);
         assert_eq!(personality.configuration_descriptor.len(), 32);
         assert_eq!(personality.device_descriptor[16], 3);
+        let microsoft = personality
+            .microsoft_os_1
+            .as_ref()
+            .expect("YubiHSM personality must announce WinUSB");
+        assert_eq!(microsoft.vendor_code, 0x27);
+        assert_eq!(microsoft.compatible_ids.len(), 1);
+        assert_eq!(microsoft.compatible_ids[0].interface, 0);
+        assert_eq!(microsoft.compatible_ids[0].compatible_id, "WINUSB");
+        assert_eq!(microsoft.compatible_ids[0].sub_compatible_id, "");
         assert!(personality.strings.iter().any(|descriptor| {
             descriptor.index == 3
                 && descriptor.language_id == 0x0409

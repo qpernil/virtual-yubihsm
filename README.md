@@ -79,7 +79,9 @@ within the session's domain and delegated-capability ceilings.
   options and audit state, with sessions and message counters kept volatile;
 - a complete unprivileged `usb-gadget-supervisor` worker exposing the official
   `1050:0030` full-speed bulk endpoint pair over FunctionFS, with the configured
-  device serial published as the USB serial-number string descriptor;
+  device serial published as the USB serial-number string descriptor and the
+  physical YubiHSM 2 Microsoft OS 1.0 declaration (`MSFT100`, vendor request
+  `0x27`, interface 0 compatible ID `WINUSB`);
 - a native ST7789 YubiHSM display with a green strap-hole LED and one
   invert-only blink scheduler: stopped with the LED off while USB is inactive,
   a 0.333 Hz three-second cycle while idle, and a measured 100 ms fast cycle
@@ -118,7 +120,10 @@ It receives the supervisor control channel on file descriptor 3, publishes its
 USB personality, receives the FunctionFS bulk endpoint descriptors, and passes
 each complete YubiHSM transfer to `virtual-yubihsm-core`. It clears volatile
 sessions on bind, unbind and disable events, stalls unsupported control
-requests, and participates in the supervisor's quiesce handshake. The display
+requests, and participates in the supervisor's quiesce handshake. The
+supervisor turns the worker's Microsoft OS declaration into the special string
+descriptor and compatible-ID vendor response that make Windows bind WinUSB
+without a separate INF. The display
 power state follows the published USB personality rather than any particular
 button. KEY3 uses the same detach/reinsert lifecycle as `virtual-yubikey`, so
 ejecting is one way to publish no personality and reinsertion restores it.
