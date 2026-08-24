@@ -27,3 +27,25 @@ ruby scripts/build_yubihsm_display_assets.rb \
 sips -s format png /tmp/yubihsm-led-off.ppm --out assets/yubihsm-led-off.png
 sips -s format png /tmp/yubihsm-led-on.ppm --out assets/yubihsm-led-on.png
 ```
+
+`yubihsm-oled-source.png` is the same complete device rotated onto its side and
+reframed in grayscale for a 128x64 SH1106 SPI OLED. A 4x4 Bayer pattern turns
+those source tones into strictly black-or-white pixels. The two 1,024-byte
+`.mono1` files use the native page and bit order expected by
+`display-backends`; only the strap-hole LED changes between them. The OLED
+receives one bit per pixel and performs no grayscale rendering.
+
+Rebuild the OLED assets on macOS with:
+
+```sh
+sips -s format bmp -z 64 128 assets/yubihsm-oled-source.png \
+  --out /tmp/yubihsm-oled-128.bmp
+ruby scripts/build_yubihsm_oled_assets.rb \
+  /tmp/yubihsm-oled-128.bmp \
+  assets/yubihsm-oled-led-off.mono1 assets/yubihsm-oled-led-on.mono1 \
+  /tmp/yubihsm-oled-led-off.pgm /tmp/yubihsm-oled-led-on.pgm
+sips -s format png /tmp/yubihsm-oled-led-off.pgm \
+  --out assets/yubihsm-oled-led-off.png
+sips -s format png /tmp/yubihsm-oled-led-on.pgm \
+  --out assets/yubihsm-oled-led-on.png
+```

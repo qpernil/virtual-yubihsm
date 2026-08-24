@@ -44,7 +44,11 @@ fn publish_personality(
     }
 }
 
-pub(crate) fn run_worker(serial: u32, stop: &'static AtomicBool) -> io::Result<()> {
+pub(crate) fn run_worker(
+    serial: u32,
+    display_kind: crate::DisplayKind,
+    stop: &'static AtomicBool,
+) -> io::Result<()> {
     // SAFETY: geteuid has no preconditions.
     if unsafe { libc::geteuid() } == 0 {
         return Err(io::Error::new(
@@ -62,8 +66,11 @@ pub(crate) fn run_worker(serial: u32, stop: &'static AtomicBool) -> io::Result<(
     };
     let device = Arc::new(Mutex::new(load_or_create_state(config, &state_path)?));
     let personality = crate::usb_identity::personality(serial).to_cbor()?;
-    let display =
-        crate::display::Controller::start(resources.display_spi, resources.display_control)?;
+    let display = crate::display::Controller::start(
+        resources.display_spi,
+        resources.display_control,
+        display_kind,
+    )?;
     let buttons = match crate::buttons::Controller::start(resources.reconnect_button) {
         Ok(buttons) => buttons,
         Err(error) => {

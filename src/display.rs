@@ -1,8 +1,13 @@
-//! Physical ST7789 status display for the virtual YubiHSM worker.
+//! Physical status display for the virtual YubiHSM worker.
 
-const FRAME_SIZE: usize = 240 * 240 * 2;
-const LED_OFF_FRAME: &[u8; FRAME_SIZE] = include_bytes!("../assets/yubihsm-led-off.rgb565");
-const LED_ON_FRAME: &[u8; FRAME_SIZE] = include_bytes!("../assets/yubihsm-led-on.rgb565");
+const COLOR_FRAME_SIZE: usize = 240 * 240 * 2;
+const OLED_FRAME_SIZE: usize = 128 * 64 / 8;
+const LED_OFF_FRAME: &[u8; COLOR_FRAME_SIZE] = include_bytes!("../assets/yubihsm-led-off.rgb565");
+const LED_ON_FRAME: &[u8; COLOR_FRAME_SIZE] = include_bytes!("../assets/yubihsm-led-on.rgb565");
+const OLED_LED_OFF_FRAME: &[u8; OLED_FRAME_SIZE] =
+    include_bytes!("../assets/yubihsm-oled-led-off.mono1");
+const OLED_LED_ON_FRAME: &[u8; OLED_FRAME_SIZE] =
+    include_bytes!("../assets/yubihsm-oled-led-on.mono1");
 
 #[cfg(target_os = "linux")]
 use display_backends::{Backend, Display};
@@ -107,7 +112,7 @@ pub(crate) struct Controller {
 
 #[cfg(target_os = "linux")]
 impl Controller {
-    pub(crate) fn start(bus: File, control: File) -> io::Result<Self> {
+    pub(crate) fn start(bus: File, control: File, kind: crate::DisplayKind) -> io::Result<Self> {
         let (sender, receiver) = mpsc::channel();
         let activity_state = Arc::new(ActivityState {
             sender: sender.clone(),
@@ -117,7 +122,7 @@ impl Controller {
         let display_activity_state = Arc::clone(&activity_state);
         let thread = thread::Builder::new()
             .name("yubihsm-display".to_owned())
-            .spawn(move || display_loop(bus, control, receiver, display_activity_state))?;
+            .spawn(move || display_loop(bus, control, kind, receiver, display_activity_state))?;
         Ok(Self {
             sender,
             activity_state,
@@ -188,10 +193,11 @@ fn send_command(sender: &Sender<Command>, command: Command) -> io::Result<()> {
 fn display_loop(
     bus: File,
     control: File,
+    kind: crate::DisplayKind,
     receiver: Receiver<Command>,
     activity_state: Arc<ActivityState>,
 ) {
-    let mut hardware = Hardware::new(bus, control);
+    let mut hardware = Hardware::new(bus, control, kind);
     let mut personality_present = false;
     let mut bound = false;
     let mut suspended = false;
@@ -405,16 +411,18 @@ fn earliest(first: Option<Instant>, second: Option<Instant>) -> Option<Instant> 
 struct Hardware {
     bus: File,
     control: File,
+    kind: crate::DisplayKind,
     display: Option<Display>,
     error_reported: bool,
 }
 
 #[cfg(target_os = "linux")]
 impl Hardware {
-    fn new(bus: File, control: File) -> Self {
+    fn new(bus: File, control: File, kind: crate::DisplayKind) -> Self {
         Self {
             bus,
             control,
+            kind,
             display: None,
             error_reported: false,
         }
@@ -422,8 +430,12 @@ impl Hardware {
 
     fn render(&mut self, led_on: bool) {
         if self.display.is_none() {
+            let backend = match self.kind {
+                crate::DisplayKind::St7789Spi => Backend::St7789Spi,
+                crate::DisplayKind::Sh1106Spi => Backend::Sh1106Spi,
+            };
             match Display::from_raw_fds(
-                Backend::St7789Spi,
+                backend,
                 self.bus.as_raw_fd(),
                 Some(self.control.as_raw_fd()),
             ) {
@@ -437,7 +449,12 @@ impl Hardware {
                 }
             }
         }
-        let frame = if led_on { LED_ON_FRAME } else { LED_OFF_FRAME };
+        let frame: &[u8] = match (self.kind, led_on) {
+            (crate::DisplayKind::St7789Spi, false) => LED_OFF_FRAME,
+            (crate::DisplayKind::St7789Spi, true) => LED_ON_FRAME,
+            (crate::DisplayKind::Sh1106Spi, false) => OLED_LED_OFF_FRAME,
+            (crate::DisplayKind::Sh1106Spi, true) => OLED_LED_ON_FRAME,
+        };
         if let Err(error) = self.display.as_mut().unwrap().write_native_frame(frame) {
             self.report_error("frame write", &error);
         }
@@ -467,8 +484,8 @@ mod tests {
 
     #[test]
     fn display_frames_change_only_the_strap_hole_led() {
-        assert_eq!(LED_OFF_FRAME.len(), FRAME_SIZE);
-        assert_eq!(LED_ON_FRAME.len(), FRAME_SIZE);
+        assert_eq!(LED_OFF_FRAME.len(), COLOR_FRAME_SIZE);
+        assert_eq!(LED_ON_FRAME.len(), COLOR_FRAME_SIZE);
         let mut changed = 0;
         for (index, (off, on)) in LED_OFF_FRAME
             .chunks_exact(2)
@@ -485,6 +502,13 @@ mod tests {
             assert!((37..=54).contains(&y));
         }
         assert!((100..600).contains(&changed));
+    }
+
+    #[test]
+    fn oled_frames_are_native_monochrome_images() {
+        assert_eq!(OLED_LED_OFF_FRAME.len(), OLED_FRAME_SIZE);
+        assert_eq!(OLED_LED_ON_FRAME.len(), OLED_FRAME_SIZE);
+        assert_ne!(OLED_LED_OFF_FRAME, OLED_LED_ON_FRAME);
     }
 
     #[cfg(target_os = "linux")]

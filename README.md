@@ -82,7 +82,8 @@ within the session's domain and delegated-capability ceilings.
   device serial published as the USB serial-number string descriptor and the
   physical YubiHSM 2 Microsoft OS 1.0 declaration (`MSFT100`, vendor request
   `0x27`, interface 0 compatible ID `WINUSB`);
-- a native ST7789 YubiHSM display with a green strap-hole LED and one
+- native display images for either the 240x240 ST7789 color panel or the
+  128x64 SH1106 one-bit OLED, with a strap-hole LED and one
   invert-only blink scheduler: stopped with the LED off while USB is inactive,
   a 0.333 Hz three-second cycle while idle, and a measured 100 ms fast cycle
   throughout command execution with 67 ms on and 33 ms off. Command entry and
@@ -160,8 +161,8 @@ an inversion; the stopped state is the sole exception and always forces the LED
 off.
 
 Activity notifications carry current state rather than a history of start/end
-events. Multiple transitions can therefore be coalesced while the synchronous
-ST7789 frame writer is busy, preventing completed command bursts from producing
+events. Multiple transitions can therefore be coalesced while a synchronous
+display frame write is busy, preventing completed command bursts from producing
 delayed blinking. Overlapping command guards keep the fast cadence selected
 until the last guard exits.
 
@@ -177,11 +178,15 @@ It never logs command payloads or cryptographic material. These diagnostics are
 separate from the device audit log and do not change the rule that meta-commands
 are never audited.
 
-[`profiles/virtual-yubihsm.toml`](profiles/virtual-yubihsm.toml) is an
-installation template for the supervisor. Replace the worker command and
-account with deployment-specific absolute values. Its named display and KEY3
-resources intentionally match the `virtual-yubikey` profile so either worker
-can use the same display HAT wiring.
+[`profiles/virtual-yubihsm.toml`](profiles/virtual-yubihsm.toml) is the
+installation template for the 240x240 ST7789 color display;
+[`profiles/virtual-yubihsm-sh1106-spi.toml`](profiles/virtual-yubihsm-sh1106-spi.toml)
+selects the 128x64 SH1106 monochrome OLED. Replace the worker command and
+account in the chosen profile with deployment-specific absolute values. The
+worker includes both native asset sets and selects one with `--display`; it
+performs no image conversion at runtime. The profiles' named display and KEY3
+resources intentionally match the corresponding `virtual-yubikey` profiles so
+either worker can use the same wiring.
 
 ## Development
 
