@@ -463,7 +463,7 @@ fn serve_endpoint(
             match endpoints.output.read(&mut request) {
                 Ok(0) => {}
                 Ok(length) => {
-                    display_activity.pulse();
+                    let activity = display_activity.begin();
                     let response = {
                         let mut device = device
                             .lock()
@@ -493,6 +493,7 @@ fn serve_endpoint(
                         response
                     };
                     write_transfer(&mut endpoints.input, &response)?;
+                    drop(activity);
                 }
                 Err(error) if error.kind() == io::ErrorKind::Interrupted => {}
                 Err(error) if endpoint_is_gone(&error) => thread::sleep(ENDPOINT_RETRY_DELAY),

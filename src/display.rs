@@ -13,18 +13,14 @@ use std::io;
 #[cfg(target_os = "linux")]
 use std::os::fd::AsRawFd;
 #[cfg(target_os = "linux")]
-use std::sync::atomic::{AtomicBool, Ordering};
-#[cfg(target_os = "linux")]
 use std::sync::mpsc::{self, Receiver, RecvTimeoutError, Sender};
-#[cfg(target_os = "linux")]
-use std::sync::Arc;
 #[cfg(target_os = "linux")]
 use std::thread::{self, JoinHandle};
 #[cfg(target_os = "linux")]
 use std::time::{Duration, Instant};
 
 #[cfg(target_os = "linux")]
-const ACTIVITY_HOLD: Duration = Duration::from_millis(90);
+const ACTIVITY_BLINK_HALF_PERIOD: Duration = Duration::from_millis(60);
 #[cfg(target_os = "linux")]
 const NORMAL_BLINK_HALF_PERIOD: Duration = Duration::from_secs(1);
 #[cfg(target_os = "linux")]
@@ -34,17 +30,14 @@ const IDENTIFY_BLINK_HALF_PERIOD: Duration = Duration::from_millis(125);
 #[derive(Clone)]
 pub(crate) struct Activity {
     sender: Sender<Command>,
-    activity_pending: Arc<AtomicBool>,
 }
 
 #[cfg(target_os = "linux")]
 impl Activity {
-    pub(crate) fn pulse(&self) {
-        if self.activity_pending.swap(true, Ordering::AcqRel) {
-            return;
-        }
-        if self.sender.send(Command::Activity).is_err() {
-            self.activity_pending.store(false, Ordering::Release);
+    pub(crate) fn begin(&self) -> ActivityGuard {
+        ActivityGuard {
+            sender: self.sender.clone(),
+            started: self.sender.send(Command::ActivityStart).is_ok(),
         }
     }
 
@@ -54,9 +47,23 @@ impl Activity {
 }
 
 #[cfg(target_os = "linux")]
+pub(crate) struct ActivityGuard {
+    sender: Sender<Command>,
+    started: bool,
+}
+
+#[cfg(target_os = "linux")]
+impl Drop for ActivityGuard {
+    fn drop(&mut self) {
+        if self.started {
+            let _ = self.sender.send(Command::ActivityEnd);
+        }
+    }
+}
+
+#[cfg(target_os = "linux")]
 pub(crate) struct Controller {
     sender: Sender<Command>,
-    activity_pending: Arc<AtomicBool>,
     thread: JoinHandle<()>,
 }
 
@@ -64,22 +71,15 @@ pub(crate) struct Controller {
 impl Controller {
     pub(crate) fn start(bus: File, control: File) -> io::Result<Self> {
         let (sender, receiver) = mpsc::channel();
-        let activity_pending = Arc::new(AtomicBool::new(false));
-        let display_activity_pending = activity_pending.clone();
         let thread = thread::Builder::new()
             .name("yubihsm-display".to_owned())
-            .spawn(move || display_loop(bus, control, receiver, display_activity_pending))?;
-        Ok(Self {
-            sender,
-            activity_pending,
-            thread,
-        })
+            .spawn(move || display_loop(bus, control, receiver))?;
+        Ok(Self { sender, thread })
     }
 
     pub(crate) fn activity(&self) -> Activity {
         Activity {
             sender: self.sender.clone(),
-            activity_pending: self.activity_pending.clone(),
         }
     }
 
@@ -110,7 +110,8 @@ impl Controller {
 #[cfg(target_os = "linux")]
 #[derive(Clone, Copy)]
 enum Command {
-    Activity,
+    ActivityStart,
+    ActivityEnd,
     Identify(u8),
     Bind,
     Unbind,
@@ -127,18 +128,15 @@ fn send_command(sender: &Sender<Command>, command: Command) -> io::Result<()> {
 }
 
 #[cfg(target_os = "linux")]
-fn display_loop(
-    bus: File,
-    control: File,
-    receiver: Receiver<Command>,
-    activity_pending: Arc<AtomicBool>,
-) {
+fn display_loop(bus: File, control: File, receiver: Receiver<Command>) {
     let mut hardware = Hardware::new(bus, control);
     let mut bound = false;
     let mut suspended = false;
     let mut normal_lit = false;
     let mut normal_due = None;
-    let mut activity_until = None;
+    let mut activity_count = 0_usize;
+    let mut activity_due = None;
+    let mut activity_lit = false;
     let mut identify_until = None;
     let mut identify_due = None;
     let mut identify_lit = false;
@@ -146,8 +144,10 @@ fn display_loop(
     loop {
         let deadline = if identify_until.is_some() {
             earliest(identify_due, identify_until)
+        } else if activity_count != 0 {
+            activity_due
         } else {
-            earliest(normal_due, activity_until)
+            normal_due
         };
         let received = match deadline {
             Some(deadline) => receiver
@@ -168,25 +168,31 @@ fn display_loop(
                         identify_until = None;
                         identify_due = None;
                         identify_lit = false;
-                        normal_lit = false;
-                        normal_due = Some(now + NORMAL_BLINK_HALF_PERIOD);
-                        hardware.render(false);
+                        if activity_count != 0 {
+                            activity_lit = true;
+                            activity_due = Some(now + ACTIVITY_BLINK_HALF_PERIOD);
+                            hardware.render(true);
+                        } else {
+                            normal_lit = false;
+                            normal_due = Some(now + NORMAL_BLINK_HALF_PERIOD);
+                            hardware.render(false);
+                        }
                     } else if identify_due.is_some_and(|due| now >= due) {
                         identify_lit = !identify_lit;
                         hardware.render(identify_lit);
                         identify_due = Some(now + IDENTIFY_BLINK_HALF_PERIOD);
                     }
-                } else {
-                    let activity_ended = activity_until.is_some_and(|until| now >= until);
-                    if activity_ended {
-                        activity_until = None;
+                } else if activity_count != 0 {
+                    if activity_due.is_some_and(|due| now >= due) {
+                        activity_lit = !activity_lit;
+                        activity_due = Some(now + ACTIVITY_BLINK_HALF_PERIOD);
+                        hardware.render(activity_lit);
                     }
+                } else {
                     let normal_changed = normal_due.is_some_and(|due| now >= due);
                     if normal_changed {
                         normal_lit = !normal_lit;
                         normal_due = Some(now + NORMAL_BLINK_HALF_PERIOD);
-                    }
-                    if activity_ended || (normal_changed && activity_until.is_none()) {
                         hardware.render(normal_lit);
                     }
                 }
@@ -196,11 +202,26 @@ fn display_loop(
         };
 
         match command {
-            Command::Activity => {
-                activity_pending.store(false, Ordering::Release);
-                if bound && !suspended && identify_until.is_none() {
-                    hardware.render(!normal_lit);
-                    activity_until = Some(Instant::now() + ACTIVITY_HOLD);
+            Command::ActivityStart => {
+                activity_count = activity_count.saturating_add(1);
+                if activity_count == 1 && bound && !suspended && identify_until.is_none() {
+                    let now = Instant::now();
+                    activity_lit = true;
+                    activity_due = Some(now + ACTIVITY_BLINK_HALF_PERIOD);
+                    normal_due = None;
+                    hardware.render(true);
+                }
+            }
+            Command::ActivityEnd => {
+                activity_count = activity_count.saturating_sub(1);
+                if activity_count == 0 {
+                    activity_due = None;
+                    if bound && !suspended && identify_until.is_none() {
+                        let now = Instant::now();
+                        normal_lit = false;
+                        normal_due = Some(now + NORMAL_BLINK_HALF_PERIOD);
+                        hardware.render(false);
+                    }
                 }
             }
             Command::Identify(seconds) => {
@@ -210,7 +231,7 @@ fn display_loop(
                     identify_until = Some(now + Duration::from_secs(u64::from(seconds)));
                     identify_due = Some(now + IDENTIFY_BLINK_HALF_PERIOD);
                     normal_due = None;
-                    activity_until = None;
+                    activity_due = None;
                     hardware.render(true);
                 }
             }
@@ -219,7 +240,8 @@ fn display_loop(
                 suspended = false;
                 normal_lit = false;
                 normal_due = Some(Instant::now() + NORMAL_BLINK_HALF_PERIOD);
-                activity_until = None;
+                activity_count = 0;
+                activity_due = None;
                 identify_until = None;
                 identify_due = None;
                 hardware.render(false);
@@ -228,7 +250,8 @@ fn display_loop(
                 bound = false;
                 suspended = false;
                 normal_due = None;
-                activity_until = None;
+                activity_count = 0;
+                activity_due = None;
                 identify_until = None;
                 identify_due = None;
                 hardware.turn_off("USB unbind");
@@ -236,7 +259,7 @@ fn display_loop(
             Command::Suspend => {
                 suspended = true;
                 normal_due = None;
-                activity_until = None;
+                activity_due = None;
                 identify_until = None;
                 identify_due = None;
                 if bound {
@@ -246,9 +269,16 @@ fn display_loop(
             Command::Resume => {
                 if bound && suspended {
                     suspended = false;
-                    normal_lit = false;
-                    normal_due = Some(Instant::now() + NORMAL_BLINK_HALF_PERIOD);
-                    hardware.render(false);
+                    let now = Instant::now();
+                    if activity_count != 0 {
+                        activity_lit = true;
+                        activity_due = Some(now + ACTIVITY_BLINK_HALF_PERIOD);
+                        hardware.render(true);
+                    } else {
+                        normal_lit = false;
+                        normal_due = Some(now + NORMAL_BLINK_HALF_PERIOD);
+                        hardware.render(false);
+                    }
                 }
             }
             Command::Shutdown => {
@@ -352,5 +382,18 @@ mod tests {
             assert!((37..=54).contains(&y));
         }
         assert!((100..600).contains(&changed));
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn activity_guard_brackets_work_and_uses_the_fast_cadence() {
+        let (sender, receiver) = mpsc::channel();
+        let activity = Activity { sender };
+        {
+            let _guard = activity.begin();
+            assert!(matches!(receiver.recv().unwrap(), Command::ActivityStart));
+        }
+        assert!(matches!(receiver.recv().unwrap(), Command::ActivityEnd));
+        assert_eq!(ACTIVITY_BLINK_HALF_PERIOD, Duration::from_millis(60));
     }
 }
