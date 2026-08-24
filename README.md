@@ -111,6 +111,13 @@ eject, and shutdown turn it off; resume or reinsertion restarts its normal
 0.5 Hz blink. KEY3 uses the same detach/reinsert lifecycle as `virtual-yubikey`.
 The worker refuses to run as root.
 
+When a protocol command fails, the worker writes a diagnostic to the service
+journal containing the command name and byte, the returned device error, and,
+for an authenticated command, its session and Authentication Key identifiers.
+It never logs command payloads or cryptographic material. These diagnostics are
+separate from the device audit log and do not change the rule that meta-commands
+are never audited.
+
 [`profiles/virtual-yubihsm.toml`](profiles/virtual-yubihsm.toml) is an
 installation template for the supervisor. Replace the worker command and
 account with deployment-specific absolute values. Its named display and KEY3

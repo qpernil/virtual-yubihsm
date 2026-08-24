@@ -19,7 +19,9 @@ use std::{
     time::Duration,
 };
 use usb_gadget_worker::UsbBusEvent;
-use virtual_yubihsm_core::{CommandCode, Device, DeviceConfig};
+use virtual_yubihsm_core::{
+    CommandCode, Device, DeviceConfig, DeviceError, Frame, SessionAuthorization,
+};
 
 const MAX_TRANSFER: usize = u16::MAX as usize + 3;
 const ENDPOINT_RETRY_DELAY: Duration = Duration::from_millis(10);
@@ -466,9 +468,17 @@ fn serve_endpoint(
                         let mut device = device
                             .lock()
                             .map_err(|_| io::Error::other("device lock poisoned"))?;
+                        let outer_request = Frame::parse(&request[..length]);
+                        let session_id = outer_request.as_ref().ok().and_then(session_id);
                         let response = device.handle_encoded_observing(
                             &request[..length],
-                            |_, request, response| {
+                            |authorization, request, response| {
+                                log_authenticated_failure(
+                                    session_id,
+                                    authorization,
+                                    request,
+                                    response,
+                                );
                                 if request.command == CommandCode::BlinkDevice as u8
                                     && response.command == (CommandCode::BlinkDevice as u8 | 0x80)
                                 {
@@ -476,6 +486,7 @@ fn serve_endpoint(
                                 }
                             },
                         );
+                        log_outer_failure(outer_request.as_ref(), &response, length);
                         if device.take_persistent_change() {
                             persist_device_state(&device, state_path)?;
                         }
@@ -494,6 +505,93 @@ fn serve_endpoint(
         stop.store(true, Ordering::Relaxed);
     }
     result
+}
+
+fn session_id(request: &Frame) -> Option<u8> {
+    matches!(
+        CommandCode::from_byte(request.command),
+        Some(CommandCode::AuthenticateSession | CommandCode::SessionMessage)
+    )
+    .then(|| request.data.first().copied())
+    .flatten()
+}
+
+fn log_authenticated_failure(
+    session_id: Option<u8>,
+    authorization: SessionAuthorization,
+    request: &Frame,
+    response: &Frame,
+) {
+    let Some((error_code, error)) = response_error(response) else {
+        return;
+    };
+    eprintln!(
+        "virtual-yubihsm-worker: authenticated command {} ({:#04x}) failed: {} ({:#04x}); session={} authentication-key={:#06x}",
+        command_name(request.command),
+        request.command,
+        error,
+        error_code,
+        session_id.map_or_else(|| "unknown".to_owned(), |sid| sid.to_string()),
+        authorization.authentication_key_id,
+    );
+}
+
+fn log_outer_failure(
+    request: Result<&Frame, &DeviceError>,
+    encoded_response: &[u8],
+    length: usize,
+) {
+    let Ok(response) = Frame::parse(encoded_response) else {
+        eprintln!(
+            "virtual-yubihsm-worker: internal protocol response could not be parsed; transfer-length={length}"
+        );
+        return;
+    };
+    let Some((error_code, error)) = response_error(&response) else {
+        return;
+    };
+    match request {
+        Ok(request) => {
+            let context = session_id(request)
+                .map_or_else(String::new, |sid| format!("; session={sid}"));
+            if request.command == CommandCode::SessionMessage as u8 {
+                eprintln!(
+                    "virtual-yubihsm-worker: secure session envelope failed before inner command dispatch: {} ({:#04x}){}",
+                    error, error_code, context,
+                );
+            } else {
+                eprintln!(
+                    "virtual-yubihsm-worker: plain command {} ({:#04x}) failed: {} ({:#04x}){}",
+                    command_name(request.command),
+                    request.command,
+                    error,
+                    error_code,
+                    context,
+                );
+            }
+        }
+        Err(parse_error) => eprintln!(
+            "virtual-yubihsm-worker: protocol transfer failed before command dispatch: {parse_error} ({:#04x}); transfer-length={length}",
+            *parse_error as u8,
+        ),
+    }
+}
+
+fn response_error(response: &Frame) -> Option<(u8, String)> {
+    if response.command != 0x7f {
+        return None;
+    }
+    let code = response.data.first().copied().unwrap_or(0xff);
+    let description = DeviceError::from_byte(code).map_or_else(
+        || "unknown device error".to_owned(),
+        |error| error.to_string(),
+    );
+    Some((code, description))
+}
+
+fn command_name(command: u8) -> String {
+    CommandCode::from_byte(command)
+        .map_or_else(|| "Unknown".to_owned(), |command| format!("{command:?}"))
 }
 
 fn load_or_create_state(config: DeviceConfig, path: &Path) -> io::Result<Device> {

@@ -363,17 +363,29 @@ impl Device {
 
     /// Handle a command that is valid outside a secure session.
     pub fn execute_plain(&self, request: &Frame) -> Frame {
-        let result = match CommandCode::from_byte(request.command) {
-            Some(CommandCode::Echo) => Ok(request.data.clone()),
-            Some(CommandCode::GetDeviceInfo) => self.get_device_info(&request.data),
-            Some(CommandCode::GetDevicePublicKey) => self.get_device_public_key(&request.data),
-            Some(_) => Err(DeviceError::InvalidSession),
-            None => Err(DeviceError::InvalidCommand),
-        };
+        let result = self
+            .execute_plain_or_authenticated(request)
+            .unwrap_or_else(|| {
+                if CommandCode::from_byte(request.command).is_some() {
+                    Err(DeviceError::InvalidSession)
+                } else {
+                    Err(DeviceError::InvalidCommand)
+                }
+            });
         match result {
             Ok(data) => Frame::response(request.command, data),
             Err(error) => Frame::error(error),
         }
+    }
+
+    /// Commands accepted both directly and inside an authenticated session.
+    fn execute_plain_or_authenticated(&self, request: &Frame) -> Option<Result<Vec<u8>>> {
+        Some(match CommandCode::from_byte(request.command)? {
+            CommandCode::Echo => Ok(request.data.clone()),
+            CommandCode::GetDeviceInfo => self.get_device_info(&request.data),
+            CommandCode::GetDevicePublicKey => self.get_device_public_key(&request.data),
+            _ => return None,
+        })
     }
 
     fn create_session(&mut self, data: &[u8]) -> Result<Frame> {
@@ -662,6 +674,9 @@ impl Device {
         authorization: SessionAuthorization,
         request: &Frame,
     ) -> Result<Vec<u8>> {
+        if let Some(result) = self.execute_plain_or_authenticated(request) {
+            return result;
+        }
         let command = CommandCode::from_byte(request.command).ok_or(DeviceError::InvalidCommand)?;
         if let Some(required) = command.required_session_capability() {
             authorization.require_capability(required)?;
@@ -3536,7 +3551,8 @@ mod tests {
         let mut counter = [0; BLOCK_SIZE];
         counter[BLOCK_SIZE - 1] = 1;
         let iv = encrypt_block(&s_enc, &counter).unwrap();
-        let inner = Frame::new(CommandCode::GetStorageInfo as u8, Vec::new()).unwrap();
+        let echo_payload = b"session keepalive".to_vec();
+        let inner = Frame::new(CommandCode::Echo as u8, echo_payload.clone()).unwrap();
         let ciphertext = cbc_encrypt(&s_enc, &iv, &pad(&inner.encode())).unwrap();
         let mut message_payload = vec![sid];
         message_payload.extend_from_slice(&ciphertext);
@@ -3567,11 +3583,25 @@ mod tests {
         assert_eq!(response.data[0], sid);
         let clear = cbc_decrypt(&s_enc, &iv, &response.data[1..response_payload_length]).unwrap();
         let inner_response = Frame::parse(&unpad(clear).unwrap()).unwrap();
-        assert_eq!(
-            inner_response.command,
-            CommandCode::GetStorageInfo as u8 | 0x80
-        );
-        assert_eq!(inner_response.data.len(), 10);
+        assert_eq!(inner_response.command, CommandCode::Echo as u8 | 0x80);
+        assert_eq!(inner_response.data, echo_payload);
+        assert_eq!(device.active_session_count(), 1);
+    }
+
+    #[test]
+    fn directly_available_commands_are_also_available_in_a_session() {
+        let mut device = Device::factory_default(DeviceConfig::default());
+        let authorization = device.session_authorization(1).unwrap();
+        for request in [
+            Frame::new(CommandCode::Echo as u8, b"echo".to_vec()).unwrap(),
+            Frame::new(CommandCode::GetDeviceInfo as u8, Vec::new()).unwrap(),
+            Frame::new(CommandCode::GetDevicePublicKey as u8, Vec::new()).unwrap(),
+        ] {
+            assert_eq!(
+                device.execute_inner(authorization, &request),
+                device.execute_plain(&request)
+            );
+        }
     }
 
     #[test]
