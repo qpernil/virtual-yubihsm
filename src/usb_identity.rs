@@ -8,13 +8,13 @@ pub(crate) const MAX_PACKET_SIZE: u16 = 64;
 const VENDOR_ID: u16 = 0x1050;
 const PRODUCT_ID: u16 = 0x0030;
 
-pub(crate) fn personality() -> UsbPersonality {
+pub(crate) fn personality(serial: u32) -> UsbPersonality {
     let vendor = VENDOR_ID.to_le_bytes();
     let product = PRODUCT_ID.to_le_bytes();
     let release = 0x0241_u16.to_le_bytes();
     let device = vec![
         18, 1, 0x00, 0x02, 0, 0, 0, 64, vendor[0], vendor[1], product[0], product[1], release[0],
-        release[1], 1, 2, 0, 1,
+        release[1], 1, 2, 3, 1,
     ];
     UsbPersonality::new(UsbSpeed::FullSpeed, device, configuration_descriptor())
         .with_string(StringDescriptor::new(0, 0, [4, 3, 0x09, 0x04]))
@@ -27,6 +27,11 @@ pub(crate) fn personality() -> UsbPersonality {
             2,
             0x0409,
             string_descriptor("Virtual YubiHSM 2"),
+        ))
+        .with_string(StringDescriptor::new(
+            3,
+            0x0409,
+            string_descriptor(&serial.to_string()),
         ))
 }
 
@@ -80,13 +85,19 @@ mod tests {
 
     #[test]
     fn publishes_the_yubihsm_bulk_personality() {
-        let personality = personality();
+        let personality = personality(87_654_321);
         assert_eq!(
             &personality.device_descriptor[8..12],
             &[0x50, 0x10, 0x30, 0x00]
         );
         assert_eq!(personality.configuration_descriptor[4], 1);
         assert_eq!(personality.configuration_descriptor.len(), 32);
+        assert_eq!(personality.device_descriptor[16], 3);
+        assert!(personality.strings.iter().any(|descriptor| {
+            descriptor.index == 3
+                && descriptor.language_id == 0x0409
+                && descriptor.descriptor == string_descriptor("87654321")
+        }));
         for address in [BULK_OUT, BULK_IN] {
             assert!(personality
                 .configuration_descriptor

@@ -78,7 +78,8 @@ within the session's domain and delegated-capability ceilings.
 - versioned CBOR persistence of objects, device identity, sequence metadata,
   options and audit state, with sessions and message counters kept volatile;
 - a complete unprivileged `usb-gadget-supervisor` worker exposing the official
-  `1050:0030` full-speed bulk endpoint pair over FunctionFS;
+  `1050:0030` full-speed bulk endpoint pair over FunctionFS, with the configured
+  device serial published as the USB serial-number string descriptor;
 - a native ST7789 YubiHSM display with a green strap-hole LED and one
   invert-only blink scheduler: stopped with the LED off while USB is inactive,
   a 0.333 Hz three-second cycle while idle, and a measured 100 ms fast cycle

@@ -63,7 +63,7 @@ pub(crate) fn run_worker(serial: u32, stop: &'static AtomicBool) -> io::Result<(
         ..DeviceConfig::default()
     };
     let device = Arc::new(Mutex::new(load_or_create_state(config, &state_path)?));
-    let personality = crate::usb_identity::personality().to_cbor()?;
+    let personality = crate::usb_identity::personality(serial).to_cbor()?;
     let display =
         crate::display::Controller::start(resources.display_spi, resources.display_control)?;
     let buttons = match crate::buttons::Controller::start(resources.reconnect_button) {
