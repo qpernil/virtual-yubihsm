@@ -109,13 +109,41 @@ USB personality, receives the FunctionFS bulk endpoint descriptors, and passes
 each complete YubiHSM transfer to `virtual-yubihsm-core`. It clears volatile
 sessions on bind, unbind and disable events, stalls unsupported control
 requests, and participates in the supervisor's quiesce handshake. The display
-keeps showing the YubiHSM with its LED off while USB is suspended, unbound, or
-otherwise inactive. Only publishing no USB personality powers the display off;
-republishing the personality restores the image, and bind or resume restarts
-its normal three-second, 0.333 Hz blink. KEY3 uses the same detach/reinsert lifecycle as
-`virtual-yubikey`, so ejecting publishes no personality and reinsertion restores
-it. Worker shutdown also powers the display off. The worker refuses to run as
-root.
+power state follows the published USB personality rather than any particular
+button. KEY3 uses the same detach/reinsert lifecycle as `virtual-yubikey`, so
+ejecting is one way to publish no personality and reinsertion restores it.
+Worker shutdown also powers the display off. The worker refuses to run as root.
+
+### Display and blink lifecycle
+
+The display uses one periodic invert-only scheduler. Its selected cadence is a
+direct consequence of the current USB and command state:
+
+| State | Display and LED behavior |
+| --- | --- |
+| No USB personality | Power the complete display off. |
+| Personality present, but USB suspended or unbound | Keep the YubiHSM image visible, stop the periodic scheduler, and force the LED off. |
+| USB bound and awake, with no command running | Invert every 1.5 seconds: a symmetric three-second, 0.333 Hz idle cycle. |
+| A command is running | Use the measured 100 ms fast cycle: hold on for 67 ms and off for 33 ms. |
+| An authenticated `Blink Device` duration remains | Continue using the same fast cycle after returning the command response. |
+
+Entering and leaving command activity each add one immediate LED inversion and
+restart the selected periodic timer from that edge. The next fast delay follows
+the resulting state: 67 ms after an on edge and 33 ms after an off edge. Fast
+activity takes precedence over the slow idle cadence. Every periodic event is
+an inversion; the stopped state is the sole exception and always forces the LED
+off.
+
+Activity notifications carry current state rather than a history of start/end
+events. Multiple transitions can therefore be coalesced while the synchronous
+ST7789 frame writer is busy, preventing completed command bursts from producing
+delayed blinking. Overlapping command guards keep the fast cadence selected
+until the last guard exits.
+
+`Blink Device` is asynchronous from the caller's perspective: its response is
+returned before the requested blinking ends. A later successful `Blink Device`
+request replaces the remaining deadline with its duration measured from the
+new command; durations are neither stacked nor added.
 
 When a protocol command fails, the worker writes a diagnostic to the service
 journal containing the command name and byte, the returned device error, and,
