@@ -24,7 +24,9 @@ use std::thread::{self, JoinHandle};
 use std::time::{Duration, Instant};
 
 #[cfg(target_os = "linux")]
-const ACTIVITY_BLINK_HALF_PERIOD: Duration = Duration::from_millis(60);
+const ACTIVITY_LED_ON_HOLD: Duration = Duration::from_millis(67);
+#[cfg(target_os = "linux")]
+const ACTIVITY_LED_OFF_HOLD: Duration = Duration::from_millis(33);
 #[cfg(target_os = "linux")]
 const NORMAL_BLINK_HALF_PERIOD: Duration = Duration::from_millis(1_500);
 
@@ -217,23 +219,25 @@ fn display_loop(
                 if identify_until.is_some_and(|until| now >= until) {
                     identify_until = None;
                     if activity_count == 0 {
-                        blink_due = selected_blink_period(
+                        blink_due = selected_blink_delay(
                             personality_present,
                             bound,
                             suspended,
                             activity_count,
                             identify_until,
+                            lit,
                         )
                         .map(|period| now + period);
                     }
                 } else if blink_due.is_some_and(|due| now >= due) {
                     invert_led(&mut hardware, &mut lit);
-                    blink_due = selected_blink_period(
+                    blink_due = selected_blink_delay(
                         personality_present,
                         bound,
                         suspended,
                         activity_count,
                         identify_until,
+                        lit,
                     )
                     .map(|period| Instant::now() + period);
                 }
@@ -259,12 +263,13 @@ fn display_loop(
                     if identify_until.is_some_and(|until| now >= until) {
                         identify_until = None;
                     }
-                    blink_due = selected_blink_period(
+                    blink_due = selected_blink_delay(
                         personality_present,
                         bound,
                         suspended,
                         activity_count,
                         identify_until,
+                        lit,
                     )
                     .map(|period| now + period);
                 }
@@ -274,7 +279,7 @@ fn display_loop(
                     let now = Instant::now();
                     identify_until = Some(now + Duration::from_secs(u64::from(seconds)));
                     if activity_count == 0 {
-                        blink_due = Some(now + ACTIVITY_BLINK_HALF_PERIOD);
+                        blink_due = Some(now + activity_blink_delay(lit));
                     }
                 }
             }
@@ -335,12 +340,13 @@ fn display_loop(
                     lit = false;
                     hardware.render(false);
                     activity_count = activity_state.active_count.load(Ordering::Acquire);
-                    blink_due = selected_blink_period(
+                    blink_due = selected_blink_delay(
                         personality_present,
                         bound,
                         suspended,
                         activity_count,
                         identify_until,
+                        lit,
                     )
                     .map(|period| Instant::now() + period);
                 }
@@ -360,19 +366,29 @@ fn invert_led(hardware: &mut Hardware, lit: &mut bool) {
 }
 
 #[cfg(target_os = "linux")]
-fn selected_blink_period(
+fn selected_blink_delay(
     personality_present: bool,
     bound: bool,
     suspended: bool,
     activity_count: usize,
     identify_until: Option<Instant>,
+    lit: bool,
 ) -> Option<Duration> {
     if !personality_present || !bound || suspended {
         None
     } else if activity_count != 0 || identify_until.is_some() {
-        Some(ACTIVITY_BLINK_HALF_PERIOD)
+        Some(activity_blink_delay(lit))
     } else {
         Some(NORMAL_BLINK_HALF_PERIOD)
+    }
+}
+
+#[cfg(target_os = "linux")]
+fn activity_blink_delay(lit: bool) -> Duration {
+    if lit {
+        ACTIVITY_LED_ON_HOLD
+    } else {
+        ACTIVITY_LED_OFF_HOLD
     }
 }
 
@@ -500,27 +516,35 @@ mod tests {
         assert!(matches!(receiver.recv().unwrap(), Command::ActivityChanged));
         assert!(receiver.try_recv().is_err());
 
-        assert_eq!(ACTIVITY_BLINK_HALF_PERIOD, Duration::from_millis(60));
-        assert!(ACTIVITY_BLINK_HALF_PERIOD < NORMAL_BLINK_HALF_PERIOD);
+        assert_eq!(ACTIVITY_LED_ON_HOLD, Duration::from_millis(67));
+        assert_eq!(ACTIVITY_LED_OFF_HOLD, Duration::from_millis(33));
+        assert_eq!(
+            ACTIVITY_LED_ON_HOLD + ACTIVITY_LED_OFF_HOLD,
+            Duration::from_millis(100)
+        );
+        assert!(ACTIVITY_LED_ON_HOLD < NORMAL_BLINK_HALF_PERIOD);
     }
 
     #[cfg(target_os = "linux")]
     #[test]
     fn blink_scheduler_selects_stopped_idle_and_activity_cadences() {
         let now = Instant::now();
-        assert_eq!(selected_blink_period(true, true, true, 0, None), None);
-        assert_eq!(selected_blink_period(true, false, false, 0, None), None);
+        assert_eq!(selected_blink_delay(true, true, true, 0, None, false), None);
         assert_eq!(
-            selected_blink_period(true, true, false, 0, None),
+            selected_blink_delay(true, false, false, 0, None, false),
+            None
+        );
+        assert_eq!(
+            selected_blink_delay(true, true, false, 0, None, false),
             Some(NORMAL_BLINK_HALF_PERIOD)
         );
         assert_eq!(
-            selected_blink_period(true, true, false, 1, None),
-            Some(ACTIVITY_BLINK_HALF_PERIOD)
+            selected_blink_delay(true, true, false, 1, None, true),
+            Some(ACTIVITY_LED_ON_HOLD)
         );
         assert_eq!(
-            selected_blink_period(true, true, false, 0, Some(now)),
-            Some(ACTIVITY_BLINK_HALF_PERIOD)
+            selected_blink_delay(true, true, false, 0, Some(now), false),
+            Some(ACTIVITY_LED_OFF_HOLD)
         );
     }
 }

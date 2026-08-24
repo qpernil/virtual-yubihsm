@@ -72,10 +72,10 @@ within the session's domain and delegated-capability ceilings.
   `1050:0030` full-speed bulk endpoint pair over FunctionFS;
 - a native ST7789 YubiHSM display with a green strap-hole LED and one
   invert-only blink scheduler: stopped with the LED off while USB is inactive,
-  a 0.333 Hz three-second cycle while idle, and a fast cadence throughout
-  command execution. Command entry and exit each add an immediate inversion;
-  authenticated `Blink Device` requests extend the fast cadence for their
-  requested duration.
+  a 0.333 Hz three-second cycle while idle, and a measured 100 ms fast cycle
+  throughout command execution with 67 ms on and 33 ms off. Command entry and
+  exit each add an immediate inversion; authenticated `Blink Device` requests
+  extend the fast cadence for their requested duration.
 
 All officially registered cryptographic algorithms are now represented and
 their general-purpose cryptographic command families are implemented. SSH
