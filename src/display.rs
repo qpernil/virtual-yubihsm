@@ -22,7 +22,7 @@ use std::time::{Duration, Instant};
 #[cfg(target_os = "linux")]
 const ACTIVITY_BLINK_HALF_PERIOD: Duration = Duration::from_millis(60);
 #[cfg(target_os = "linux")]
-const NORMAL_BLINK_HALF_PERIOD: Duration = Duration::from_secs(1);
+const NORMAL_BLINK_HALF_PERIOD: Duration = Duration::from_millis(1_500);
 #[cfg(target_os = "linux")]
 const IDENTIFY_BLINK_HALF_PERIOD: Duration = Duration::from_millis(125);
 

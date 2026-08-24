@@ -71,7 +71,7 @@ within the session's domain and delegated-capability ceilings.
 - a complete unprivileged `usb-gadget-supervisor` worker exposing the official
   `1050:0030` full-speed bulk endpoint pair over FunctionFS;
 - a native ST7789 YubiHSM display with a green strap-hole LED, its normal
-  0.5 Hz blink, an operation-scoped fast blink throughout command execution,
+  0.333 Hz blink with a three-second cycle, an operation-scoped fast blink throughout command execution,
   and authenticated identification blinking for the duration carried by the
   official `Blink Device` command.
 
@@ -110,7 +110,7 @@ requests, and participates in the supervisor's quiesce handshake. The display
 keeps showing the YubiHSM with its LED off while USB is suspended, unbound, or
 otherwise inactive. Only publishing no USB personality powers the display off;
 republishing the personality restores the image, and bind or resume restarts
-its normal 0.5 Hz blink. KEY3 uses the same detach/reinsert lifecycle as
+its normal three-second, 0.333 Hz blink. KEY3 uses the same detach/reinsert lifecycle as
 `virtual-yubikey`, so ejecting publishes no personality and reinsertion restores
 it. Worker shutdown also powers the display off. The worker refuses to run as
 root.
