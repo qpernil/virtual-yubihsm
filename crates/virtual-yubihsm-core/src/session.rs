@@ -1,11 +1,11 @@
 use crate::{
     secure_channel_crypto::{
-        cbc_decrypt, cbc_encrypt, cmac, encrypt_block, pad, scp03_kdf, unpad, BLOCK_SIZE,
+        cbc_decrypt, cbc_encrypt, cmac, encrypt_block, pad, unpad, BLOCK_SIZE,
     },
     DeviceError, Frame, Result, SessionAuthorization,
 };
 use p256::{ecdh::diffie_hellman, elliptic_curve::sec1::ToSec1Point, PublicKey, SecretKey};
-use sha2::{Digest, Sha256};
+use software_key_core::secure_channel::{scp03_cryptogram, scp03_key, x963_kdf_sha256};
 use subtle::ConstantTimeEq;
 use zeroize::Zeroizing;
 
@@ -92,7 +92,7 @@ impl SecureSession {
         let session_keys = x963_session_keys(
             ephemeral.raw_secret_bytes().as_slice(),
             static_secret.raw_secret_bytes().as_slice(),
-        );
+        )?;
         let mut receipt_input = Vec::with_capacity(P256_PUBLIC_KEY_LENGTH * 2);
         receipt_input.extend_from_slice(&device_ephemeral_public);
         receipt_input.extend_from_slice(host_ephemeral_public);
@@ -216,30 +216,24 @@ pub(crate) fn random_secret_key() -> Result<SecretKey> {
 }
 
 fn derive_key(key: &[u8], constant: u8, context: &[u8]) -> Result<[u8; BLOCK_SIZE]> {
-    scp03_kdf(key, constant, context, 128)?
-        .try_into()
-        .map_err(|_| DeviceError::SessionFailed)
+    scp03_key(key, constant, context).map_err(|_| DeviceError::SessionFailed)
 }
 
 fn derive_cryptogram(key: &[u8], constant: u8, context: &[u8]) -> Result<[u8; MAC_LENGTH]> {
-    scp03_kdf(key, constant, context, 64)?
-        .try_into()
-        .map_err(|_| DeviceError::SessionFailed)
+    scp03_cryptogram(key, constant, context).map_err(|_| DeviceError::SessionFailed)
 }
 
-fn x963_session_keys(ephemeral: &[u8], static_secret: &[u8]) -> Zeroizing<[u8; 64]> {
-    let mut output = Zeroizing::new([0; 64]);
-    for (index, chunk) in output.chunks_mut(32).enumerate() {
-        let mut input = Zeroizing::new(Vec::with_capacity(
-            ephemeral.len() + static_secret.len() + 4 + SCP11_SHARED_INFO.len(),
-        ));
-        input.extend_from_slice(ephemeral);
-        input.extend_from_slice(static_secret);
-        input.extend_from_slice(&((index + 1) as u32).to_be_bytes());
-        input.extend_from_slice(&SCP11_SHARED_INFO);
-        chunk.copy_from_slice(&Sha256::digest(&input));
-    }
-    output
+fn x963_session_keys(ephemeral: &[u8], static_secret: &[u8]) -> Result<Zeroizing<[u8; 64]>> {
+    let mut shared_secret =
+        Zeroizing::new(Vec::with_capacity(ephemeral.len() + static_secret.len()));
+    shared_secret.extend_from_slice(ephemeral);
+    shared_secret.extend_from_slice(static_secret);
+    x963_kdf_sha256(&shared_secret, &SCP11_SHARED_INFO, 64)
+        .map_err(|_| DeviceError::SessionFailed)?
+        .as_slice()
+        .try_into()
+        .map(Zeroizing::new)
+        .map_err(|_| DeviceError::SessionFailed)
 }
 
 fn increment_counter(counter: &mut [u8; BLOCK_SIZE]) {

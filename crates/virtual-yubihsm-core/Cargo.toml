@@ -8,15 +8,12 @@ license = "MIT OR Apache-2.0"
 publish = false
 
 [dependencies]
-aes = "0.8.4"
 ciborium = "0.2.2"
-cmac = "0.7.2"
 const-oid = "0.10.2"
 der = { version = "0.8.1", features = ["alloc", "derive", "std"] }
 getrandom = "0.4.3"
 hmac = "0.13.0"
 p256 = { version = "0.14.0", features = ["ecdh", "ecdsa", "pkcs8"] }
-pbkdf2 = { version = "0.13.0", features = ["hmac"] }
 rsa = { version = "0.9.10", default-features = false, features = ["std"] }
 serde = { version = "1.0.228", features = ["derive"] }
 sha2 = "0.11.0"

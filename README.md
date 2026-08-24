@@ -25,6 +25,15 @@ virtual-yubihsm-core
 software-key-core (path dependency)
 ```
 
+`software-key-core` owns reusable software keys and cryptographic
+computations: asymmetric generation/signing/agreement, RSA encodings,
+AES/CMAC/CCM/KWP, SCP03-style primitives, X9.63 derivation, and the Yubico
+password KDF. `virtual-yubihsm-core` owns command decoding, capabilities,
+delegated capabilities, domains, object lifecycle and persistence, sessions,
+counters, audit policy, and device error mapping. This keeps the cryptography
+shared without making either the HSM protocol or its authorization model a
+dependency of other consumers.
+
 An authenticated session receives exactly the Authentication Key object's:
 
 - capabilities — operations that the session may request;

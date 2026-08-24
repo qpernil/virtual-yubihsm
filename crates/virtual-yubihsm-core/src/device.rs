@@ -18,13 +18,13 @@ use p256::{
     elliptic_curve::sec1::ToSec1Point,
     SecretKey,
 };
-use pbkdf2::pbkdf2_hmac;
 use rsa::{pkcs8::EncodePublicKey, BigUint, RsaPublicKey};
 use serde::{Deserialize, Serialize};
 use sha1::Sha1;
 use sha2::{Digest, Sha256, Sha384, Sha512};
 use software_key_core::{
     rsa_signing::RsaHashAlgorithm,
+    secure_channel::yubico_password_kdf,
     software_key_agreement::{derive_with_signing_key, SoftwareX25519Key},
     software_signing::{EcCurve, SoftwarePublicKey, SoftwareSigningAlgorithm, SoftwareSigningKey},
     software_symmetric::{
@@ -2494,12 +2494,6 @@ impl Device {
         };
         self.objects.insert(record.info.key(), record);
     }
-}
-
-fn yubico_password_kdf(password: &[u8]) -> Zeroizing<[u8; 32]> {
-    let mut output = Zeroizing::new([0; 32]);
-    pbkdf2_hmac::<Sha256>(password, b"Yubico", 10_000, output.as_mut());
-    output
 }
 
 fn authentication_key_length(algorithm: u8) -> Result<usize> {

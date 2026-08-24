@@ -657,6 +657,7 @@ version = "0.1.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "add6b9d92e496f16f4526d68ff29da1483aba4b119baeab8bed3b9e3544a6f3d"
 dependencies = [
+ "const-oid 0.10.2",
  "crypto-common 0.2.2",
  "ctutils",
  "hybrid-array",
@@ -703,6 +704,7 @@ dependencies = [
  "num-iter",
  "num-traits",
  "rand",
+ "serde",
  "smallvec",
  "zeroize",
 ]
@@ -912,6 +914,7 @@ version = "0.8.7"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "22f6172bdec972074665ed81ed53b71da00bfc44b65a753cfde883ec4c702a1a"
 dependencies = [
+ "libc",
  "rand_chacha",
  "rand_core 0.6.4",
 ]
@@ -1129,16 +1132,21 @@ dependencies = [
  "bp256",
  "bp384",
  "ccm",
+ "cmac",
  "ecdsa",
  "ed25519-dalek",
  "elliptic-curve",
  "getrandom 0.4.3",
+ "hkdf",
+ "hmac",
  "k256",
  "ml-dsa",
+ "num-bigint-dig",
  "p224",
  "p256",
  "p384",
  "p521",
+ "pbkdf2",
  "primefield",
  "primeorder",
  "rsa",
@@ -1304,15 +1312,12 @@ dependencies = [
 name = "virtual-yubihsm-core"
 version = "0.1.0"
 dependencies = [
- "aes 0.8.4",
  "ciborium",
- "cmac",
  "const-oid 0.10.2",
  "der 0.8.1",
  "getrandom 0.4.3",
  "hmac",
  "p256",
- "pbkdf2",
  "rsa",
  "serde",
  "sha1",
