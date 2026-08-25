@@ -157,9 +157,10 @@ consequence of the current USB and command state:
 
 Command activity starts an LED edge. The next fast delay follows the resulting
 state: 67 ms after an on edge and 33 ms after an off edge. Fast activity takes
-precedence over the slow idle cadence; after completion, periodic idle resumes
-from the current logical state. The stopped state is the sole exception and
-always forces the LED off.
+precedence over the slow idle cadence. A short command returns to the
+pre-command LED state after its pulse, then periodic idle resumes; activity
+therefore cannot look like a mere phase shift of the slow blink. The stopped
+state is the sole exception and always forces the LED off.
 
 A monotonic command epoch preserves a command that starts and finishes during a
 synchronous frame write. Activity arriving while a pulse is already visible may
