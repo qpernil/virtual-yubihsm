@@ -11,8 +11,8 @@ const OLED_LED_ON_FRAME: &[u8; OLED_FRAME_SIZE] =
 
 #[cfg(target_os = "linux")]
 use display_backends::indicator::{
-    AttentionGuard, Cadence, CommandGuard, Controller as IndicatorController, IdlePolicy,
-    IndicatorRenderer, Policy,
+    AttentionGuard, BlinkCount, Cadence, CommandGuard, Controller as IndicatorController,
+    IdlePolicy, IndicatorRenderer, Policy,
 };
 #[cfg(target_os = "linux")]
 use display_backends::{Backend, Display};
@@ -44,7 +44,10 @@ const MINIMUM_EDGE: Duration = Duration::from_millis(8);
 const fn indicator_policy() -> Policy {
     Policy::new(
         BUSY_CADENCE,
-        IdlePolicy::Periodic(IDLE_CADENCE),
+        IdlePolicy::Blink {
+            cadence: IDLE_CADENCE,
+            count: BlinkCount::Forever,
+        },
         MINIMUM_EDGE,
     )
 }
@@ -396,10 +399,10 @@ mod tests {
         assert_eq!(policy.busy.off, Duration::from_millis(33));
         assert_eq!(
             policy.idle,
-            IdlePolicy::Periodic(Cadence::new(
-                Duration::from_millis(1_500),
-                Duration::from_millis(1_500)
-            ))
+            IdlePolicy::Blink {
+                cadence: Cadence::new(Duration::from_millis(1_500), Duration::from_millis(1_500)),
+                count: BlinkCount::Forever,
+            }
         );
         assert_eq!(policy.minimum_edge, Duration::from_millis(8));
     }

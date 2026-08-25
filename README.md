@@ -47,7 +47,7 @@ operation capability on the object, and at least one shared domain. Creating an
 object additionally requires all requested domains and capabilities to be
 within the session's domain and delegated-capability ceilings.
 
-## Implemented checkpoint
+## Supported protocol
 
 - wire frame parsing and documented device errors;
 - device information, storage information, pseudo-random, reset, close and
@@ -90,7 +90,7 @@ within the session's domain and delegated-capability ceilings.
   Authenticated `Blink Device` requests extend the fast cadence for their
   requested duration.
 
-All officially registered cryptographic algorithms are now represented and
+All officially registered cryptographic algorithms are represented and
 their general-purpose cryptographic command families are implemented. SSH
 certificate signing is intentionally out of scope; template storage remains
 available for protocol compatibility, while `Sign SSH Certificate` returns the
@@ -113,6 +113,11 @@ and must only be accessible to the worker identity and the administrator.
 Secure sessions and secure-message counters are never serialized. `ResetDevice`
 clears objects, options, audit state and sessions, then reinstalls the factory
 Authentication Key while retaining the device's static identity.
+
+Persistent state retains a generation counter for every object identity seen
+since the last device reset, including deleted objects. Creation, recreation,
+and successful in-place opaque-data replacement advance that counter; object
+information and listings expose its low byte as the protocol sequence.
 
 ## Worker lifecycle
 
@@ -157,10 +162,11 @@ consequence of the current USB and command state:
 
 Command activity starts an LED edge. The next fast delay follows the resulting
 state: 67 ms after an on edge and 33 ms after an off edge. Fast activity takes
-precedence over the slow idle cadence. A short command returns to the
-pre-command LED state after its pulse, then periodic idle resumes; activity
-therefore cannot look like a mere phase shift of the slow blink. The stopped
-state is the sole exception and always forces the LED off.
+precedence over the slow idle cadence. Activity always establishes an on phase;
+if slow idle is already on, an 8 ms off separator makes the following on edge
+visible. A short command then finishes off, while a sustained command continues
+directly into the 67/33 ms cadence. Periodic idle restarts from off afterward.
+The stopped state always forces the LED off.
 
 A monotonic command epoch preserves a command that starts and finishes during a
 synchronous frame write. Activity arriving while a pulse is already visible may

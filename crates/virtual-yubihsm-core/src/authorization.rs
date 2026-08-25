@@ -67,8 +67,8 @@ impl SessionAuthorization {
     }
 
     pub fn authorize_delete(self, object: &ObjectInfo) -> Result<()> {
-        self.require_visible(object)?;
-        self.require_capability(object.object_type.deletion_capability())
+        let capability = object.object_type.deletion_capability();
+        self.authorize_use(object, capability, capability)
     }
 
     pub fn authorize_wrapped_export(
@@ -96,16 +96,11 @@ impl SessionAuthorization {
         Ok(())
     }
 
-    pub fn authorize_wrapped_import(
+    pub fn authorize_wrapped_creation(
         self,
         requested: &ObjectInfo,
         wrap_key: &ObjectRecord,
     ) -> Result<()> {
-        self.authorize_use(
-            &wrap_key.info,
-            Capability::ImportWrapped,
-            Capability::ImportWrapped,
-        )?;
         self.authorize_create(requested, Capability::ImportWrapped)?;
         if !requested
             .capabilities
