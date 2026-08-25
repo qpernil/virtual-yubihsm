@@ -10,6 +10,11 @@ const OLED_LED_ON_FRAME: &[u8; OLED_FRAME_SIZE] =
     include_bytes!("../assets/yubihsm-oled-led-on.mono1");
 
 #[cfg(target_os = "linux")]
+use display_backends::indicator::{
+    AttentionGuard, Cadence, CommandGuard, Controller as IndicatorController, IdlePolicy,
+    IndicatorRenderer, Policy,
+};
+#[cfg(target_os = "linux")]
 use display_backends::{Backend, Display};
 #[cfg(target_os = "linux")]
 use std::fs::File;
@@ -19,9 +24,8 @@ use std::io;
 use std::os::fd::AsRawFd;
 #[cfg(target_os = "linux")]
 use std::sync::{
-    atomic::{AtomicBool, AtomicUsize, Ordering},
     mpsc::{self, Receiver, RecvTimeoutError, Sender},
-    Arc,
+    Arc, Mutex,
 };
 #[cfg(target_os = "linux")]
 use std::thread::{self, JoinHandle};
@@ -29,110 +33,75 @@ use std::thread::{self, JoinHandle};
 use std::time::{Duration, Instant};
 
 #[cfg(target_os = "linux")]
-const ACTIVITY_LED_ON_HOLD: Duration = Duration::from_millis(67);
+const BUSY_CADENCE: Cadence = Cadence::new(Duration::from_millis(67), Duration::from_millis(33));
 #[cfg(target_os = "linux")]
-const ACTIVITY_LED_OFF_HOLD: Duration = Duration::from_millis(33);
+const IDLE_CADENCE: Cadence =
+    Cadence::new(Duration::from_millis(1_500), Duration::from_millis(1_500));
 #[cfg(target_os = "linux")]
-const NORMAL_BLINK_HALF_PERIOD: Duration = Duration::from_millis(1_500);
+const MINIMUM_EDGE: Duration = Duration::from_millis(8);
+
+#[cfg(target_os = "linux")]
+const fn indicator_policy() -> Policy {
+    Policy::new(
+        BUSY_CADENCE,
+        IdlePolicy::Periodic(IDLE_CADENCE),
+        MINIMUM_EDGE,
+    )
+}
 
 #[cfg(target_os = "linux")]
 #[derive(Clone)]
 pub(crate) struct Activity {
-    state: Arc<ActivityState>,
-}
-
-#[cfg(target_os = "linux")]
-struct ActivityState {
+    inner: display_backends::indicator::Activity,
     sender: Sender<Command>,
-    active_count: AtomicUsize,
-    notification_pending: AtomicBool,
-}
-
-#[cfg(target_os = "linux")]
-impl ActivityState {
-    fn notify(&self) {
-        if !self.notification_pending.swap(true, Ordering::AcqRel)
-            && self.sender.send(Command::ActivityChanged).is_err()
-        {
-            self.notification_pending.store(false, Ordering::Release);
-        }
-    }
 }
 
 #[cfg(target_os = "linux")]
 impl Activity {
-    pub(crate) fn begin(&self) -> ActivityGuard {
-        let previous = self
-            .state
-            .active_count
-            .fetch_update(Ordering::AcqRel, Ordering::Acquire, |count| {
-                Some(count.saturating_add(1))
-            })
-            .unwrap();
-        if previous == 0 {
-            self.state.notify();
-        }
-        ActivityGuard {
-            state: Arc::clone(&self.state),
-        }
+    pub(crate) fn begin(&self) -> CommandGuard {
+        self.inner.begin()
     }
 
     pub(crate) fn identify(&self, seconds: u8) {
-        let _ = self.state.sender.send(Command::Identify(seconds));
-    }
-}
-
-#[cfg(target_os = "linux")]
-pub(crate) struct ActivityGuard {
-    state: Arc<ActivityState>,
-}
-
-#[cfg(target_os = "linux")]
-impl Drop for ActivityGuard {
-    fn drop(&mut self) {
-        let previous = self
-            .state
-            .active_count
-            .fetch_update(Ordering::AcqRel, Ordering::Acquire, |count| {
-                Some(count.saturating_sub(1))
-            })
-            .unwrap();
-        if previous == 1 {
-            self.state.notify();
-        }
+        let _ = self.sender.send(Command::Identify(seconds));
     }
 }
 
 #[cfg(target_os = "linux")]
 pub(crate) struct Controller {
     sender: Sender<Command>,
-    activity_state: Arc<ActivityState>,
-    thread: JoinHandle<()>,
+    activity: display_backends::indicator::Activity,
+    thread: JoinHandle<io::Result<()>>,
 }
 
 #[cfg(target_os = "linux")]
 impl Controller {
     pub(crate) fn start(bus: File, control: File, kind: crate::DisplayKind) -> io::Result<Self> {
+        let hardware = Arc::new(Mutex::new(Hardware::new(bus, control, kind)));
+        let indicator = IndicatorController::start(
+            indicator_policy(),
+            HardwareRenderer {
+                hardware: Arc::clone(&hardware),
+            },
+            "yubihsm-indicator",
+        )?;
+        let activity = indicator.activity();
         let (sender, receiver) = mpsc::channel();
-        let activity_state = Arc::new(ActivityState {
-            sender: sender.clone(),
-            active_count: AtomicUsize::new(0),
-            notification_pending: AtomicBool::new(false),
-        });
-        let display_activity_state = Arc::clone(&activity_state);
+        let display_activity = activity.clone();
         let thread = thread::Builder::new()
             .name("yubihsm-display".to_owned())
-            .spawn(move || display_loop(bus, control, kind, receiver, display_activity_state))?;
+            .spawn(move || display_loop(indicator, hardware, receiver, display_activity))?;
         Ok(Self {
             sender,
-            activity_state,
+            activity,
             thread,
         })
     }
 
     pub(crate) fn activity(&self) -> Activity {
         Activity {
-            state: Arc::clone(&self.activity_state),
+            inner: self.activity.clone(),
+            sender: self.sender.clone(),
         }
     }
 
@@ -164,14 +133,13 @@ impl Controller {
         let _ = self.sender.send(Command::Shutdown);
         self.thread
             .join()
-            .map_err(|_| io::Error::other("YubiHSM display thread panicked"))
+            .map_err(|_| io::Error::other("YubiHSM display thread panicked"))?
     }
 }
 
 #[cfg(target_os = "linux")]
 #[derive(Clone, Copy)]
 enum Command {
-    ActivityChanged,
     Identify(u8),
     PersonalityPresent,
     PersonalityAbsent,
@@ -191,24 +159,19 @@ fn send_command(sender: &Sender<Command>, command: Command) -> io::Result<()> {
 
 #[cfg(target_os = "linux")]
 fn display_loop(
-    bus: File,
-    control: File,
-    kind: crate::DisplayKind,
+    indicator: IndicatorController,
+    hardware: Arc<Mutex<Hardware>>,
     receiver: Receiver<Command>,
-    activity_state: Arc<ActivityState>,
-) {
-    let mut hardware = Hardware::new(bus, control, kind);
+    activity: display_backends::indicator::Activity,
+) -> io::Result<()> {
     let mut personality_present = false;
     let mut bound = false;
     let mut suspended = false;
-    let mut lit = false;
-    let mut activity_count = 0_usize;
-    let mut identify_until = None;
-    let mut blink_due = None;
+    let mut identify_until: Option<Instant> = None;
+    let mut identify_guard: Option<AttentionGuard> = None;
 
     loop {
-        let deadline = earliest(blink_due, identify_until);
-        let received = match deadline {
+        let received = match identify_until {
             Some(deadline) => receiver
                 .recv_timeout(deadline.saturating_duration_since(Instant::now()))
                 .map(Some),
@@ -221,189 +184,103 @@ fn display_loop(
             Ok(Some(command)) => command,
             Ok(None) => unreachable!(),
             Err(RecvTimeoutError::Timeout) => {
-                let now = Instant::now();
-                if identify_until.is_some_and(|until| now >= until) {
-                    identify_until = None;
-                    if activity_count == 0 {
-                        blink_due = selected_blink_delay(
-                            personality_present,
-                            bound,
-                            suspended,
-                            activity_count,
-                            identify_until,
-                            lit,
-                        )
-                        .map(|period| now + period);
-                    }
-                } else if blink_due.is_some_and(|due| now >= due) {
-                    invert_led(&mut hardware, &mut lit);
-                    blink_due = selected_blink_delay(
-                        personality_present,
-                        bound,
-                        suspended,
-                        activity_count,
-                        identify_until,
-                        lit,
-                    )
-                    .map(|period| Instant::now() + period);
-                }
+                identify_until = None;
+                drop(identify_guard.take());
                 continue;
             }
             Err(RecvTimeoutError::Disconnected) => Command::Shutdown,
         };
 
         match command {
-            Command::ActivityChanged => {
-                activity_state
-                    .notification_pending
-                    .store(false, Ordering::Release);
-                let current_count = activity_state.active_count.load(Ordering::Acquire);
-                let was_active = activity_count != 0;
-                let is_active = current_count != 0;
-                activity_count = current_count;
-                if was_active != is_active {
-                    if personality_present && bound && !suspended {
-                        invert_led(&mut hardware, &mut lit);
-                    }
-                    let now = Instant::now();
-                    if identify_until.is_some_and(|until| now >= until) {
-                        identify_until = None;
-                    }
-                    blink_due = selected_blink_delay(
-                        personality_present,
-                        bound,
-                        suspended,
-                        activity_count,
-                        identify_until,
-                        lit,
-                    )
-                    .map(|period| now + period);
-                }
-            }
             Command::Identify(seconds) => {
                 if personality_present && bound && !suspended && seconds != 0 {
-                    let now = Instant::now();
-                    identify_until = Some(now + Duration::from_secs(u64::from(seconds)));
-                    if activity_count == 0 {
-                        blink_due = Some(now + activity_blink_delay(lit));
-                    }
+                    drop(identify_guard.take());
+                    identify_guard = Some(activity.attention(BUSY_CADENCE)?);
+                    identify_until = Some(Instant::now() + Duration::from_secs(u64::from(seconds)));
                 }
             }
             Command::PersonalityPresent => {
                 personality_present = true;
                 bound = false;
                 suspended = false;
-                lit = false;
-                activity_count = 0;
                 identify_until = None;
-                blink_due = None;
-                hardware.render(false);
+                drop(identify_guard.take());
+                indicator.disable()?;
+                lock_hardware(&hardware)?.render(false);
             }
             Command::PersonalityAbsent => {
                 personality_present = false;
                 bound = false;
                 suspended = false;
-                activity_count = 0;
                 identify_until = None;
-                blink_due = None;
-                lit = false;
-                hardware.turn_off("USB personality absent");
+                drop(identify_guard.take());
+                let result = indicator.disable();
+                lock_hardware(&hardware)?.turn_off("USB personality absent");
+                result?;
             }
             Command::Bind => {
                 bound = true;
                 suspended = false;
-                lit = false;
-                activity_count = 0;
                 identify_until = None;
-                blink_due = personality_present.then(|| Instant::now() + NORMAL_BLINK_HALF_PERIOD);
+                drop(identify_guard.take());
                 if personality_present {
-                    hardware.render(false);
+                    lock_hardware(&hardware)?.render(false);
+                    indicator.enable()?;
                 }
             }
             Command::Unbind => {
                 bound = false;
                 suspended = false;
-                activity_count = 0;
                 identify_until = None;
-                blink_due = None;
+                drop(identify_guard.take());
+                indicator.disable()?;
                 if personality_present {
-                    lit = false;
-                    hardware.render(false);
+                    lock_hardware(&hardware)?.render(false);
                 }
             }
             Command::Suspend => {
                 suspended = true;
                 identify_until = None;
-                blink_due = None;
+                drop(identify_guard.take());
+                indicator.disable()?;
                 if personality_present {
-                    lit = false;
-                    hardware.render(false);
+                    lock_hardware(&hardware)?.render(false);
                 }
             }
             Command::Resume => {
                 if personality_present && bound && suspended {
                     suspended = false;
-                    lit = false;
-                    hardware.render(false);
-                    activity_count = activity_state.active_count.load(Ordering::Acquire);
-                    blink_due = selected_blink_delay(
-                        personality_present,
-                        bound,
-                        suspended,
-                        activity_count,
-                        identify_until,
-                        lit,
-                    )
-                    .map(|period| Instant::now() + period);
+                    lock_hardware(&hardware)?.render(false);
+                    indicator.enable()?;
                 }
             }
             Command::Shutdown => {
-                hardware.turn_off("worker shutdown");
-                break;
+                drop(identify_guard.take());
+                let result = indicator.shutdown();
+                lock_hardware(&hardware)?.turn_off("worker shutdown");
+                return result;
             }
         }
     }
 }
 
 #[cfg(target_os = "linux")]
-fn invert_led(hardware: &mut Hardware, lit: &mut bool) {
-    *lit = !*lit;
-    hardware.render(*lit);
+fn lock_hardware(hardware: &Mutex<Hardware>) -> io::Result<std::sync::MutexGuard<'_, Hardware>> {
+    hardware
+        .lock()
+        .map_err(|_| io::Error::other("YubiHSM display lock poisoned"))
 }
 
 #[cfg(target_os = "linux")]
-fn selected_blink_delay(
-    personality_present: bool,
-    bound: bool,
-    suspended: bool,
-    activity_count: usize,
-    identify_until: Option<Instant>,
-    lit: bool,
-) -> Option<Duration> {
-    if !personality_present || !bound || suspended {
-        None
-    } else if activity_count != 0 || identify_until.is_some() {
-        Some(activity_blink_delay(lit))
-    } else {
-        Some(NORMAL_BLINK_HALF_PERIOD)
-    }
+struct HardwareRenderer {
+    hardware: Arc<Mutex<Hardware>>,
 }
 
 #[cfg(target_os = "linux")]
-fn activity_blink_delay(lit: bool) -> Duration {
-    if lit {
-        ACTIVITY_LED_ON_HOLD
-    } else {
-        ACTIVITY_LED_OFF_HOLD
-    }
-}
-
-#[cfg(target_os = "linux")]
-fn earliest(first: Option<Instant>, second: Option<Instant>) -> Option<Instant> {
-    match (first, second) {
-        (Some(first), Some(second)) => Some(first.min(second)),
-        (Some(value), None) | (None, Some(value)) => Some(value),
-        (None, None) => None,
+impl IndicatorRenderer for HardwareRenderer {
+    fn set_indicator(&mut self, lit: bool) -> io::Result<()> {
+        lock_hardware(&self.hardware)?.render(lit);
+        Ok(())
     }
 }
 
@@ -513,62 +390,17 @@ mod tests {
 
     #[cfg(target_os = "linux")]
     #[test]
-    fn activity_guard_tracks_current_state_without_queuing_history() {
-        let (sender, receiver) = mpsc::channel();
-        let state = Arc::new(ActivityState {
-            sender,
-            active_count: AtomicUsize::new(0),
-            notification_pending: AtomicBool::new(false),
-        });
-        let activity = Activity {
-            state: Arc::clone(&state),
-        };
-
-        let first = activity.begin();
-        let second = activity.begin();
-        assert_eq!(state.active_count.load(Ordering::Acquire), 2);
-        assert!(matches!(receiver.recv().unwrap(), Command::ActivityChanged));
-        assert!(receiver.try_recv().is_err());
-
-        state.notification_pending.store(false, Ordering::Release);
-        drop(first);
-        assert_eq!(state.active_count.load(Ordering::Acquire), 1);
-        assert!(receiver.try_recv().is_err());
-
-        drop(second);
-        assert_eq!(state.active_count.load(Ordering::Acquire), 0);
-        assert!(matches!(receiver.recv().unwrap(), Command::ActivityChanged));
-        assert!(receiver.try_recv().is_err());
-
-        assert_eq!(ACTIVITY_LED_ON_HOLD, Duration::from_millis(67));
-        assert_eq!(ACTIVITY_LED_OFF_HOLD, Duration::from_millis(33));
+    fn indicator_policy_preserves_yubihsm_cadences() {
+        let policy = indicator_policy();
+        assert_eq!(policy.busy.on, Duration::from_millis(67));
+        assert_eq!(policy.busy.off, Duration::from_millis(33));
         assert_eq!(
-            ACTIVITY_LED_ON_HOLD + ACTIVITY_LED_OFF_HOLD,
-            Duration::from_millis(100)
+            policy.idle,
+            IdlePolicy::Periodic(Cadence::new(
+                Duration::from_millis(1_500),
+                Duration::from_millis(1_500)
+            ))
         );
-        assert!(ACTIVITY_LED_ON_HOLD < NORMAL_BLINK_HALF_PERIOD);
-    }
-
-    #[cfg(target_os = "linux")]
-    #[test]
-    fn blink_scheduler_selects_stopped_idle_and_activity_cadences() {
-        let now = Instant::now();
-        assert_eq!(selected_blink_delay(true, true, true, 0, None, false), None);
-        assert_eq!(
-            selected_blink_delay(true, false, false, 0, None, false),
-            None
-        );
-        assert_eq!(
-            selected_blink_delay(true, true, false, 0, None, false),
-            Some(NORMAL_BLINK_HALF_PERIOD)
-        );
-        assert_eq!(
-            selected_blink_delay(true, true, false, 1, None, true),
-            Some(ACTIVITY_LED_ON_HOLD)
-        );
-        assert_eq!(
-            selected_blink_delay(true, true, false, 0, Some(now), false),
-            Some(ACTIVITY_LED_OFF_HOLD)
-        );
+        assert_eq!(policy.minimum_edge, Duration::from_millis(8));
     }
 }

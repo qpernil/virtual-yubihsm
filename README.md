@@ -83,12 +83,12 @@ within the session's domain and delegated-capability ceilings.
   physical YubiHSM 2 Microsoft OS 1.0 declaration (`MSFT100`, vendor request
   `0x27`, interface 0 compatible ID `WINUSB`);
 - native display images for either the 240x240 ST7789 color panel or the
-  128x64 SH1106 one-bit OLED, with a strap-hole LED and one
-  invert-only blink scheduler: stopped with the LED off while USB is inactive,
-  a 0.333 Hz three-second cycle while idle, and a measured 100 ms fast cycle
-  throughout command execution with 67 ms on and 33 ms off. Command entry and
-  exit each add an immediate inversion; authenticated `Blink Device` requests
-  extend the fast cadence for their requested duration.
+  128x64 SH1106 one-bit OLED, with a strap-hole LED driven by the shared
+  `display-backends::indicator` scheduler: stopped with the LED off while USB is
+  inactive, a 0.333 Hz three-second cycle while idle, and a measured 100 ms
+  fast cycle throughout command execution with 67 ms on and 33 ms off.
+  Authenticated `Blink Device` requests extend the fast cadence for their
+  requested duration.
 
 All officially registered cryptographic algorithms are now represented and
 their general-purpose cryptographic command families are implemented. SSH
@@ -142,8 +142,10 @@ Worker shutdown also powers the display off. The worker refuses to run as root.
 
 ### Display and blink lifecycle
 
-The display uses one periodic invert-only scheduler. Its selected cadence is a
-direct consequence of the current USB and command state:
+The display uses the device-neutral `display-backends::indicator` scheduler and
+a worker-supplied renderer that maps its one logical bit to the appropriate
+complete color or monochrome image. Its selected cadence is a direct
+consequence of the current USB and command state:
 
 | State | Display and LED behavior |
 | --- | --- |
@@ -153,23 +155,24 @@ direct consequence of the current USB and command state:
 | A command is running | Use the measured 100 ms fast cycle: hold on for 67 ms and off for 33 ms. |
 | An authenticated `Blink Device` duration remains | Continue using the same fast cycle after returning the command response. |
 
-Entering and leaving command activity each add one immediate LED inversion and
-restart the selected periodic timer from that edge. The next fast delay follows
-the resulting state: 67 ms after an on edge and 33 ms after an off edge. Fast
-activity takes precedence over the slow idle cadence. Every periodic event is
-an inversion; the stopped state is the sole exception and always forces the LED
-off.
+Command activity starts an LED edge. The next fast delay follows the resulting
+state: 67 ms after an on edge and 33 ms after an off edge. Fast activity takes
+precedence over the slow idle cadence; after completion, periodic idle resumes
+from the current logical state. The stopped state is the sole exception and
+always forces the LED off.
 
-Activity notifications carry current state rather than a history of start/end
-events. Multiple transitions can therefore be coalesced while a synchronous
-display frame write is busy, preventing completed command bursts from producing
-delayed blinking. Overlapping command guards keep the fast cadence selected
-until the last guard exits.
+A monotonic command epoch preserves a command that starts and finishes during a
+synchronous frame write. Activity arriving while a pulse is already visible may
+retain one additional pulse; further activity coalesces rather than building a
+delayed animation queue. Edges begin at least 8 ms apart, with renderer time
+included in that interval rather than added to it. A slower display therefore
+becomes the natural rate limit.
 
 `Blink Device` is asynchronous from the caller's perspective: its response is
-returned before the requested blinking ends. A later successful `Blink Device`
-request replaces the remaining deadline with its duration measured from the
-new command; durations are neither stacked nor added.
+returned before the requested blinking ends. A small worker-side timer retains
+the shared scheduler's scoped fast-cadence override for the requested duration.
+A later successful request replaces the remaining deadline; durations are
+neither stacked nor added.
 
 When a protocol command fails, the worker writes a diagnostic to the service
 journal containing the command name and byte, the returned device error, and,
