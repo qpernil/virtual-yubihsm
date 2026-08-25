@@ -68,7 +68,8 @@ impl SessionAuthorization {
 
     pub fn authorize_delete(self, object: &ObjectInfo) -> Result<()> {
         let capability = object.object_type.deletion_capability();
-        self.authorize_use(object, capability, capability)
+        self.require_visible(object)?;
+        self.require_capability(capability)
     }
 
     pub fn authorize_wrapped_export(
@@ -190,6 +191,27 @@ mod tests {
         assert_eq!(
             session().authorize_create(&too_many_capabilities, Capability::PutOpaque),
             Err(DeviceError::InsufficientPermissions)
+        );
+    }
+
+    #[test]
+    fn deletion_requires_session_capability_and_domain_but_not_object_capability() {
+        let object = info(0b0010, CapabilitySet::NONE);
+        let authorized = SessionAuthorization {
+            capabilities: CapabilitySet::from_capabilities([Capability::DeleteOpaque]),
+            ..session()
+        };
+        authorized.authorize_delete(&object).unwrap();
+
+        assert_eq!(
+            session().authorize_delete(&object),
+            Err(DeviceError::InsufficientPermissions)
+        );
+
+        let hidden = info(0b0100, CapabilitySet::NONE);
+        assert_eq!(
+            authorized.authorize_delete(&hidden),
+            Err(DeviceError::ObjectNotFound)
         );
     }
 
