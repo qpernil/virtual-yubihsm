@@ -45,7 +45,10 @@ An authenticated session receives exactly the Authentication Key object's:
 Using an existing object requires the command capability on the session, the
 operation capability on the object, and at least one shared domain. Creating an
 object additionally requires all requested domains and capabilities to be
-within the session's domain and delegated-capability ceilings.
+within the session's domain and delegated-capability ceilings. Deletion is the
+exception: it requires the type-specific delete capability on the session and a
+shared domain, but does not require the target object to authorize its own
+deletion.
 
 ## Supported protocol
 
