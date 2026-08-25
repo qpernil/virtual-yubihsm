@@ -128,6 +128,10 @@ Every durable transaction recorded by the worker also advances a persisted
 storage may omit intermediate images, but every stored snapshot still carries
 an ordering key that can support retained history later.
 
+The asymmetric YubiHSM Auth persistence path has also been exercised against a
+physical YubiKey. See the
+[advanced YubiHSM Auth qualification record](docs/advanced-yubihsm-auth-qualification.md).
+
 ## Worker lifecycle
 
 `virtual-yubihsm-worker` is the project worker, not a second adapter process.
