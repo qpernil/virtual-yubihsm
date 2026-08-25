@@ -13,7 +13,8 @@ mod worker_protocol;
 
 #[cfg(target_os = "linux")]
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::{env, io};
+use std::{env, io, time::Duration};
+use usb_gadget_worker::PersistenceMode;
 
 #[cfg(target_os = "linux")]
 static STOP_REQUESTED: AtomicBool = AtomicBool::new(false);
@@ -41,6 +42,7 @@ impl DisplayKind {
 struct Options {
     serial: u32,
     display: DisplayKind,
+    persistence: PersistenceMode,
 }
 
 fn main() {
@@ -58,7 +60,12 @@ fn run() -> io::Result<()> {
     #[cfg(target_os = "linux")]
     {
         install_signal_handlers()?;
-        functionfs::run_worker(options.serial, options.display, &STOP_REQUESTED)
+        functionfs::run_worker(
+            options.serial,
+            options.display,
+            options.persistence,
+            &STOP_REQUESTED,
+        )
     }
 
     #[cfg(not(target_os = "linux"))]
@@ -74,15 +81,17 @@ fn run() -> io::Result<()> {
 fn parse_arguments(arguments: impl IntoIterator<Item = String>) -> io::Result<Option<Options>> {
     let mut serial = 12_345_678;
     let mut display = DisplayKind::St7789Spi;
+    let mut persistence = PersistenceMode::Batched(Duration::from_millis(500));
     let mut arguments = arguments.into_iter();
     while let Some(argument) = arguments.next() {
         match argument.as_str() {
             "-h" | "--help" => {
                 println!(
-                    "Usage: virtual-yubihsm-worker [--serial DECIMAL] [--display BACKEND]\n\n\
+                    "Usage: virtual-yubihsm-worker [--serial DECIMAL] [--display BACKEND] [--persistence MODE]\n\n\
                      Unprivileged YubiHSM 2 FunctionFS worker for usb-gadget-supervisor.\n\
                      Persistent state is stored in STATE_DIRECTORY.\n\
-                     BACKEND is st7789-spi (default) or sh1106-spi."
+                     BACKEND is st7789-spi (default) or sh1106-spi.\n\
+                     MODE is batched (default, 500 ms) or immediate."
                 );
                 return Ok(None);
             }
@@ -109,6 +118,15 @@ fn parse_arguments(arguments: impl IntoIterator<Item = String>) -> io::Result<Op
             value if value.starts_with("--display=") => {
                 display = DisplayKind::parse(&value["--display=".len()..])?;
             }
+            "--persistence" => {
+                let value = arguments.next().ok_or_else(|| {
+                    io::Error::new(io::ErrorKind::InvalidInput, "--persistence needs a value")
+                })?;
+                persistence = parse_persistence(&value)?;
+            }
+            value if value.starts_with("--persistence=") => {
+                persistence = parse_persistence(&value["--persistence=".len()..])?;
+            }
             _ => {
                 return Err(io::Error::new(
                     io::ErrorKind::InvalidInput,
@@ -117,7 +135,22 @@ fn parse_arguments(arguments: impl IntoIterator<Item = String>) -> io::Result<Op
             }
         }
     }
-    Ok(Some(Options { serial, display }))
+    Ok(Some(Options {
+        serial,
+        display,
+        persistence,
+    }))
+}
+
+fn parse_persistence(value: &str) -> io::Result<PersistenceMode> {
+    match value {
+        "batched" => Ok(PersistenceMode::Batched(Duration::from_millis(500))),
+        "immediate" => Ok(PersistenceMode::Immediate),
+        _ => Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            format!("invalid persistence mode {value:?}; use batched or immediate"),
+        )),
+    }
 }
 
 #[cfg(target_os = "linux")]
@@ -147,6 +180,7 @@ mod tests {
             Some(Options {
                 serial: 42,
                 display: DisplayKind::St7789Spi,
+                persistence: PersistenceMode::Batched(Duration::from_millis(500)),
             })
         );
         assert!(parse_arguments(["--unknown".to_owned()]).is_err());
@@ -159,6 +193,19 @@ mod tests {
             Some(Options {
                 serial: 12_345_678,
                 display: DisplayKind::Sh1106Spi,
+                persistence: PersistenceMode::Batched(Duration::from_millis(500)),
+            })
+        );
+    }
+
+    #[test]
+    fn parses_immediate_persistence() {
+        assert_eq!(
+            parse_arguments(["--persistence=immediate".to_owned()]).unwrap(),
+            Some(Options {
+                serial: 12_345_678,
+                display: DisplayKind::St7789Spi,
+                persistence: PersistenceMode::Immediate,
             })
         );
     }

@@ -114,10 +114,19 @@ Secure sessions and secure-message counters are never serialized. `ResetDevice`
 clears objects, options, audit state and sessions, then reinstalls the factory
 Authentication Key while retaining the device's static identity.
 
-Persistent state retains a generation counter for every object identity seen
-since the last device reset, including deleted objects. Creation, recreation,
-and successful in-place opaque-data replacement advance that counter; object
-information and listings expose its low byte as the protocol sequence.
+Persistent state retains the latest generation for every numeric object ID seen
+since the last device reset, including deleted objects. The mapping is shared
+by every object type: creation, including recreation after deletion, successful
+in-place opaque replacement, and Authentication Key changes advance the ID's
+counter. Read-only object use and deletion do not affect the generation. Object
+information and listings expose the generation's low byte as the protocol
+sequence. A never-before-seen ID starts at generation zero. Trusted fixture
+provisioning instead preserves its explicitly supplied sequence.
+
+Every durable transaction recorded by the worker also advances a persisted
+64-bit state epoch. The epoch survives restart and `ResetDevice`. Batched
+storage may omit intermediate images, but every stored snapshot still carries
+an ordering key that can support retained history later.
 
 ## Worker lifecycle
 

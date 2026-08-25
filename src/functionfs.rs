@@ -7,10 +7,9 @@ use crate::{
 };
 use std::{
     env, fs,
-    fs::{File, OpenOptions},
+    fs::File,
     io::{self, Read, Write},
     os::fd::AsRawFd,
-    os::unix::fs::OpenOptionsExt,
     path::{Path, PathBuf},
     sync::{
         atomic::{AtomicBool, Ordering},
@@ -18,7 +17,10 @@ use std::{
     },
     thread,
 };
-use usb_gadget_worker::{EndpointLifecycle, UsbBusEvent};
+use usb_gadget_worker::{
+    replace_file_atomically, EndpointLifecycle, PersistenceMode, StatePersistence,
+    StatePersistenceHandle, UsbBusEvent,
+};
 use virtual_yubihsm_core::{
     CommandCode, Device, DeviceConfig, DeviceError, Frame, SessionAuthorization,
 };
@@ -47,6 +49,7 @@ fn publish_personality(
 pub(crate) fn run_worker(
     serial: u32,
     display_kind: crate::DisplayKind,
+    persistence_mode: PersistenceMode,
     stop: &'static AtomicBool,
 ) -> io::Result<()> {
     // SAFETY: geteuid has no preconditions.
@@ -64,7 +67,15 @@ pub(crate) fn run_worker(
         serial,
         ..DeviceConfig::default()
     };
-    let device = Arc::new(Mutex::new(load_or_create_state(config, &state_path)?));
+    let device = load_or_create_state(config, &state_path)?;
+    let persistence = StatePersistence::start(
+        device,
+        state_path,
+        persistence_mode,
+        encode_device_state,
+        move || stop.store(true, Ordering::Relaxed),
+    )?;
+    let device = persistence.handle();
     let personality = crate::usb_identity::personality(serial).to_cbor()?;
     let display = crate::display::Controller::start(
         resources.display_spi,
@@ -117,8 +128,7 @@ pub(crate) fn run_worker(
             let lifecycle = Arc::new(EndpointLifecycle::new());
             let runtime = EndpointRuntime::start(
                 endpoints,
-                Arc::clone(&device),
-                state_path.clone(),
+                device.clone(),
                 stop,
                 display.activity(),
                 Arc::clone(&lifecycle),
@@ -135,7 +145,7 @@ pub(crate) fn run_worker(
                 generation,
                 &mut configure_request,
                 ControlServices {
-                    device: &device,
+                    device: device.state(),
                     display: &display,
                     buttons: &buttons,
                     stop,
@@ -145,8 +155,10 @@ pub(crate) fn run_worker(
             stop.store(true, Ordering::Relaxed);
             lifecycle.stop();
             let runtime_result = runtime.shutdown();
+            let persistence_result = persistence.flush();
             let outcome = control_result?;
             runtime_result?;
+            persistence_result?;
             match outcome {
                 ControlOutcome::Quiesce {
                     request_id,
@@ -179,9 +191,13 @@ pub(crate) fn run_worker(
         }
     })();
     stop.store(true, Ordering::Relaxed);
+    let persistence_result = persistence.shutdown();
     let button_result = buttons.shutdown();
     let display_result = display.shutdown();
-    result.and(button_result).and(display_result)
+    result
+        .and(persistence_result)
+        .and(button_result)
+        .and(display_result)
 }
 
 struct InitialResources {
@@ -492,24 +508,14 @@ struct EndpointRuntime {
 impl EndpointRuntime {
     fn start(
         endpoints: Endpoints,
-        device: Arc<Mutex<Device>>,
-        state_path: PathBuf,
+        device: StatePersistenceHandle<Device>,
         stop: &'static AtomicBool,
         display_activity: crate::display::Activity,
         lifecycle: Arc<EndpointLifecycle>,
     ) -> io::Result<Self> {
         let thread = thread::Builder::new()
             .name("yubihsm-usb".to_owned())
-            .spawn(move || {
-                serve_endpoint(
-                    endpoints,
-                    device,
-                    &state_path,
-                    stop,
-                    display_activity,
-                    lifecycle,
-                )
-            })?;
+            .spawn(move || serve_endpoint(endpoints, device, stop, display_activity, lifecycle))?;
         Ok(Self { thread })
     }
 
@@ -522,8 +528,7 @@ impl EndpointRuntime {
 
 fn serve_endpoint(
     mut endpoints: Endpoints,
-    device: Arc<Mutex<Device>>,
-    state_path: &Path,
+    device: StatePersistenceHandle<Device>,
     stop: &'static AtomicBool,
     display_activity: crate::display::Activity,
     lifecycle: Arc<EndpointLifecycle>,
@@ -541,13 +546,14 @@ fn serve_endpoint(
                     Ok(0) => {}
                     Ok(length) => {
                         let activity = display_activity.begin();
-                        let response = {
-                            let mut device = device
+                        let (response, mutation) = {
+                            let mut state = device
+                                .state()
                                 .lock()
                                 .map_err(|_| io::Error::other("device lock poisoned"))?;
                             let outer_request = Frame::parse(&request[..length]);
                             let session_id = outer_request.as_ref().ok().and_then(session_id);
-                            let response = device.handle_encoded_observing(
+                            let response = state.handle_encoded_observing(
                                 &request[..length],
                                 |authorization, request, response| {
                                     log_authenticated_failure(
@@ -565,11 +571,20 @@ fn serve_endpoint(
                                 },
                             );
                             log_outer_failure(outer_request.as_ref(), &response, length);
-                            if device.take_persistent_change() {
-                                persist_device_state(&device, state_path)?;
-                            }
-                            response
+                            let mutation = state
+                                .take_persistent_change()
+                                .map_err(|error| {
+                                    io::Error::other(format!(
+                                        "advance persistent YubiHSM state epoch: {error}"
+                                    ))
+                                })?
+                                .then(|| device.record_mutation())
+                                .transpose()?;
+                            (response, mutation)
                         };
+                        if let Some(mutation) = mutation {
+                            mutation.wait()?;
+                        }
                         write_transfer(&mut endpoints.input, &response)?;
                         drop(activity);
                     }
@@ -684,46 +699,17 @@ fn load_or_create_state(config: DeviceConfig, path: &Path) -> io::Result<Device>
         }),
         Err(error) if error.kind() == io::ErrorKind::NotFound => {
             let device = Device::factory_default(config);
-            persist_device_state(&device, path)?;
+            replace_file_atomically(path, &encode_device_state(&device)?)?;
             Ok(device)
         }
         Err(error) => Err(with_context(error, "read persistent YubiHSM state")),
     }
 }
 
-fn persist_device_state(device: &Device, path: &Path) -> io::Result<()> {
-    let encoded = device
+fn encode_device_state(device: &Device) -> io::Result<Vec<u8>> {
+    device
         .persistent_state()
-        .map_err(|error| io::Error::other(format!("encode persistent YubiHSM state: {error}")))?;
-    persist_state(&encoded, path)
-}
-
-fn persist_state(encoded: &[u8], path: &Path) -> io::Result<()> {
-    let temporary = path.with_extension(format!("tmp-{}", std::process::id()));
-    let result = (|| {
-        let mut file = OpenOptions::new()
-            .write(true)
-            .create(true)
-            .truncate(true)
-            .mode(0o600)
-            .open(&temporary)
-            .map_err(|error| with_context(error, "create temporary YubiHSM state"))?;
-        file.write_all(encoded)
-            .map_err(|error| with_context(error, "write temporary YubiHSM state"))?;
-        file.sync_all()
-            .map_err(|error| with_context(error, "sync temporary YubiHSM state"))?;
-        drop(file);
-        fs::rename(&temporary, path)
-            .map_err(|error| with_context(error, "replace persistent YubiHSM state"))?;
-        let parent = path
-            .parent()
-            .ok_or_else(|| io::Error::other("persistent state has no parent directory"))?;
-        File::open(parent)?.sync_all()
-    })();
-    if result.is_err() {
-        let _ = fs::remove_file(&temporary);
-    }
-    result
+        .map_err(|error| io::Error::other(format!("encode persistent YubiHSM state: {error}")))
 }
 
 fn write_transfer(file: &mut File, bytes: &[u8]) -> io::Result<()> {

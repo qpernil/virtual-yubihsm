@@ -55,7 +55,7 @@ const MAX_SESSIONS: u8 = 16;
 const DEFAULT_AUTHENTICATION_ALGORITHM: u8 = AUTHENTICATION_ALGORITHM_AES128_YUBICO;
 const OPAQUE_DATA_ALGORITHM: u8 = 30;
 const PERSISTENT_STATE_SCHEMA: &str = "virtual-yubihsm-state";
-const PERSISTENT_STATE_VERSION: u16 = 2;
+const PERSISTENT_STATE_VERSION: u16 = 1;
 const OPTION_FORCE_AUDIT: u8 = 0x01;
 const OPTION_COMMAND_AUDIT: u8 = 0x03;
 const OPTION_ALGORITHM_TOGGLE: u8 = 0x04;
@@ -125,9 +125,33 @@ struct PersistentState {
     config: DeviceConfig,
     objects: Vec<ObjectRecord>,
     device_static_private: [u8; 32],
-    sequence_history: BTreeMap<ObjectKey, u64>,
+    state_epoch: u64,
+    sequence_history: SequenceHistory,
     options: DeviceOptions,
     audit: AuditState,
+}
+
+#[derive(Clone, Debug, Default, Deserialize, Serialize)]
+struct SequenceHistory {
+    entries: BTreeMap<u16, u64>,
+}
+
+impl SequenceHistory {
+    fn validate(&self) -> bool {
+        self.entries.keys().all(|id| *id != 0 && *id != u16::MAX)
+    }
+
+    fn generation(&self, id: u16) -> Option<u64> {
+        self.entries.get(&id).copied()
+    }
+
+    fn record(&mut self, id: u16, generation: u64) {
+        self.entries.insert(id, generation);
+    }
+
+    fn clear(&mut self) {
+        self.entries.clear();
+    }
 }
 
 struct AttestationProfile {
@@ -199,7 +223,8 @@ pub struct Device {
     objects: BTreeMap<ObjectKey, ObjectRecord>,
     sessions: BTreeMap<u8, SessionEntry>,
     device_static_private: Zeroizing<[u8; 32]>,
-    sequence_history: BTreeMap<ObjectKey, u64>,
+    state_epoch: u64,
+    sequence_history: SequenceHistory,
     options: DeviceOptions,
     audit: AuditState,
     persistent_change: bool,
@@ -227,7 +252,8 @@ impl Device {
             objects: BTreeMap::new(),
             sessions: BTreeMap::new(),
             device_static_private: Zeroizing::new(device_static_private),
-            sequence_history: BTreeMap::new(),
+            state_epoch: 0,
+            sequence_history: SequenceHistory::default(),
             options: DeviceOptions::default(),
             audit: AuditState {
                 next_number: 1,
@@ -591,7 +617,7 @@ impl Device {
         object.validate()?;
         let key = object.info.key();
         self.sequence_history
-            .insert(key, u64::from(object.info.sequence));
+            .record(key.id, u64::from(object.info.sequence));
         self.objects.insert(key, object);
         self.persistent_change = true;
         Ok(())
@@ -615,6 +641,7 @@ impl Device {
             config: self.config.clone(),
             objects: self.objects.values().cloned().collect(),
             device_static_private: *self.device_static_private,
+            state_epoch: self.state_epoch,
             sequence_history: self.sequence_history.clone(),
             options: self.options.clone(),
             audit: self.audit.clone(),
@@ -649,22 +676,14 @@ impl Device {
         SecretKey::from_slice(&state.device_static_private)
             .map_err(|_| DeviceError::InvalidData)?;
         let sequence_history = state.sequence_history;
-        if sequence_history
-            .keys()
-            .any(|key| key.id == 0 || key.id == u16::MAX)
-        {
+        if !sequence_history.validate() {
             return Err(DeviceError::InvalidData);
         }
         let mut objects = BTreeMap::new();
         for object in state.objects {
             object.validate()?;
             let key = object.info.key();
-            if sequence_history
-                .get(&key)
-                .map(|generation| *generation as u8)
-                != Some(object.info.sequence)
-                || objects.insert(key, object).is_some()
-            {
+            if objects.insert(key, object).is_some() {
                 return Err(DeviceError::InvalidData);
             }
         }
@@ -673,6 +692,7 @@ impl Device {
             objects,
             sessions: BTreeMap::new(),
             device_static_private: Zeroizing::new(state.device_static_private),
+            state_epoch: state.state_epoch,
             sequence_history,
             options: state.options,
             audit: state.audit,
@@ -680,9 +700,22 @@ impl Device {
         })
     }
 
-    /// Report and clear the durable-state dirty flag used by worker storage.
-    pub fn take_persistent_change(&mut self) -> bool {
-        std::mem::take(&mut self.persistent_change)
+    /// Commit one pending durable transaction and advance its persisted epoch.
+    pub fn take_persistent_change(&mut self) -> Result<bool> {
+        if !self.persistent_change {
+            return Ok(false);
+        }
+        self.state_epoch = self
+            .state_epoch
+            .checked_add(1)
+            .ok_or(DeviceError::StorageFailed)?;
+        self.persistent_change = false;
+        Ok(true)
+    }
+
+    /// Return the ordering key carried by the next persistent snapshot.
+    pub fn state_epoch(&self) -> u64 {
+        self.state_epoch
     }
 
     fn execute_inner_result(
@@ -868,10 +901,15 @@ impl Device {
             }
             CommandCode::GetOpaque => first(ObjectType::Opaque, Capability::GetOpaque),
             CommandCode::GetTemplate => first(ObjectType::Template, Capability::GetTemplate),
-            CommandCode::ChangeAuthenticationKey => first(
-                ObjectType::AuthenticationKey,
-                Capability::ChangeAuthenticationKey,
-            ),
+            CommandCode::ChangeAuthenticationKey => {
+                if parse_u16_at(data, 0)? != authorization.authentication_key_id {
+                    return Err(DeviceError::InvalidId);
+                }
+                first(
+                    ObjectType::AuthenticationKey,
+                    Capability::ChangeAuthenticationKey,
+                )
+            }
             CommandCode::SignPkcs1 => first(ObjectType::AsymmetricKey, Capability::SignPkcs),
             CommandCode::SignPss => first(ObjectType::AsymmetricKey, Capability::SignPss),
             CommandCode::SignEcdsa => first(ObjectType::AsymmetricKey, Capability::SignEcdsa),
@@ -1332,11 +1370,7 @@ impl Device {
                 updated.info.length =
                     u16::try_from(material.len()).map_err(|_| DeviceError::WrongLength)?;
                 updated.material = ObjectMaterial::Opaque(material);
-                let generation = self.next_generation(key);
-                updated.info.sequence = generation as u8;
-                updated.validate()?;
-                self.sequence_history.insert(key, generation);
-                self.objects.insert(key, updated);
+                self.write_object(updated)?;
                 return Ok(requested_id.to_be_bytes().to_vec());
             }
         }
@@ -1359,7 +1393,7 @@ impl Device {
             material: ObjectMaterial::Opaque(material),
         };
         record.validate()?;
-        self.insert_new_object(record);
+        self.write_object(record)?;
         Ok(id.to_be_bytes().to_vec())
     }
 
@@ -1401,7 +1435,7 @@ impl Device {
             material: ObjectMaterial::Authentication(material),
         };
         record.validate()?;
-        self.insert_new_object(record);
+        self.write_object(record)?;
         Ok(id.to_be_bytes().to_vec())
     }
 
@@ -1452,7 +1486,7 @@ impl Device {
             material: ObjectMaterial::Secret(secret),
         };
         record.validate()?;
-        self.insert_new_object(record);
+        self.write_object(record)?;
         Ok(id.to_be_bytes().to_vec())
     }
 
@@ -1795,7 +1829,7 @@ impl Device {
             material: ObjectMaterial::Secret(secret),
         };
         record.validate()?;
-        self.insert_new_object(record);
+        self.write_object(record)?;
         Ok(id.to_be_bytes().to_vec())
     }
 
@@ -1857,7 +1891,7 @@ impl Device {
             material: ObjectMaterial::Secret(secret),
         };
         record.validate()?;
-        self.insert_new_object(record);
+        self.write_object(record)?;
         Ok(id.to_be_bytes().to_vec())
     }
 
@@ -1921,7 +1955,7 @@ impl Device {
             material: ObjectMaterial::Secret(secret),
         };
         record.validate()?;
-        self.insert_new_object(record);
+        self.write_object(record)?;
         Ok(id.to_be_bytes().to_vec())
     }
 
@@ -1965,7 +1999,7 @@ impl Device {
             material: ObjectMaterial::Public(data[HEADER_LENGTH..].to_vec()),
         };
         record.validate()?;
-        self.insert_new_object(record);
+        self.write_object(record)?;
         Ok(id.to_be_bytes().to_vec())
     }
 
@@ -2053,7 +2087,7 @@ impl Device {
             record.info.id.to_be_bytes().as_slice(),
         ]
         .concat();
-        self.insert_new_object(record);
+        self.write_object(record)?;
         Ok(response)
     }
 
@@ -2149,7 +2183,7 @@ impl Device {
             record.info.id.to_be_bytes().as_slice(),
         ]
         .concat();
-        self.insert_new_object(record);
+        self.write_object(record)?;
         Ok(response)
     }
 
@@ -2219,7 +2253,7 @@ impl Device {
             record.info.id.to_be_bytes().as_slice(),
         ]
         .concat();
-        self.insert_new_object(record);
+        self.write_object(record)?;
         Ok(response)
     }
 
@@ -2404,7 +2438,7 @@ impl Device {
             },
         };
         record.validate()?;
-        self.insert_new_object(record);
+        self.write_object(record)?;
         Ok(id.to_be_bytes().to_vec())
     }
 
@@ -2511,7 +2545,7 @@ impl Device {
             material: ObjectMaterial::Opaque(material),
         };
         record.validate()?;
-        self.insert_new_object(record);
+        self.write_object(record)?;
         Ok(id.to_be_bytes().to_vec())
     }
 
@@ -2584,13 +2618,15 @@ impl Device {
             id,
         };
         let material = parse_authentication_key_material(algorithm, &data[3..])?;
-        let record = self
+        let mut updated = self
             .objects
-            .get_mut(&key)
+            .get(&key)
+            .cloned()
             .ok_or(DeviceError::ObjectNotFound)?;
-        record.info.algorithm = algorithm;
-        record.info.length = key_length as u16;
-        record.material = ObjectMaterial::Authentication(material);
+        updated.info.algorithm = algorithm;
+        updated.info.length = key_length as u16;
+        updated.material = ObjectMaterial::Authentication(material);
+        self.write_object(updated)?;
         Ok(id.to_be_bytes().to_vec())
     }
 
@@ -2617,20 +2653,20 @@ impl Device {
             .ok_or(DeviceError::StorageFailed)
     }
 
-    fn next_generation(&self, key: ObjectKey) -> u64 {
+    fn next_generation(&self, id: u16) -> u64 {
         self.sequence_history
-            .get(&key)
-            .copied()
-            .unwrap_or(0)
-            .wrapping_add(1)
+            .generation(id)
+            .map_or(0, |generation| generation.wrapping_add(1))
     }
 
-    fn insert_new_object(&mut self, mut record: ObjectRecord) {
+    fn write_object(&mut self, mut record: ObjectRecord) -> Result<()> {
+        record.validate()?;
         let key = record.info.key();
-        let generation = self.next_generation(key);
+        let generation = self.next_generation(key.id);
         record.info.sequence = generation as u8;
-        self.sequence_history.insert(key, generation);
+        self.sequence_history.record(key.id, generation);
         self.objects.insert(key, record);
+        Ok(())
     }
 
     fn install_factory_authentication_key(&mut self) {
@@ -2653,7 +2689,7 @@ impl Device {
             )),
         };
         let key = record.info.key();
-        self.sequence_history.insert(key, 0);
+        self.sequence_history.record(key.id, 0);
         self.objects.insert(key, record);
     }
 }
@@ -3027,7 +3063,7 @@ fn encode_wrapped_object(object: &ObjectRecord) -> Result<Vec<u8>> {
         .try_into()
         .map_err(|_| DeviceError::WrongLength)?;
     let mut output = Vec::with_capacity(71 + payload.len());
-    output.extend_from_slice(b"VYH2");
+    output.extend_from_slice(b"VYH1");
     output.push(object.info.object_type as u8);
     output.extend_from_slice(&object.info.id.to_be_bytes());
     output.extend_from_slice(&object.info.domains.to_be_bytes());
@@ -3046,7 +3082,7 @@ fn encode_wrapped_object(object: &ObjectRecord) -> Result<Vec<u8>> {
 
 fn decode_wrapped_object(mut data: &[u8]) -> Result<ObjectRecord> {
     let version = take(&mut data, 4)?;
-    if !matches!(version, b"VYH1" | b"VYH2") {
+    if version != b"VYH1" {
         return Err(DeviceError::InvalidData);
     }
     let object_type =
@@ -3055,11 +3091,7 @@ fn decode_wrapped_object(mut data: &[u8]) -> Result<ObjectRecord> {
     let domains = u16::from_be_bytes(take(&mut data, 2)?.try_into().unwrap());
     let capabilities = CapabilitySet::from_bytes(take(&mut data, 8)?.try_into().unwrap());
     let algorithm = take(&mut data, 1)?[0];
-    let origin = if version == b"VYH2" {
-        take(&mut data, 1)?[0] & 0x0f
-    } else {
-        0
-    };
+    let origin = take(&mut data, 1)?[0] & 0x0f;
     let label = trim_label(take(&mut data, 40)?);
     let delegated_capabilities = CapabilitySet::from_bytes(take(&mut data, 8)?.try_into().unwrap());
     let material_kind = take(&mut data, 1)?[0];
@@ -3556,6 +3588,47 @@ mod tests {
     }
 
     #[test]
+    fn trusted_provisioning_preserves_and_seeds_an_explicit_sequence() {
+        let mut device = Device::factory_default(DeviceConfig::default());
+        let capabilities = CapabilitySet::from_capabilities([Capability::PutOpaque]);
+        let key = ObjectKey {
+            object_type: ObjectType::Opaque,
+            id: 31,
+        };
+        device
+            .provision_object(ObjectRecord {
+                info: ObjectInfo {
+                    capabilities,
+                    id: key.id,
+                    length: 7,
+                    domains: 1,
+                    object_type: key.object_type,
+                    algorithm: OPAQUE_DATA_ALGORITHM,
+                    sequence: 73,
+                    origin: 2,
+                    label: b"state".to_vec(),
+                    delegated_capabilities: CapabilitySet::NONE,
+                },
+                material: ObjectMaterial::Opaque(b"fixture".to_vec()),
+            })
+            .unwrap();
+        assert_eq!(device.object(key).unwrap().info.sequence, 73);
+        assert_eq!(device.sequence_history.generation(key.id), Some(73));
+
+        let admin = device.session_authorization(1).unwrap();
+        assert_eq!(
+            device
+                .execute_inner(
+                    admin,
+                    &put_opaque_request_with_payload(key.id, 1, capabilities, b"runtime"),
+                )
+                .data,
+            key.id.to_be_bytes()
+        );
+        assert_eq!(device.object(key).unwrap().info.sequence, 74);
+    }
+
+    #[test]
     fn opaque_read_requires_get_opaque_on_session_and_object() {
         let mut device = Device::factory_default(DeviceConfig::default());
         let admin = device.session_authorization(1).unwrap();
@@ -3681,7 +3754,7 @@ mod tests {
     }
 
     #[test]
-    fn object_generations_survive_deletion_and_persistence() {
+    fn object_generations_are_global_by_id_and_survive_deletion_and_persistence() {
         let config = DeviceConfig::default();
         let mut device = Device::factory_default(config.clone());
         let admin = device.session_authorization(1).unwrap();
@@ -3698,6 +3771,10 @@ mod tests {
             object_type: ObjectType::Opaque,
             id: 19,
         };
+        let symmetric_key = ObjectKey {
+            object_type: ObjectType::SymmetricKey,
+            id: 18,
+        };
 
         assert_eq!(
             device
@@ -3705,14 +3782,30 @@ mod tests {
                 .data,
             18_u16.to_be_bytes()
         );
-        assert_eq!(device.object(key).unwrap().info.sequence, 1);
+        assert_eq!(device.object(key).unwrap().info.sequence, 0);
+        assert_eq!(
+            device
+                .execute_inner(
+                    admin,
+                    &put_symmetric_key_request(
+                        18,
+                        1,
+                        CapabilitySet::NONE,
+                        Algorithm::Aes128,
+                        &[0x18; 16],
+                    ),
+                )
+                .data,
+            18_u16.to_be_bytes()
+        );
+        assert_eq!(device.object(symmetric_key).unwrap().info.sequence, 1);
         assert_eq!(
             device
                 .execute_inner(admin, &put_opaque_request(19, 1, capabilities))
                 .data,
             19_u16.to_be_bytes()
         );
-        assert_eq!(device.object(other_key).unwrap().info.sequence, 1);
+        assert_eq!(device.object(other_key).unwrap().info.sequence, 0);
 
         let delete = Frame::new(
             CommandCode::DeleteObject as u8,
@@ -3731,9 +3824,9 @@ mod tests {
             18_u16.to_be_bytes()
         );
         assert_eq!(restored.object(key).unwrap().info.sequence, 2);
+        assert_eq!(restored.object(symmetric_key).unwrap().info.sequence, 1);
 
-        restored.sequence_history.insert(key, 255);
-        restored.objects.get_mut(&key).unwrap().info.sequence = 255;
+        restored.sequence_history.record(key.id, 255);
         assert_eq!(
             restored
                 .execute_inner(
@@ -3743,8 +3836,23 @@ mod tests {
                 .data,
             18_u16.to_be_bytes()
         );
-        assert_eq!(restored.sequence_history[&key], 256);
+        assert_eq!(restored.sequence_history.generation(key.id), Some(256));
         assert_eq!(restored.object(key).unwrap().info.sequence, 0);
+    }
+
+    #[test]
+    fn object_generation_history_retains_every_seen_id() {
+        let mut history = SequenceHistory::default();
+        for id in 1..=257 {
+            history.record(id, u64::from(id));
+        }
+        history.record(1, 999);
+
+        assert_eq!(history.entries.len(), 257);
+        assert_eq!(history.generation(1), Some(999));
+        assert_eq!(history.generation(2), Some(2));
+        assert_eq!(history.generation(257), Some(257));
+        assert!(history.validate());
     }
 
     #[test]
@@ -3894,12 +4002,27 @@ mod tests {
         change.extend_from_slice(&[0x77; 32]);
         let change = Frame::new(CommandCode::ChangeAuthenticationKey as u8, change).unwrap();
         assert_eq!(
-            device.execute_inner(admin, &change).data,
+            device.execute_inner(admin, &change),
+            Frame::error(DeviceError::InvalidId)
+        );
+        assert_eq!(
+            device.execute_inner(session, &change).data,
             23_u16.to_be_bytes()
         );
         assert_eq!(
             device.authentication_key_material(23).unwrap(),
             &AuthenticationKeyMaterial::Symmetric(vec![0x77; 32])
+        );
+        assert_eq!(
+            device
+                .object(ObjectKey {
+                    object_type: ObjectType::AuthenticationKey,
+                    id: 23,
+                })
+                .unwrap()
+                .info
+                .sequence,
+            1
         );
         // Existing sessions keep their authorization snapshot; changing the
         // key material affects only future authentication handshakes.
@@ -4777,10 +4900,14 @@ mod tests {
         assert!(device.execute_inner(admin, &set_audit).data.is_empty());
         let random = Frame::new(CommandCode::GetPseudoRandom as u8, 4_u16.to_be_bytes()).unwrap();
         assert_eq!(device.execute_inner(admin, &random).data.len(), 4);
-        assert!(device.take_persistent_change());
+        assert_eq!(device.state_epoch(), 0);
+        assert!(device.take_persistent_change().unwrap());
+        assert_eq!(device.state_epoch(), 1);
+        assert!(!device.take_persistent_change().unwrap());
 
         let encoded = device.persistent_state().unwrap();
-        let restored = Device::from_persistent_state(config.clone(), &encoded).unwrap();
+        let mut restored = Device::from_persistent_state(config.clone(), &encoded).unwrap();
+        assert_eq!(restored.state_epoch(), 1);
         assert_eq!(restored.active_session_count(), 0);
         assert!(restored
             .object(ObjectKey {
@@ -4794,6 +4921,11 @@ mod tests {
             OPTION_ON
         );
         assert_eq!(restored.device_static_private.as_ref(), &[7; 32]);
+
+        let reset = Frame::new(CommandCode::ResetDevice as u8, vec![0xde]).unwrap();
+        assert!(restored.execute_inner(admin, &reset).data.is_empty());
+        assert!(restored.take_persistent_change().unwrap());
+        assert_eq!(restored.state_epoch(), 2);
 
         let foreign = DeviceConfig {
             serial: 78,
