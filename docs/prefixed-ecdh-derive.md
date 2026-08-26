@@ -162,6 +162,50 @@ The connector validates the target receipt with the first key and uses the
 remaining keys for that secure session. It erases the derived material and its
 client ephemeral private key when the session ends.
 
+The receipt and secure-messaging calculations are, in wire order:
+
+```text
+Kreceipt = output[0..16]
+S-ENC    = output[16..32]
+S-MAC    = output[32..48]
+S-RMAC   = output[48..64]
+
+receipt = AES-CMAC(Kreceipt,
+                   Qdevice-ephemeral || Qclient-ephemeral)
+```
+
+The full 16-byte receipt becomes the initial MAC chaining value `MCV`. For each
+authenticated request, let `R` be the encoded three-byte command header and
+payload, with the header length including the trailing eight-byte MAC but with
+that MAC itself omitted from `R`:
+
+```text
+command-mac = AES-CMAC(S-MAC, MCV || R)
+wire-mac    = command-mac[0..8]
+next MCV    = command-mac
+```
+
+For a response, let `A` be its encoded three-byte response header and payload,
+again with the header length including the trailing eight-byte response MAC
+but with that MAC omitted from `A`:
+
+```text
+response-mac = AES-CMAC(S-RMAC, MCV || A)
+wire-rmac    = response-mac[0..8]
+```
+
+Response authentication does not advance `MCV`; the next request advances it.
+For an encrypted session message, the inner YubiHSM frame is padded using ISO
+7816-4 padding and encrypted with AES-CBC under `S-ENC`:
+
+```text
+IV         = AES-ECB(S-ENC, counter)
+ciphertext = AES-CBC-ENC(S-ENC, IV, ISO7816-4-pad(inner-frame))
+```
+
+The request and its response use the same counter-derived IV. The counter
+starts at one and increments after each completed request/response exchange.
+
 ## Security boundary
 
 The separate capability is essential. If the same key also has ordinary
@@ -187,3 +231,47 @@ keys, non-replayable closed sessions, and no continuing authorization to invoke
 the source HSM. A compromised connector holding the exported session keys can
 still control the current session; avoiding that would require moving secure
 messaging itself behind the HSM boundary.
+
+## Future true key derivation
+
+The broader missing HSM abstraction is a real, chainable `C_DeriveKey`: a
+protected base object plus mechanism parameters and an output template should
+create another protected HSM object atomically instead of returning bytes. A
+persistent generic-secret object type would provide the natural intermediate
+object. This is realistic for physical hardware: it is an ordinary,
+non-extractable NVM object with narrowly assigned derivation capabilities, not
+a large or long-lived RAM allocation.
+
+For this construction, a token-output form of `DeriveEcdhKdf` would create the
+64-byte generic secret directly in NVM. Native `CKM_EXTRACT_KEY_FROM_KEY` could
+then create persistent, non-extractable AES-128 objects for the receipt key,
+`S-ENC`, `S-MAC`, and `S-RMAC`. Existing AES-CMAC, ECB, and CBC operations would
+complete secure messaging without exposing any key bytes.
+
+The generic-secret output could itself serve as an HMAC or KDF base key. A
+subsequent derivation could instead create AES or another supported symmetric
+key type selected by the output template. The same foundation should cover
+standard protected ECDH and finite-field DH, HKDF, all three SP 800-108 modes,
+`CKM_EXTRACT_KEY_FROM_KEY`, concatenate/XOR composition, digest-based
+derivation, and suitable protocol-specific derivations. Password-based input
+can produce the same persistent output objects even though its operation is
+closer to key generation than derivation from a protected base key.
+
+Ordinary derived token objects would follow the usual YubiHSM model:
+NVM-backed, generation-tracked, and explicitly deleted. A practical first
+subset is persistent generic-secret output, extraction into persistent AES
+keys, protected ECDH, HKDF, and SP 800-108. That is broadly reusable and
+happens to provide all the key-composition pieces SCP11 needs without making
+SCP11 itself part of the object model.
+
+The one session object needed by the SCP11 construction is small enough for a
+more faithful hardware design. Each authenticated HSM session can hold one
+optional, zeroizing generic-secret buffer of at most 64 bytes. It has sequence
+zero, never enters persistence, and is addressable only through that HSM
+session. Authentication clears it before establishing new authority; close,
+timeout, authentication failure, protocol invalidation, and reset clear it as
+well. The provider must retain the underlying HSM session while its PKCS #11
+session-object handle exists. The generic secret can then be extracted into
+ordinary persistent AES objects without its bytes crossing the device
+boundary. This requires no NVM orphan recovery or persistent session-owner
+metadata.
