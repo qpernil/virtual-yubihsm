@@ -2801,14 +2801,23 @@ impl Device {
             }
             return Ok(requested);
         }
-        (1..u16::MAX)
-            .find(|id| {
-                !self.objects.contains_key(&ObjectKey {
-                    object_type,
-                    id: *id,
-                })
-            })
-            .ok_or(DeviceError::StorageFailed)
+        self.random_available_id_with(|| {
+            let mut encoded = [0; 2];
+            getrandom::fill(&mut encoded).map_err(|_| DeviceError::StorageFailed)?;
+            Ok(u16::from_be_bytes(encoded))
+        })
+    }
+
+    fn random_available_id_with<F>(&self, mut next_id: F) -> Result<u16>
+    where
+        F: FnMut() -> Result<u16>,
+    {
+        loop {
+            let id = next_id()?;
+            if id != 0 && id != u16::MAX && !self.objects.keys().any(|key| key.id == id) {
+                return Ok(id);
+            }
+        }
     }
 
     fn next_generation(&self, id: u16) -> u64 {
@@ -4060,6 +4069,62 @@ mod tests {
         );
         assert_eq!(restored.sequence_history.generation(key.id), Some(256));
         assert_eq!(restored.object(key).unwrap().info.sequence, 0);
+    }
+
+    #[test]
+    fn automatic_object_ids_are_random_valid_and_globally_unused() {
+        let mut device = Device::factory_default(DeviceConfig::default());
+        let admin = device.session_authorization(1).unwrap();
+        let opaque_response =
+            device.execute_inner(admin, &put_opaque_request(0, 1, CapabilitySet::NONE));
+        let opaque_id = u16::from_be_bytes(opaque_response.data.try_into().unwrap());
+        assert_ne!(opaque_id, 0);
+        assert_ne!(opaque_id, u16::MAX);
+
+        let symmetric_response = device.execute_inner(
+            admin,
+            &put_symmetric_key_request(0, 1, CapabilitySet::NONE, Algorithm::Aes128, &[0x42; 16]),
+        );
+        let symmetric_id = u16::from_be_bytes(symmetric_response.data.try_into().unwrap());
+        assert_ne!(symmetric_id, 0);
+        assert_ne!(symmetric_id, u16::MAX);
+        assert_ne!(symmetric_id, opaque_id);
+        assert!(device
+            .objects
+            .keys()
+            .all(|key| key.id != 0 && key.id != u16::MAX));
+    }
+
+    #[test]
+    fn automatic_id_sampling_rejects_reserved_and_cross_type_collisions() {
+        let mut device = Device::factory_default(DeviceConfig::default());
+        let admin = device.session_authorization(1).unwrap();
+        assert_eq!(
+            device
+                .execute_inner(
+                    admin,
+                    &put_symmetric_key_request(
+                        7,
+                        1,
+                        CapabilitySet::NONE,
+                        Algorithm::Aes128,
+                        &[0x07; 16],
+                    ),
+                )
+                .data,
+            7_u16.to_be_bytes()
+        );
+
+        let mut candidates = [0, u16::MAX, 1, 7, 42].into_iter();
+        assert_eq!(
+            device
+                .random_available_id_with(|| Ok(candidates.next().unwrap()))
+                .unwrap(),
+            42
+        );
+        // Explicit identifiers remain scoped by object type, as in the wire
+        // protocol; only automatic allocation promises a globally unused ID.
+        assert_eq!(device.resolve_id(ObjectType::Opaque, 7).unwrap(), 7);
     }
 
     #[test]

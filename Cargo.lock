@@ -1366,6 +1366,7 @@ name = "usb-gadget-worker"
 version = "0.1.0"
 dependencies = [
  "ciborium",
+ "libc",
  "serde",
  "serde_bytes",
 ]
