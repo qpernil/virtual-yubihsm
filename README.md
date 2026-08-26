@@ -139,6 +139,25 @@ The asymmetric YubiHSM Auth persistence path has also been exercised against a
 physical YubiKey. See the
 [advanced YubiHSM Auth qualification record](docs/advanced-yubihsm-auth-qualification.md).
 
+## Compatibility behavior
+
+The reported object capacity follows the physical device's nominal 256-object
+limit. Once that many objects exist, `Get Storage Info` reports zero free object
+slots, but the virtual device continues to permit additional objects.
+
+Force-audit mode rejects ordinary authenticated commands when the audit log is
+full; it does not implicitly enable auditing for every command. `Create Session`
+and `Authenticate Session` may be configured for audit, but are never rejected
+because the log is full, avoiding an authentication deadlock. Successful
+authentication that cannot be logged is reflected in the unlogged-authentication
+counter. The `Session Message` envelope itself can never be audited; its
+decrypted command is considered separately.
+
+Successful command responses must fit the protocol's maximum encrypted return
+frame. An otherwise successful operation that produces too much return data is
+reported as `WRONG LENGTH`. `Reset Device` also renews the static P-256 device
+identity in addition to restoring the factory object and option state.
+
 ## Worker lifecycle
 
 `virtual-yubihsm-worker` is the project worker, not a second adapter process.
@@ -205,8 +224,9 @@ When a protocol command fails, the worker writes a diagnostic to the service
 journal containing the command name and byte, the returned device error, and,
 for an authenticated command, its session and Authentication Key identifiers.
 It never logs command payloads or cryptographic material. These diagnostics are
-separate from the device audit log and do not change the rule that meta-commands
-are never audited.
+separate from the device audit log. The `Session Message` envelope itself is
+never audited. Configured `Create Session` and `Authenticate Session` operations
+can be audited, while decrypted commands are audited individually.
 
 [`profiles/virtual-yubihsm.toml`](profiles/virtual-yubihsm.toml) is the
 installation template for the 240x240 ST7789 color display;

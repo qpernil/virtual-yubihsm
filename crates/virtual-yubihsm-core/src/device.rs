@@ -415,7 +415,7 @@ impl Device {
             ) => {
                 return self.execute_plain(&request);
             }
-            Some(CommandCode::CreateSession) => self.create_session(&request.data),
+            Some(CommandCode::CreateSession) => self.create_session(&request),
             Some(CommandCode::AuthenticateSession) => self.authenticate_session(&request),
             Some(CommandCode::SessionMessage) => {
                 self.session_message_with(&request, handler, observer)
@@ -493,70 +493,93 @@ impl Device {
         })
     }
 
-    fn create_session(&mut self, data: &[u8]) -> Result<Frame> {
+    fn create_session(&mut self, request: &Frame) -> Result<Frame> {
+        let data = &request.data;
         if data.len() < 2 {
             return Err(DeviceError::WrongLength);
         }
         let authentication_key_id = u16::from_be_bytes(data[..2].try_into().unwrap());
         let authorization = self.session_authorization(authentication_key_id)?;
-        let material = self
-            .authentication_key_material(authentication_key_id)?
-            .clone();
-        let sid = (0..MAX_SESSIONS)
-            .find(|sid| !self.sessions.contains_key(sid))
-            .ok_or(DeviceError::SessionsFull)?;
+        let result = (|| {
+            let material = self
+                .authentication_key_material(authentication_key_id)?
+                .clone();
+            let sid = (0..MAX_SESSIONS)
+                .find(|sid| !self.sessions.contains_key(sid))
+                .ok_or(DeviceError::SessionsFull)?;
 
-        match &material {
-            AuthenticationKeyMaterial::Symmetric(static_keys) => {
-                if data.len() != 2 + CHALLENGE_LENGTH {
-                    return Err(DeviceError::WrongLength);
+            match &material {
+                AuthenticationKeyMaterial::Symmetric(static_keys) => {
+                    if data.len() != 2 + CHALLENGE_LENGTH {
+                        return Err(DeviceError::WrongLength);
+                    }
+                    let mut card_challenge = [0; CHALLENGE_LENGTH];
+                    getrandom::fill(&mut card_challenge).map_err(|_| DeviceError::StorageFailed)?;
+                    let (secure, card_cryptogram, expected_host_cryptogram) =
+                        SecureSession::begin_symmetric(
+                            sid,
+                            static_keys,
+                            &data[2..],
+                            card_challenge,
+                        )?;
+                    self.sessions.insert(
+                        sid,
+                        SessionEntry {
+                            authorization,
+                            secure,
+                            expected_host_cryptogram: Some(expected_host_cryptogram),
+                            authenticated: false,
+                        },
+                    );
+                    let mut response = Vec::with_capacity(1 + CHALLENGE_LENGTH + 8);
+                    response.push(sid);
+                    response.extend_from_slice(&card_challenge);
+                    response.extend_from_slice(&card_cryptogram);
+                    Ok(Frame::response(CommandCode::CreateSession as u8, response))
                 }
-                let mut card_challenge = [0; CHALLENGE_LENGTH];
-                getrandom::fill(&mut card_challenge).map_err(|_| DeviceError::StorageFailed)?;
-                let (secure, card_cryptogram, expected_host_cryptogram) =
-                    SecureSession::begin_symmetric(sid, static_keys, &data[2..], card_challenge)?;
-                self.sessions.insert(
-                    sid,
-                    SessionEntry {
-                        authorization,
-                        secure,
-                        expected_host_cryptogram: Some(expected_host_cryptogram),
-                        authenticated: false,
-                    },
-                );
-                let mut response = Vec::with_capacity(1 + CHALLENGE_LENGTH + 8);
-                response.push(sid);
-                response.extend_from_slice(&card_challenge);
-                response.extend_from_slice(&card_cryptogram);
-                Ok(Frame::response(CommandCode::CreateSession as u8, response))
-            }
-            AuthenticationKeyMaterial::Asymmetric(host_static_public) => {
-                if data.len() != 2 + P256_PUBLIC_KEY_LENGTH {
-                    return Err(DeviceError::WrongLength);
+                AuthenticationKeyMaterial::Asymmetric(host_static_public) => {
+                    if data.len() != 2 + P256_PUBLIC_KEY_LENGTH {
+                        return Err(DeviceError::WrongLength);
+                    }
+                    let (secure, device_ephemeral_public, receipt) =
+                        SecureSession::begin_asymmetric(
+                            sid,
+                            &self.device_static_private,
+                            host_static_public,
+                            &data[2..],
+                        )?;
+                    self.sessions.insert(
+                        sid,
+                        SessionEntry {
+                            authorization,
+                            secure,
+                            expected_host_cryptogram: None,
+                            authenticated: true,
+                        },
+                    );
+                    let mut response = Vec::with_capacity(1 + P256_PUBLIC_KEY_LENGTH + 16);
+                    response.push(sid);
+                    response.extend_from_slice(&device_ephemeral_public);
+                    response.extend_from_slice(&receipt);
+                    self.record_unlogged_authentication_if_full();
+                    Ok(Frame::response(CommandCode::CreateSession as u8, response))
                 }
-                let (secure, device_ephemeral_public, receipt) = SecureSession::begin_asymmetric(
-                    sid,
-                    &self.device_static_private,
-                    host_static_public,
-                    &data[2..],
-                )?;
-                self.sessions.insert(
-                    sid,
-                    SessionEntry {
-                        authorization,
-                        secure,
-                        expected_host_cryptogram: None,
-                        authenticated: true,
-                    },
-                );
-                let mut response = Vec::with_capacity(1 + P256_PUBLIC_KEY_LENGTH + 16);
-                response.push(sid);
-                response.extend_from_slice(&device_ephemeral_public);
-                response.extend_from_slice(&receipt);
-                self.record_unlogged_authentication_if_full();
-                Ok(Frame::response(CommandCode::CreateSession as u8, response))
             }
+        })();
+        if self.should_audit(CommandCode::CreateSession) {
+            let result_code = result
+                .as_ref()
+                .err()
+                .copied()
+                .map_or(0, |error| error as u8);
+            self.append_audit_entry(
+                authorization,
+                CommandCode::CreateSession,
+                request,
+                result_code,
+            );
         }
+        result
     }
 
     fn authenticate_session(&mut self, request: &Frame) -> Result<Frame> {
@@ -569,21 +592,38 @@ impl Device {
             .sessions
             .remove(&sid)
             .ok_or(DeviceError::InvalidSession)?;
-        if entry.authenticated {
-            return Err(DeviceError::InvalidSession);
+        let authorization = entry.authorization;
+        let result = (|| {
+            if entry.authenticated {
+                return Err(DeviceError::InvalidSession);
+            }
+            let expected = entry
+                .expected_host_cryptogram
+                .take()
+                .ok_or(DeviceError::AuthenticationFailed)?;
+            entry.secure.authenticate_symmetric(request, &expected)?;
+            entry.authenticated = true;
+            self.sessions.insert(sid, entry);
+            self.record_unlogged_authentication_if_full();
+            Ok(Frame::response(
+                CommandCode::AuthenticateSession as u8,
+                Vec::new(),
+            ))
+        })();
+        if self.should_audit(CommandCode::AuthenticateSession) {
+            let result_code = result
+                .as_ref()
+                .err()
+                .copied()
+                .map_or(0, |error| error as u8);
+            self.append_audit_entry(
+                authorization,
+                CommandCode::AuthenticateSession,
+                request,
+                result_code,
+            );
         }
-        let expected = entry
-            .expected_host_cryptogram
-            .take()
-            .ok_or(DeviceError::AuthenticationFailed)?;
-        entry.secure.authenticate_symmetric(request, &expected)?;
-        entry.authenticated = true;
-        self.sessions.insert(sid, entry);
-        self.record_unlogged_authentication_if_full();
-        Ok(Frame::response(
-            CommandCode::AuthenticateSession as u8,
-            Vec::new(),
-        ))
+        result
     }
 
     fn session_message_with<F, O>(
@@ -1290,12 +1330,13 @@ impl Device {
                 }
                 let mut updated = self.options.command_audit.clone();
                 for pair in values.chunks_exact(2) {
-                    if CommandCode::from_byte(pair[0]).is_none() || !valid_option_value(pair[1]) {
+                    let Some(command) = CommandCode::from_byte(pair[0]) else {
+                        return Err(DeviceError::InvalidData);
+                    };
+                    if !valid_option_value(pair[1]) {
                         return Err(DeviceError::InvalidData);
                     }
-                    if CommandCode::from_byte(pair[0]).is_some_and(command_is_meta)
-                        && pair[1] != OPTION_OFF
-                    {
+                    if !command_can_be_audited(command) && pair[1] != OPTION_OFF {
                         return Err(DeviceError::InvalidData);
                     }
                     if updated.get(&pair[0]) == Some(&OPTION_FIX) && pair[1] != OPTION_FIX {
@@ -1374,7 +1415,7 @@ impl Device {
     }
 
     fn should_audit(&self, command: CommandCode) -> bool {
-        !command_is_meta(command)
+        command_can_be_audited(command)
             && self
                 .options
                 .command_audit
@@ -1394,7 +1435,11 @@ impl Device {
         if self.audit.entries.len() >= usize::from(self.config.log_capacity) {
             return;
         }
-        let (target_key, second_key) = audit_key_ids(command, &request.data);
+        let (target_key, second_key) = if command == CommandCode::AuthenticateSession {
+            (authorization.authentication_key_id, 0)
+        } else {
+            audit_key_ids(command, &request.data)
+        };
         let mut entry = AuditEntry {
             number: self.audit.next_number,
             command: command as u8,
@@ -3540,6 +3585,14 @@ fn command_is_meta(command: CommandCode) -> bool {
     )
 }
 
+fn command_can_be_audited(command: CommandCode) -> bool {
+    !command_is_meta(command)
+        || matches!(
+            command,
+            CommandCode::CreateSession | CommandCode::AuthenticateSession
+        )
+}
+
 fn audit_key_ids(command: CommandCode, data: &[u8]) -> (u16, u16) {
     let first = data
         .get(..2)
@@ -5152,20 +5205,76 @@ mod tests {
     }
 
     #[test]
-    fn meta_commands_including_session_message_are_never_audited() {
+    fn authentication_commands_can_be_audited_but_session_message_cannot() {
         let mut device = Device::factory_default(DeviceConfig::default());
         let admin = device.session_authorization(1).unwrap();
-        let meta_commands = [
+        let enable_authentication_audit = Frame::new(
+            CommandCode::SetOption as u8,
+            vec![
+                OPTION_COMMAND_AUDIT,
+                0,
+                4,
+                CommandCode::CreateSession as u8,
+                OPTION_ON,
+                CommandCode::AuthenticateSession as u8,
+                OPTION_ON,
+            ],
+        )
+        .unwrap();
+        assert!(device
+            .execute_inner(admin, &enable_authentication_audit)
+            .data
+            .is_empty());
+
+        let mut create_data = 1_u16.to_be_bytes().to_vec();
+        create_data.extend_from_slice(&[0; CHALLENGE_LENGTH]);
+        let create = Frame::new(CommandCode::CreateSession as u8, create_data).unwrap();
+        let create_response = device.handle_frame(create);
+        assert_eq!(
+            create_response.command,
+            CommandCode::CreateSession as u8 | 0x80
+        );
+        let sid = create_response.data[0];
+
+        let malformed_authenticate =
+            Frame::new(CommandCode::AuthenticateSession as u8, vec![sid]).unwrap();
+        assert_eq!(
+            device.handle_frame(malformed_authenticate),
+            Frame::error(DeviceError::AuthenticationFailed)
+        );
+
+        assert_eq!(device.audit.entries.len(), 2);
+        assert_eq!(
+            (
+                device.audit.entries[0].command,
+                device.audit.entries[0].session_key,
+                device.audit.entries[0].target_key,
+                device.audit.entries[0].result,
+            ),
+            (CommandCode::CreateSession as u8, 1, 1, 0)
+        );
+        assert_eq!(
+            (
+                device.audit.entries[1].command,
+                device.audit.entries[1].session_key,
+                device.audit.entries[1].target_key,
+                device.audit.entries[1].result,
+            ),
+            (
+                CommandCode::AuthenticateSession as u8,
+                1,
+                1,
+                DeviceError::AuthenticationFailed as u8,
+            )
+        );
+
+        for command in [
             CommandCode::Echo,
-            CommandCode::CreateSession,
-            CommandCode::AuthenticateSession,
             CommandCode::SessionMessage,
             CommandCode::GetDeviceInfo,
             CommandCode::GetDevicePublicKey,
             CommandCode::CloseSession,
-        ];
-
-        for command in meta_commands {
+        ] {
             let enable_audit = Frame::new(
                 CommandCode::SetOption as u8,
                 vec![OPTION_COMMAND_AUDIT, 0, 2, command as u8, OPTION_ON],
@@ -5176,15 +5285,61 @@ mod tests {
                 Frame::error(DeviceError::InvalidData)
             );
 
-            // Keep the execution rule fail-safe even if an invalid option map
-            // somehow reaches memory through a future state migration.
+            // Keep the execution rule fail-safe if an invalid option map
+            // reaches memory through trusted state restoration.
             device
                 .options
                 .command_audit
                 .insert(command as u8, OPTION_ON);
             assert!(!device.should_audit(command));
         }
-        assert!(device.audit.entries.is_empty());
+    }
+
+    #[test]
+    fn authentication_commands_are_not_denied_when_force_audit_log_is_full() {
+        let mut device = Device::factory_default(DeviceConfig {
+            log_capacity: 1,
+            ..DeviceConfig::default()
+        });
+        let admin = device.session_authorization(1).unwrap();
+        let options = Frame::new(
+            CommandCode::SetOption as u8,
+            vec![
+                OPTION_COMMAND_AUDIT,
+                0,
+                4,
+                CommandCode::CreateSession as u8,
+                OPTION_ON,
+                CommandCode::AuthenticateSession as u8,
+                OPTION_ON,
+            ],
+        )
+        .unwrap();
+        assert!(device.execute_inner(admin, &options).data.is_empty());
+        let force = Frame::new(
+            CommandCode::SetOption as u8,
+            vec![OPTION_FORCE_AUDIT, 0, 1, OPTION_ON],
+        )
+        .unwrap();
+        assert!(device.execute_inner(admin, &force).data.is_empty());
+
+        let mut create_data = 1_u16.to_be_bytes().to_vec();
+        create_data.extend_from_slice(&[0; CHALLENGE_LENGTH]);
+        let create = Frame::new(CommandCode::CreateSession as u8, create_data).unwrap();
+        let first = device.handle_frame(create.clone());
+        assert_eq!(first.command, CommandCode::CreateSession as u8 | 0x80);
+        assert_eq!(device.audit.entries.len(), 1);
+
+        let second = device.handle_frame(create);
+        assert_eq!(second.command, CommandCode::CreateSession as u8 | 0x80);
+        let sid = second.data[0];
+        let malformed_authenticate =
+            Frame::new(CommandCode::AuthenticateSession as u8, vec![sid]).unwrap();
+        assert_eq!(
+            device.handle_frame(malformed_authenticate),
+            Frame::error(DeviceError::AuthenticationFailed)
+        );
+        assert_eq!(device.audit.entries.len(), 1);
     }
 
     #[test]
