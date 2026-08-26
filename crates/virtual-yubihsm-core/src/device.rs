@@ -12,7 +12,6 @@ use der::{
     asn1::{Any, BitString, OctetString},
     Decode, Encode,
 };
-use hmac::{Hmac, Mac};
 use p256::{
     ecdsa::{DerSignature, SigningKey as P256SigningKey},
     elliptic_curve::sec1::ToSec1Point,
@@ -20,8 +19,6 @@ use p256::{
 };
 use rsa::{pkcs8::EncodePublicKey, BigUint, RsaPublicKey};
 use serde::{Deserialize, Serialize};
-use sha1::Sha1;
-use sha2::{Digest, Sha256, Sha384, Sha512};
 use software_key_core::{
     rsa_signing::RsaHashAlgorithm,
     secure_channel::yubico_password_kdf,
@@ -1306,9 +1303,9 @@ impl Device {
         let mut digest_input = Vec::with_capacity(32);
         digest_input.extend_from_slice(&encoded[..16]);
         digest_input.extend_from_slice(&self.audit.previous_digest);
-        entry
-            .digest
-            .copy_from_slice(&Sha256::digest(&digest_input)[..16]);
+        entry.digest.copy_from_slice(
+            &software_key_core::digest::HashAlgorithm::Sha256.digest(&digest_input)[..16],
+        );
         self.audit.previous_digest = entry.digest;
         self.audit.next_number = self.audit.next_number.wrapping_add(1).max(1);
         self.audit.systick = self.audit.systick.wrapping_add(1);
@@ -3221,21 +3218,14 @@ fn calculate_hmac(object: &ObjectRecord, data: &[u8]) -> Result<Vec<u8>> {
     let ObjectMaterial::Secret(secret) = &object.material else {
         return Err(DeviceError::InvalidData);
     };
-    macro_rules! calculate {
-        ($digest:ty) => {{
-            let mut mac = <Hmac<$digest> as hmac::digest::KeyInit>::new_from_slice(secret)
-                .map_err(|_| DeviceError::InvalidData)?;
-            mac.update(data);
-            Ok(mac.finalize().into_bytes().to_vec())
-        }};
-    }
-    match object.info.algorithm {
-        19 => calculate!(Sha1),
-        20 => calculate!(Sha256),
-        21 => calculate!(Sha384),
-        22 => calculate!(Sha512),
-        _ => Err(DeviceError::InvalidData),
-    }
+    let algorithm = match object.info.algorithm {
+        19 => software_key_core::digest::HashAlgorithm::Sha1,
+        20 => software_key_core::digest::HashAlgorithm::Sha256,
+        21 => software_key_core::digest::HashAlgorithm::Sha384,
+        22 => software_key_core::digest::HashAlgorithm::Sha512,
+        _ => return Err(DeviceError::InvalidData),
+    };
+    software_key_core::digest::hmac(algorithm, secret, data).map_err(|_| DeviceError::InvalidData)
 }
 
 fn parse_u16(data: &[u8]) -> Result<u16> {
@@ -3451,7 +3441,6 @@ mod tests {
         cbc_decrypt, cbc_encrypt, cmac, encrypt_block, pad, scp03_kdf, unpad, BLOCK_SIZE,
     };
     use p256::ecdh::diffie_hellman;
-    use sha2::Digest;
     use software_key_core::software_signing::EcCurve;
 
     fn put_opaque_request(id: u16, domains: u16, capabilities: CapabilitySet) -> Frame {
@@ -4163,7 +4152,8 @@ mod tests {
             uncompressed: [vec![0x04], public_response.data[1..].to_vec()].concat(),
         };
 
-        let digest = Sha256::digest(b"protocol-neutral key implementation");
+        let digest = software_key_core::digest::HashAlgorithm::Sha256
+            .digest(b"protocol-neutral key implementation");
         let sign = Frame::new(
             CommandCode::SignEcdsa as u8,
             [42_u16.to_be_bytes().as_slice(), digest.as_slice()].concat(),
@@ -4216,7 +4206,8 @@ mod tests {
             modulus: public_response.data[1..].to_vec(),
             exponent: vec![1, 0, 1],
         };
-        let digest = Sha256::digest(b"virtual YubiHSM RSA command");
+        let digest =
+            software_key_core::digest::HashAlgorithm::Sha256.digest(b"virtual YubiHSM RSA command");
         let sign = Frame::new(
             CommandCode::SignPkcs1 as u8,
             [43_u16.to_be_bytes().as_slice(), digest.as_slice()].concat(),
@@ -4813,7 +4804,7 @@ mod tests {
             input.extend_from_slice(static_secret.raw_secret_bytes().as_slice());
             input.extend_from_slice(&((index + 1) as u32).to_be_bytes());
             input.extend_from_slice(&[0x3c, 0x88, 0x10]);
-            chunk.copy_from_slice(&Sha256::digest(&input));
+            chunk.copy_from_slice(&software_key_core::digest::HashAlgorithm::Sha256.digest(&input));
         }
         let mut receipt_input = response.data[1..66].to_vec();
         receipt_input.extend_from_slice(host_ephemeral_public.as_bytes());
