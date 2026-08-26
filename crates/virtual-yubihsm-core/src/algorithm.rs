@@ -1,7 +1,7 @@
 /// Algorithm identifiers from the YubiHSM 2 protocol.
 ///
-/// `X25519` is a virtual-device extension. The official registry currently
-/// ends at `AesKwp`.
+/// `X25519` and `EcdhKdf` are virtual-device extensions. The official registry
+/// currently ends at `AesKwp`.
 #[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
 #[repr(u8)]
 pub enum Algorithm {
@@ -61,6 +61,8 @@ pub enum Algorithm {
     AesCbc = 54,
     AesKwp = 55,
     X25519 = 56,
+    /// Support for the virtual `DeriveEcdhKdf` command.
+    EcdhKdf = 57,
 }
 
 impl Algorithm {
@@ -123,10 +125,10 @@ impl Algorithm {
     ];
 
     pub const fn from_byte(value: u8) -> Option<Self> {
-        if value == 0 || value > Self::X25519 as u8 {
+        if value == 0 || value > Self::EcdhKdf as u8 {
             return None;
         }
-        // SAFETY: every value in the inclusive range 1..=56 is represented.
+        // SAFETY: every value in the inclusive range 1..=57 is represented.
         Some(unsafe { core::mem::transmute::<u8, Self>(value) })
     }
 
@@ -188,6 +190,7 @@ mod tests {
         }
         assert_eq!(Algorithm::X25519 as u8, 56);
         assert_eq!(Algorithm::from_byte(56), Some(Algorithm::X25519));
-        assert_eq!(Algorithm::from_byte(57), None);
+        assert_eq!(Algorithm::from_byte(57), Some(Algorithm::EcdhKdf));
+        assert_eq!(Algorithm::from_byte(58), None);
     }
 }

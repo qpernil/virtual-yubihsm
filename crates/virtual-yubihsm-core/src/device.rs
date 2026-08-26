@@ -17,6 +17,7 @@ use rsa::{pkcs8::EncodePublicKey as EncodeRsaPublicKey, BigUint, RsaPublicKey};
 use serde::{Deserialize, Serialize};
 use signature::{Keypair, Signer};
 use software_key_core::{
+    digest::{x963_kdf, HashAlgorithm},
     rsa_signing::RsaHashAlgorithm,
     secure_channel::yubico_password_kdf,
     software_key_agreement::{derive_with_signing_key, SoftwareX25519Key},
@@ -282,7 +283,7 @@ impl Default for DeviceConfig {
             log_capacity: 62,
             algorithms: Algorithm::OFFICIAL
                 .into_iter()
-                .chain([Algorithm::X25519])
+                .chain([Algorithm::X25519, Algorithm::EcdhKdf])
                 .map(|algorithm| algorithm as u8)
                 .collect(),
             part_number: *b"78CLUFX5000P\0",
@@ -919,6 +920,7 @@ impl Device {
             CommandCode::SignEcdsa => self.sign_ecdsa(authorization, &request.data),
             CommandCode::SignEddsa => self.sign_eddsa(authorization, &request.data),
             CommandCode::DeriveEcdh => self.derive_ecdh(authorization, &request.data),
+            CommandCode::DeriveEcdhKdf => self.derive_ecdh_kdf(authorization, &request.data),
             CommandCode::DecryptPkcs1 => self.decrypt_pkcs1(authorization, &request.data),
             CommandCode::DecryptOaep => self.decrypt_oaep(authorization, &request.data),
             CommandCode::PutHmacKey => self.put_hmac_key(authorization, &request.data, false),
@@ -1060,6 +1062,9 @@ impl Device {
             CommandCode::SignEcdsa => first(ObjectType::AsymmetricKey, Capability::SignEcdsa),
             CommandCode::SignEddsa => first(ObjectType::AsymmetricKey, Capability::SignEddsa),
             CommandCode::DeriveEcdh => first(ObjectType::AsymmetricKey, Capability::DeriveEcdh),
+            CommandCode::DeriveEcdhKdf => {
+                first(ObjectType::AsymmetricKey, Capability::DeriveEcdhKdf)
+            }
             CommandCode::DecryptPkcs1 => first(ObjectType::AsymmetricKey, Capability::DecryptPkcs),
             CommandCode::DecryptOaep => first(ObjectType::AsymmetricKey, Capability::DecryptOaep),
             CommandCode::SignHmac => first(ObjectType::HmacKey, Capability::SignHmac),
@@ -1873,16 +1878,66 @@ impl Device {
         }
         let id = u16::from_be_bytes(data[..2].try_into().unwrap());
         let object = self.asymmetric_object(authorization, id)?;
-        if object.info.algorithm == Algorithm::X25519 as u8 {
-            x25519_key(object)?
-                .derive(&data[2..])
-                .map(|secret| secret.to_vec())
-                .map_err(|_| DeviceError::InvalidData)
-        } else {
-            derive_with_signing_key(&signing_key(object)?, &data[2..])
-                .map(|secret| secret.to_vec())
-                .map_err(|_| DeviceError::InvalidData)
+        raw_ecdh_secret(object, &data[2..]).map(|secret| secret.to_vec())
+    }
+
+    /// Derive an ECDH secret, prefix it with caller-provided secret material,
+    /// and apply ANSI X9.63 without exposing the raw ECDH result.
+    ///
+    /// Request encoding:
+    ///
+    /// ```text
+    /// key id             u16
+    /// X9.63 hash         u8   (1..=9; SHA-1 through SHA3-512)
+    /// output length      u16
+    /// peer public length u16
+    /// prefix length      u16
+    /// shared-info length u16
+    /// peer public || prefix || shared-info
+    /// ```
+    fn derive_ecdh_kdf(&self, authorization: SessionAuthorization, data: &[u8]) -> Result<Vec<u8>> {
+        const HEADER_LENGTH: usize = 11;
+        if data.len() < HEADER_LENGTH {
+            return Err(DeviceError::WrongLength);
         }
+        let id = parse_u16_at(data, 0)?;
+        let hash = ecdh_kdf_hash(data[2])?;
+        let output_length = usize::from(parse_u16_at(data, 3)?);
+        if output_length == 0 || !secure_response_data_fits(output_length) {
+            return Err(DeviceError::WrongLength);
+        }
+        let lengths = [
+            usize::from(parse_u16_at(data, 5)?),
+            usize::from(parse_u16_at(data, 7)?),
+            usize::from(parse_u16_at(data, 9)?),
+        ];
+        let payload_length = lengths
+            .into_iter()
+            .try_fold(0_usize, usize::checked_add)
+            .ok_or(DeviceError::WrongLength)?;
+        if data.len() != HEADER_LENGTH.saturating_add(payload_length) {
+            return Err(DeviceError::WrongLength);
+        }
+        let mut offset = HEADER_LENGTH;
+        let mut take = |length: usize| {
+            let value = &data[offset..offset + length];
+            offset += length;
+            value
+        };
+        let peer_public = take(lengths[0]);
+        let prefix = take(lengths[1]);
+        let shared_info = take(lengths[2]);
+
+        let object = self.asymmetric_object(authorization, id)?;
+        let shared_secret = raw_ecdh_secret(object, peer_public)?;
+        let mut prefixed = Zeroizing::new(Vec::with_capacity(
+            prefix.len().saturating_add(shared_secret.len()),
+        ));
+        prefixed.extend_from_slice(prefix);
+        prefixed.extend_from_slice(&shared_secret);
+        x963_kdf(hash, &prefixed, shared_info, output_length)
+            .map(|output| output.to_vec())
+            .map_err(|_| DeviceError::InvalidData)
     }
 
     fn decrypt_pkcs1(&self, authorization: SessionAuthorization, data: &[u8]) -> Result<Vec<u8>> {
@@ -3412,6 +3467,32 @@ fn calculate_hmac(object: &ObjectRecord, data: &[u8]) -> Result<Vec<u8>> {
     software_key_core::digest::hmac(algorithm, secret, data).map_err(|_| DeviceError::InvalidData)
 }
 
+fn raw_ecdh_secret(object: &ObjectRecord, peer_public: &[u8]) -> Result<Zeroizing<Vec<u8>>> {
+    if object.info.algorithm == Algorithm::X25519 as u8 {
+        x25519_key(object)?
+            .derive(peer_public)
+            .map_err(|_| DeviceError::InvalidData)
+    } else {
+        derive_with_signing_key(&signing_key(object)?, peer_public)
+            .map_err(|_| DeviceError::InvalidData)
+    }
+}
+
+fn ecdh_kdf_hash(value: u8) -> Result<HashAlgorithm> {
+    match value {
+        1 => Ok(HashAlgorithm::Sha1),
+        2 => Ok(HashAlgorithm::Sha224),
+        3 => Ok(HashAlgorithm::Sha256),
+        4 => Ok(HashAlgorithm::Sha384),
+        5 => Ok(HashAlgorithm::Sha512),
+        6 => Ok(HashAlgorithm::Sha3_224),
+        7 => Ok(HashAlgorithm::Sha3_256),
+        8 => Ok(HashAlgorithm::Sha3_384),
+        9 => Ok(HashAlgorithm::Sha3_512),
+        _ => Err(DeviceError::InvalidData),
+    }
+}
+
 fn parse_u16(data: &[u8]) -> Result<u16> {
     data.try_into()
         .map(u16::from_be_bytes)
@@ -3673,6 +3754,43 @@ mod tests {
         data.extend_from_slice(&delegated_capabilities.to_bytes());
         data.extend_from_slice(key);
         Frame::new(CommandCode::PutAuthenticationKey as u8, data).unwrap()
+    }
+
+    fn put_asymmetric_authentication_key_request(
+        id: u16,
+        domains: u16,
+        capabilities: CapabilitySet,
+        delegated_capabilities: CapabilitySet,
+        public_key: &[u8],
+    ) -> Frame {
+        let mut data = Vec::new();
+        data.extend_from_slice(&id.to_be_bytes());
+        data.extend_from_slice(b"asymmetric auth");
+        data.resize(42, 0);
+        data.extend_from_slice(&domains.to_be_bytes());
+        data.extend_from_slice(&capabilities.to_bytes());
+        data.push(AUTHENTICATION_ALGORITHM_EC_P256);
+        data.extend_from_slice(&delegated_capabilities.to_bytes());
+        data.extend_from_slice(public_key);
+        Frame::new(CommandCode::PutAuthenticationKey as u8, data).unwrap()
+    }
+
+    fn put_asymmetric_key_request(
+        id: u16,
+        domains: u16,
+        capabilities: CapabilitySet,
+        algorithm: Algorithm,
+        private_key: &[u8],
+    ) -> Frame {
+        let mut data = Vec::new();
+        data.extend_from_slice(&id.to_be_bytes());
+        data.extend_from_slice(b"private key");
+        data.resize(42, 0);
+        data.extend_from_slice(&domains.to_be_bytes());
+        data.extend_from_slice(&capabilities.to_bytes());
+        data.push(algorithm as u8);
+        data.extend_from_slice(private_key);
+        Frame::new(CommandCode::PutAsymmetricKey as u8, data).unwrap()
     }
 
     fn generate_asymmetric_key_request(
@@ -4581,6 +4699,75 @@ mod tests {
     }
 
     #[test]
+    fn prefixed_ecdh_kdf_derives_without_exposing_the_raw_secret() {
+        let mut device = Device::factory_default(DeviceConfig::default());
+        let admin = device.session_authorization(1).unwrap();
+        let capabilities = CapabilitySet::from_capabilities([Capability::DeriveEcdhKdf]);
+        for id in [46, 47] {
+            let request =
+                generate_asymmetric_key_request(id, 1, capabilities, Algorithm::EcP256 as u8);
+            assert_eq!(device.execute_inner(admin, &request).data, id.to_be_bytes());
+        }
+        let public = |device: &mut Device, id: u16| {
+            let request = Frame::new(CommandCode::GetPublicKey as u8, id.to_be_bytes()).unwrap();
+            let response = device.execute_inner(admin, &request);
+            assert_eq!(response.data[0], Algorithm::EcP256 as u8);
+            [&[0x04], &response.data[1..]].concat()
+        };
+        let peer_public = public(&mut device, 47);
+        let object = device
+            .object(ObjectKey {
+                object_type: ObjectType::AsymmetricKey,
+                id: 46,
+            })
+            .unwrap();
+        let raw_secret = raw_ecdh_secret(object, &peer_public).unwrap();
+        let prepend = [0x41; 32];
+        let shared_info = [0x3c, 0x88, 0x10];
+        let mut prefixed = Zeroizing::new(Vec::new());
+        prefixed.extend_from_slice(&prepend);
+        prefixed.extend_from_slice(&raw_secret);
+        let expected = x963_kdf(HashAlgorithm::Sha256, &prefixed, &shared_info, 64).unwrap();
+
+        let mut data = Vec::new();
+        data.extend_from_slice(&46_u16.to_be_bytes());
+        data.push(3); // X9.63 SHA-256
+        data.extend_from_slice(&64_u16.to_be_bytes());
+        for value in [peer_public.len(), prepend.len(), shared_info.len()] {
+            data.extend_from_slice(&u16::try_from(value).unwrap().to_be_bytes());
+        }
+        data.extend_from_slice(&peer_public);
+        data.extend_from_slice(&prepend);
+        data.extend_from_slice(&shared_info);
+        let request = Frame::new(CommandCode::DeriveEcdhKdf as u8, data).unwrap();
+        assert_eq!(device.execute_inner(admin, &request).data, *expected);
+
+        let raw_request = Frame::new(
+            CommandCode::DeriveEcdh as u8,
+            [46_u16.to_be_bytes().as_slice(), peer_public.as_slice()].concat(),
+        )
+        .unwrap();
+        assert_eq!(
+            device.execute_inner(admin, &raw_request),
+            Frame::error(DeviceError::InsufficientPermissions)
+        );
+
+        // Empty augmentation still passes the secret through a mandatory KDF;
+        // there is no CKD_NULL equivalent that can disclose the raw result.
+        let mut data = Vec::new();
+        data.extend_from_slice(&46_u16.to_be_bytes());
+        data.push(3);
+        data.extend_from_slice(&32_u16.to_be_bytes());
+        data.extend_from_slice(&u16::try_from(peer_public.len()).unwrap().to_be_bytes());
+        data.extend_from_slice(&[0; 4]);
+        data.extend_from_slice(&peer_public);
+        let request = Frame::new(CommandCode::DeriveEcdhKdf as u8, data).unwrap();
+        let derived = device.execute_inner(admin, &request).data;
+        assert_eq!(derived.len(), raw_secret.len());
+        assert_ne!(derived, *raw_secret);
+    }
+
+    #[test]
     fn every_official_ec_key_algorithm_is_available_through_device_commands() {
         let mut device = Device::factory_default(DeviceConfig::default());
         let admin = device.session_authorization(1).unwrap();
@@ -5110,6 +5297,157 @@ mod tests {
             &response.data[66..],
             cmac(&session_keys[..16], &receipt_input).unwrap()
         );
+    }
+
+    #[test]
+    fn protected_ecdh_kdf_can_authenticate_back_to_the_same_hsm() {
+        let mut device = Device::factory_default(DeviceConfig::default());
+        let admin = device.session_authorization(1).unwrap();
+        let static_private = p256::SecretKey::from_slice(&[3; 32]).unwrap();
+        let static_public = static_private.public_key().to_sec1_point(false);
+        let derive_capability = CapabilitySet::from_capabilities([Capability::DeriveEcdhKdf]);
+        let put_static = put_asymmetric_key_request(
+            32,
+            1,
+            derive_capability,
+            Algorithm::EcP256,
+            static_private.to_bytes().as_slice(),
+        );
+        assert_eq!(
+            device.execute_inner(admin, &put_static).data,
+            32_u16.to_be_bytes()
+        );
+
+        let session_capabilities = CapabilitySet::from_capabilities([Capability::GetPseudoRandom]);
+        let put_authentication = put_asymmetric_authentication_key_request(
+            33,
+            1,
+            session_capabilities,
+            CapabilitySet::NONE,
+            &static_public.as_bytes()[1..],
+        );
+        assert_eq!(
+            device.execute_inner(admin, &put_authentication).data,
+            33_u16.to_be_bytes()
+        );
+
+        let host_ephemeral = p256::SecretKey::from_slice(&[4; 32]).unwrap();
+        let host_ephemeral_public = host_ephemeral.public_key().to_sec1_point(false);
+        let mut create_data = 33_u16.to_be_bytes().to_vec();
+        create_data.extend_from_slice(host_ephemeral_public.as_bytes());
+        let create = Frame::new(CommandCode::CreateSession as u8, create_data).unwrap();
+        let create_response = Frame::parse(&device.handle_encoded(&create.encode())).unwrap();
+        assert_eq!(
+            create_response.command,
+            CommandCode::CreateSession as u8 | 0x80
+        );
+        assert_eq!(create_response.data.len(), 1 + 65 + 16);
+        let sid = create_response.data[0];
+
+        // Zephemeral is intentionally calculated by the untrusted host. The
+        // static ECDH result remains inside object 32 and enters the KDF there.
+        let device_ephemeral =
+            p256::PublicKey::from_sec1_bytes(&create_response.data[1..66]).unwrap();
+        let ephemeral_secret = diffie_hellman(
+            host_ephemeral.to_nonzero_scalar(),
+            device_ephemeral.as_affine(),
+        );
+        let device_public_request =
+            Frame::new(CommandCode::GetDevicePublicKey as u8, Vec::new()).unwrap();
+        let mut device_static_public = device.execute_plain(&device_public_request).data;
+        device_static_public[0] = 0x04;
+
+        let shared_info = [0x3c, 0x88, 0x10];
+        let mut derive_data = Vec::new();
+        derive_data.extend_from_slice(&32_u16.to_be_bytes());
+        derive_data.push(3); // X9.63 SHA-256
+        derive_data.extend_from_slice(&64_u16.to_be_bytes());
+        for value in [
+            device_static_public.len(),
+            ephemeral_secret.raw_secret_bytes().len(),
+            shared_info.len(),
+        ] {
+            derive_data.extend_from_slice(&u16::try_from(value).unwrap().to_be_bytes());
+        }
+        derive_data.extend_from_slice(&device_static_public);
+        derive_data.extend_from_slice(ephemeral_secret.raw_secret_bytes());
+        derive_data.extend_from_slice(&shared_info);
+        let derive = Frame::new(CommandCode::DeriveEcdhKdf as u8, derive_data).unwrap();
+        let derive_response = device.execute_inner(admin, &derive);
+        assert_eq!(
+            derive_response.command,
+            CommandCode::DeriveEcdhKdf as u8 | 0x80
+        );
+        assert_eq!(derive_response.data.len(), 64);
+        let session_keys = derive_response.data;
+
+        let mut receipt_input = create_response.data[1..66].to_vec();
+        receipt_input.extend_from_slice(host_ephemeral_public.as_bytes());
+        assert_eq!(
+            &create_response.data[66..],
+            cmac(&session_keys[..16], &receipt_input).unwrap()
+        );
+
+        let raw_derive = Frame::new(
+            CommandCode::DeriveEcdh as u8,
+            [
+                32_u16.to_be_bytes().as_slice(),
+                device_static_public.as_slice(),
+            ]
+            .concat(),
+        )
+        .unwrap();
+        assert_eq!(
+            device.execute_inner(admin, &raw_derive),
+            Frame::error(DeviceError::InsufficientPermissions)
+        );
+
+        // Use the protected result as real SCP11 session keys. A successful
+        // authorized command proves more than merely reproducing the receipt.
+        let mut counter = [0; BLOCK_SIZE];
+        counter[BLOCK_SIZE - 1] = 1;
+        let iv = encrypt_block(&session_keys[16..32], &counter).unwrap();
+        let inner = Frame::new(CommandCode::GetPseudoRandom as u8, 16_u16.to_be_bytes()).unwrap();
+        let ciphertext = cbc_encrypt(&session_keys[16..32], &iv, &pad(&inner.encode())).unwrap();
+        let mut message_payload = vec![sid];
+        message_payload.extend_from_slice(&ciphertext);
+        let total_length = message_payload.len() + 8;
+        let mut message_without_mac = vec![
+            CommandCode::SessionMessage as u8,
+            (total_length >> 8) as u8,
+            total_length as u8,
+        ];
+        message_without_mac.extend_from_slice(&message_payload);
+        let mut message_mac_input = create_response.data[66..].to_vec();
+        message_mac_input.extend_from_slice(&message_without_mac);
+        let message_mac = cmac(&session_keys[32..48], &message_mac_input).unwrap();
+        message_payload.extend_from_slice(&message_mac[..8]);
+        let message = Frame::new(CommandCode::SessionMessage as u8, message_payload).unwrap();
+        let response = Frame::parse(&device.handle_encoded(&message.encode())).unwrap();
+        assert_eq!(response.command, CommandCode::SessionMessage as u8 | 0x80);
+
+        let response_payload_length = response.data.len() - 8;
+        let response_without_mac = &response.encode()[..3 + response_payload_length];
+        let mut rmac_input = message_mac.to_vec();
+        rmac_input.extend_from_slice(response_without_mac);
+        let expected_rmac = cmac(&session_keys[48..64], &rmac_input).unwrap();
+        assert_eq!(
+            &response.data[response_payload_length..],
+            &expected_rmac[..8]
+        );
+        assert_eq!(response.data[0], sid);
+        let clear = cbc_decrypt(
+            &session_keys[16..32],
+            &iv,
+            &response.data[1..response_payload_length],
+        )
+        .unwrap();
+        let inner_response = Frame::parse(&unpad(clear).unwrap()).unwrap();
+        assert_eq!(
+            inner_response.command,
+            CommandCode::GetPseudoRandom as u8 | 0x80
+        );
+        assert_eq!(inner_response.data.len(), 16);
     }
 
     #[test]
