@@ -18,7 +18,7 @@ use std::{
     thread,
 };
 use usb_gadget_worker::{
-    replace_file_atomically, EndpointLifecycle, PersistenceMode, StatePersistence,
+    replace_file_atomically, EndpointLifecycle, PersistenceMode, StateLock, StatePersistence,
     StatePersistenceHandle, UsbBusEvent,
 };
 use virtual_yubihsm_core::{
@@ -63,6 +63,7 @@ pub(crate) fn run_worker(
     let resources = InitialResources::parse(validate_initial_resources(control.receive()?)?)?;
     let state_directory = required_path(STATE_DIRECTORY_ENV)?;
     let state_path = state_directory.join(format!("yubihsm-{serial}.cbor"));
+    let _state_lock = StateLock::acquire(state_directory.join(format!("yubihsm-{serial}.lock")))?;
     let config = DeviceConfig {
         serial,
         ..DeviceConfig::default()

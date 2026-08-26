@@ -134,19 +134,30 @@ it must not introduce transport concepts.
 
 ## Connector backend
 
-The connector adds one adapter per configured virtual instance:
+The connector adds one adapter and one dedicated blocking actor per configured
+virtual instance:
 
 ```rust
-struct BuiltInVirtualYubiHsm {
-    persistence: StatePersistenceHandle<Device>,
-    identity: DeviceIdentity,
+enum ActorRequest {
+    Command {
+        bytes: Vec<u8>,
+        reply: tokio::sync::oneshot::Sender<Result<Vec<u8>>>,
+    },
+    Shutdown {
+        reply: tokio::sync::oneshot::Sender<Result<()>>,
+    },
 }
 ```
 
-The exact mutex and persistence-handle types belong to the connector and the
-shared persistence library. The persistence handle owns the synchronized
-`Device`; the adapter must not keep a second copy. Conceptually, command
-handling is:
+The asynchronous adapter sends requests through a capacity-one Tokio MPSC
+channel and awaits each result through its one-shot channel. The actor blocks
+on that channel from its own OS thread, so synchronous cryptography, mutexes,
+and persistence receipts never block a Tokio executor thread. Cancelling an
+HTTP request only drops its one-shot receiver; the actor still finishes and
+accounts for a command it already received.
+
+The persistence handle owns the synchronized `Device`; neither the actor nor
+adapter keeps a second copy. Conceptually, actor command handling is:
 
 1. acquire the instance's command lock;
 2. call `Device::handle_encoded` with exactly one native request frame;
@@ -188,10 +199,17 @@ For each built-in instance:
 - a persistence failure withdraws or fails the instance rather than continuing
   with state that cannot meet its configured durability contract.
 
-The connector must exclusively lock each state file or state directory for the
-lifetime of the instance. The USB worker and connector may not open the same
-persisted device simultaneously. Supporting two transports for one live device
-would require a single state-owning process and is outside this design.
+Every frontend must acquire the shared `StateLock` on
+`STATE_DIRECTORY/yubihsm-<serial>.lock` before reading or creating the CBOR
+image and retain it through the final persistence flush. The stable sidecar is
+locked instead of the CBOR file because persistence atomically replaces the
+CBOR inode. Lock acquisition is nonblocking and a concurrent owner is a
+startup error; the sidecar remains present after the kernel releases the lock.
+The process or service manager still decides which otherwise independent tool
+should run. The USB worker and connector may point at the same persisted device
+across separate runs, but may not open it simultaneously. Supporting two
+transports for one live device would require a single state-owning process and
+is outside this design.
 
 ## Configuration
 
@@ -210,8 +228,19 @@ state_directory = "/var/lib/yubihsmrs-connector/virtual-yubihsm-87654321"
 persistence = { batched = { maximum_delay_ms = 500 } }
 ```
 
-Exact syntax should follow the connector's existing configuration model. The
-required semantics are:
+The implemented connector uses repeatable command-line configuration:
+
+```text
+--virtual-yubihsm SERIAL=STATE_DIRECTORY
+--virtual-yubihsm-persistence batched|immediate
+--virtual-yubihsm-batch-delay-ms MILLISECONDS
+--hardware-discovery true|false
+```
+
+Persistence policy and batch delay currently apply to all embedded instances
+in one connector process. Virtual instances are opt-in, while physical
+discovery defaults to enabled and can be independently disabled for a
+virtual-only connector. The required semantics are:
 
 - every serial is explicit and unique across the connector's physical and
   virtual inventory;

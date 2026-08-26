@@ -113,6 +113,11 @@ serving USB, and atomically replaces it after persistent changes. Temporary and
 final files are created with mode `0600`, synced before replacement, and the
 containing directory is synced after replacement. A corrupt, unsupported, or
 wrong-serial image fails closed rather than silently factory-resetting.
+Before reading or creating that image, the worker exclusively locks the
+persistent sidecar `STATE_DIRECTORY/yubihsm-<serial>.lock` and retains the lock
+through its final persistence flush. The sidecar remains present when unlocked;
+the kernel lock, rather than file existence, records ownership. A concurrent
+owner is a startup error.
 
 The CBOR image is deliberately not encrypted. It contains private key material
 and Authentication Keys, so `STATE_DIRECTORY` is part of the trusted boundary
