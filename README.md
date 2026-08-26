@@ -34,6 +34,10 @@ counters, audit policy, and device error mapping. This keeps the cryptography
 shared without making either the HSM protocol or its authorization model a
 dependency of other consumers.
 
+The proposed direct, in-process integration of this core as a built-in device
+inside `yubihsmrs-connector` is specified in the
+[built-in connector design](docs/yubihsmrs-connector-integration-design.md).
+
 An authenticated session receives exactly the Authentication Key object's:
 
 - capabilities — operations that the session may request;
