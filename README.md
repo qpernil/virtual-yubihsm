@@ -119,7 +119,7 @@ and Authentication Keys, so `STATE_DIRECTORY` is part of the trusted boundary
 and must only be accessible to the worker identity and the administrator.
 Secure sessions and secure-message counters are never serialized. `ResetDevice`
 clears objects, options, audit state and sessions, then reinstalls the factory
-Authentication Key while retaining the device's static identity.
+Authentication Key and generates a new static P-256 device identity.
 
 Persistent state retains the latest generation for every numeric object ID seen
 since the last device reset, including deleted objects. The mapping is shared
