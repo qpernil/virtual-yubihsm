@@ -1,7 +1,8 @@
 use crate::{
     session::{
-        random_secret_key, SecureSession, SessionEntry, AUTHENTICATION_ALGORITHM_AES128_YUBICO,
-        AUTHENTICATION_ALGORITHM_EC_P256, CHALLENGE_LENGTH, P256_PUBLIC_KEY_LENGTH,
+        random_secret_key, secure_response_data_fits, secure_response_fits, SecureSession,
+        SessionEntry, AUTHENTICATION_ALGORITHM_AES128_YUBICO, AUTHENTICATION_ALGORITHM_EC_P256,
+        CHALLENGE_LENGTH, P256_PUBLIC_KEY_LENGTH,
     },
     Algorithm, AuthenticationKeyMaterial, Capability, CapabilitySet, CommandCode, DeviceError,
     Frame, ObjectInfo, ObjectKey, ObjectMaterial, ObjectRecord, ObjectType, Result,
@@ -12,13 +13,9 @@ use der::{
     asn1::{Any, BitString, OctetString},
     Decode, Encode,
 };
-use p256::{
-    ecdsa::{DerSignature, SigningKey as P256SigningKey},
-    elliptic_curve::sec1::ToSec1Point,
-    SecretKey,
-};
-use rsa::{pkcs8::EncodePublicKey, BigUint, RsaPublicKey};
+use rsa::{pkcs8::EncodePublicKey as EncodeRsaPublicKey, BigUint, RsaPublicKey};
 use serde::{Deserialize, Serialize};
+use signature::{Keypair, Signer};
 use software_key_core::{
     rsa_signing::RsaHashAlgorithm,
     secure_channel::yubico_password_kdf,
@@ -30,7 +27,10 @@ use software_key_core::{
         wrap_aes_kwp, AES_BLOCK_SIZE, AES_CCM_NONCE_SIZE, AES_CCM_TAG_SIZE,
     },
 };
-use spki::{AlgorithmIdentifierOwned, SubjectPublicKeyInfoOwned};
+use spki::{
+    AlgorithmIdentifierOwned, DynSignatureAlgorithmIdentifier, SignatureBitStringEncoding,
+    SubjectPublicKeyInfoOwned,
+};
 use std::{collections::BTreeMap, io::Cursor};
 use std::{str::FromStr, time::Duration};
 use subtle::ConstantTimeEq;
@@ -160,6 +160,82 @@ struct AttestationProfile {
     metadata_extensions: Vec<Extension>,
 }
 
+#[derive(Clone)]
+struct P256CertificateVerifyingKey(Vec<u8>);
+
+impl spki::EncodePublicKey for P256CertificateVerifyingKey {
+    fn to_public_key_der(&self) -> spki::Result<spki::Document> {
+        let encoded = ec_subject_public_key_info(EcCurve::P256, &self.0)
+            .map_err(|_| spki::Error::KeyMalformed)?
+            .to_der()?;
+        spki::Document::try_from(encoded).map_err(Into::into)
+    }
+}
+
+struct P256CertificateSigner {
+    key: SoftwareSigningKey,
+    verifying_key: P256CertificateVerifyingKey,
+}
+
+impl P256CertificateSigner {
+    fn from_serialized(serialized: &[u8]) -> Result<Self> {
+        let key = SoftwareSigningKey::from_serialized(
+            SoftwareSigningAlgorithm::EcdsaP256Sha256,
+            serialized,
+        )
+        .map_err(|_| DeviceError::InvalidData)?;
+        let SoftwarePublicKey::Ec {
+            curve: EcCurve::P256,
+            uncompressed,
+        } = key.public_key()
+        else {
+            return Err(DeviceError::InvalidData);
+        };
+        Ok(Self {
+            key,
+            verifying_key: P256CertificateVerifyingKey(uncompressed),
+        })
+    }
+}
+
+impl Keypair for P256CertificateSigner {
+    type VerifyingKey = P256CertificateVerifyingKey;
+
+    fn verifying_key(&self) -> Self::VerifyingKey {
+        self.verifying_key.clone()
+    }
+}
+
+impl DynSignatureAlgorithmIdentifier for P256CertificateSigner {
+    fn signature_algorithm_identifier(&self) -> spki::Result<AlgorithmIdentifierOwned> {
+        Ok(AlgorithmIdentifierOwned {
+            oid: ObjectIdentifier::new_unwrap("1.2.840.10045.4.3.2"),
+            parameters: None,
+        })
+    }
+}
+
+struct P256CertificateSignature(Vec<u8>);
+
+impl SignatureBitStringEncoding for P256CertificateSignature {
+    fn to_bitstring(&self) -> der::Result<BitString> {
+        BitString::from_bytes(&self.0)
+    }
+}
+
+impl Signer<P256CertificateSignature> for P256CertificateSigner {
+    fn try_sign(
+        &self,
+        message: &[u8],
+    ) -> core::result::Result<P256CertificateSignature, signature::Error> {
+        self.key
+            .sign_message(SoftwareSigningAlgorithm::EcdsaP256Sha256, message)
+            .and_then(|signature| signature.to_ecdsa_der(EcCurve::P256))
+            .map(P256CertificateSignature)
+            .map_err(|_| signature::Error::new())
+    }
+}
+
 impl BuilderProfile for AttestationProfile {
     fn get_issuer(&self, _subject: &Name) -> Name {
         self.issuer.clone()
@@ -229,9 +305,11 @@ pub struct Device {
 
 impl Device {
     pub fn factory_default(config: DeviceConfig) -> Self {
-        let static_key = random_secret_key().expect("operating-system random source unavailable");
-        Self::factory_default_with_device_static_private(config, static_key.to_bytes().into())
-            .expect("generated P-256 device key is invalid")
+        Self::factory_default_with_device_static_private(
+            config,
+            random_device_static_private().expect("operating-system random source unavailable"),
+        )
+        .expect("generated P-256 device key is invalid")
     }
 
     /// Construct a device with an explicitly supplied P-256 static key.
@@ -243,7 +321,11 @@ impl Device {
         config: DeviceConfig,
         device_static_private: [u8; 32],
     ) -> Result<Self> {
-        SecretKey::from_slice(&device_static_private).map_err(|_| DeviceError::InvalidData)?;
+        SoftwareSigningKey::from_serialized(
+            SoftwareSigningAlgorithm::EcdsaP256Sha256,
+            &device_static_private,
+        )
+        .map_err(|_| DeviceError::InvalidData)?;
         let mut device = Self {
             config,
             objects: BTreeMap::new(),
@@ -537,6 +619,11 @@ impl Device {
         let handled_externally = handled_response.is_some();
         let response =
             handled_response.unwrap_or_else(|| self.execute_inner(entry.authorization, &inner));
+        let response = if secure_response_fits(&response) {
+            response
+        } else {
+            Frame::error(DeviceError::WrongLength)
+        };
         observer(entry.authorization, &inner, &response);
         let closes_session = matches!(
             CommandCode::from_byte(inner.command),
@@ -555,10 +642,18 @@ impl Device {
 
     fn get_device_public_key(&self, data: &[u8]) -> Result<Vec<u8>> {
         require_empty(data)?;
-        let private = SecretKey::from_slice(self.device_static_private.as_ref())
-            .map_err(|_| DeviceError::StorageFailed)?;
-        let point = private.public_key().to_sec1_point(false);
-        let mut public = point.as_bytes().to_vec();
+        let private = SoftwareSigningKey::from_serialized(
+            SoftwareSigningAlgorithm::EcdsaP256Sha256,
+            self.device_static_private.as_ref(),
+        )
+        .map_err(|_| DeviceError::StorageFailed)?;
+        let SoftwarePublicKey::Ec {
+            uncompressed: mut public,
+            ..
+        } = private.public_key()
+        else {
+            return Err(DeviceError::StorageFailed);
+        };
         public[0] = AUTHENTICATION_ALGORITHM_EC_P256;
         Ok(public)
     }
@@ -580,7 +675,15 @@ impl Device {
             return Frame::error(DeviceError::LogFull);
         }
 
-        let result = self.execute_inner_result(authorization, request);
+        let result = self
+            .execute_inner_result(authorization, request)
+            .and_then(|data| {
+                if secure_response_data_fits(data.len()) {
+                    Ok(data)
+                } else {
+                    Err(DeviceError::WrongLength)
+                }
+            });
         let result_code = result
             .as_ref()
             .err()
@@ -670,8 +773,11 @@ impl Device {
         {
             return Err(DeviceError::InvalidData);
         }
-        SecretKey::from_slice(&state.device_static_private)
-            .map_err(|_| DeviceError::InvalidData)?;
+        SoftwareSigningKey::from_serialized(
+            SoftwareSigningAlgorithm::EcdsaP256Sha256,
+            &state.device_static_private,
+        )
+        .map_err(|_| DeviceError::InvalidData)?;
         let sequence_history = state.sequence_history;
         if !sequence_history.validate() {
             return Err(DeviceError::InvalidData);
@@ -730,7 +836,7 @@ impl Device {
             CommandCode::GetStorageInfo => {
                 require_empty(&request.data)?;
                 let used = self.objects.len() as u16;
-                let free = (MAX_OBJECTS - self.objects.len()) as u16;
+                let free = MAX_OBJECTS.saturating_sub(self.objects.len()) as u16;
                 Ok([MAX_OBJECTS as u16, free, 1024, 1024 - used, 126]
                     .into_iter()
                     .flat_map(u16::to_be_bytes)
@@ -845,9 +951,11 @@ impl Device {
                 if request.data != [0xde] {
                     return Err(DeviceError::InvalidData);
                 }
+                let renewed_device_static_private = random_device_static_private()?;
                 self.objects.clear();
                 self.sequence_history.clear();
                 self.sessions.clear();
+                *self.device_static_private = renewed_device_static_private;
                 self.options = DeviceOptions::default();
                 self.audit = AuditState {
                     next_number: 1,
@@ -1541,11 +1649,20 @@ impl Device {
         let target_id = u16::from_be_bytes(data[..2].try_into().unwrap());
         let attesting_id = u16::from_be_bytes(data[2..].try_into().unwrap());
         let (target_spki, target_info) = if target_id == 0 {
-            let private = SecretKey::from_slice(self.device_static_private.as_ref())
-                .map_err(|_| DeviceError::StorageFailed)?;
-            let public = private.public_key().to_sec1_point(false);
+            let private = SoftwareSigningKey::from_serialized(
+                SoftwareSigningAlgorithm::EcdsaP256Sha256,
+                self.device_static_private.as_ref(),
+            )
+            .map_err(|_| DeviceError::StorageFailed)?;
+            let SoftwarePublicKey::Ec {
+                uncompressed: public,
+                ..
+            } = private.public_key()
+            else {
+                return Err(DeviceError::StorageFailed);
+            };
             (
-                ec_subject_public_key_info(EcCurve::P256, public.as_bytes())?,
+                ec_subject_public_key_info(EcCurve::P256, &public)?,
                 ObjectInfo {
                     capabilities: CapabilitySet::NONE,
                     id: 0,
@@ -1585,8 +1702,7 @@ impl Device {
                 format!("CN=Virtual YubiHSM Attestation Key {attesting_id}"),
             )
         };
-        let signer =
-            P256SigningKey::from_slice(&attesting_private).map_err(|_| DeviceError::InvalidData)?;
+        let signer = P256CertificateSigner::from_serialized(&attesting_private)?;
         let mut subject = Name::from_str(&format!("CN=Virtual YubiHSM Key {target_id}"))
             .map_err(|_| DeviceError::InvalidData)?;
         let mut issuer = Name::from_str(&issuer).map_err(|_| DeviceError::InvalidData)?;
@@ -1637,7 +1753,7 @@ impl Device {
         )
         .map_err(|_| DeviceError::InvalidData)?;
         let certificate = builder
-            .build::<_, DerSignature>(&signer)
+            .build::<_, P256CertificateSignature>(&signer)
             .map_err(|_| DeviceError::StorageFailed)?;
         certificate.to_der().map_err(|_| DeviceError::StorageFailed)
     }
@@ -2699,6 +2815,15 @@ fn authentication_key_length(algorithm: u8) -> Result<usize> {
     }
 }
 
+fn random_device_static_private() -> Result<[u8; 32]> {
+    random_secret_key()?
+        .serialized()
+        .map_err(|_| DeviceError::StorageFailed)?
+        .as_slice()
+        .try_into()
+        .map_err(|_| DeviceError::StorageFailed)
+}
+
 fn parse_authentication_key_material(
     algorithm: u8,
     key: &[u8],
@@ -2709,7 +2834,12 @@ fn parse_authentication_key_material(
         }
         AUTHENTICATION_ALGORITHM_EC_P256 if key.len() == 64 => {
             let encoded = [vec![0x04], key.to_vec()].concat();
-            p256::PublicKey::from_sec1_bytes(&encoded).map_err(|_| DeviceError::InvalidData)?;
+            SoftwarePublicKey::Ec {
+                curve: EcCurve::P256,
+                uncompressed: encoded,
+            }
+            .validate()
+            .map_err(|_| DeviceError::InvalidData)?;
             Ok(AuthenticationKeyMaterial::Asymmetric(key.to_vec()))
         }
         AUTHENTICATION_ALGORITHM_AES128_YUBICO | AUTHENTICATION_ALGORITHM_EC_P256 => {
@@ -3440,7 +3570,7 @@ mod tests {
     use crate::secure_channel_crypto::{
         cbc_decrypt, cbc_encrypt, cmac, encrypt_block, pad, scp03_kdf, unpad, BLOCK_SIZE,
     };
-    use p256::ecdh::diffie_hellman;
+    use p256::{ecdh::diffie_hellman, elliptic_curve::sec1::ToSec1Point};
     use software_key_core::software_signing::EcCurve;
 
     fn put_opaque_request(id: u16, domains: u16, capabilities: CapabilitySet) -> Frame {
@@ -3573,6 +3703,56 @@ mod tests {
                 0xe4, 0x20, 0x59, 0x2f, 0xd4, 0x83, 0xf7, 0x59, 0xe2, 0x99, 0x09, 0xa0, 0x4c, 0x45,
                 0x05, 0xd2, 0xce, 0x0a,
             ]
+        );
+    }
+
+    #[test]
+    fn storage_info_reports_no_free_object_slots_above_nominal_capacity() {
+        let mut device = Device::factory_default(DeviceConfig::default());
+        for id in 1..=MAX_OBJECTS as u16 {
+            device
+                .provision_object(ObjectRecord {
+                    info: ObjectInfo {
+                        capabilities: CapabilitySet::NONE,
+                        id,
+                        length: 1,
+                        domains: 1,
+                        object_type: ObjectType::Opaque,
+                        algorithm: OPAQUE_DATA_ALGORITHM,
+                        sequence: 0,
+                        origin: 2,
+                        label: Vec::new(),
+                        delegated_capabilities: CapabilitySet::NONE,
+                    },
+                    material: ObjectMaterial::Opaque(vec![0]),
+                })
+                .unwrap();
+        }
+        assert_eq!(device.objects.len(), MAX_OBJECTS + 1);
+
+        let response = device.execute_inner(
+            device.session_authorization(1).unwrap(),
+            &Frame::new(CommandCode::GetStorageInfo as u8, []).unwrap(),
+        );
+        assert_eq!(&response.data[..4], &[0x01, 0x00, 0x00, 0x00]);
+    }
+
+    #[test]
+    fn oversized_command_result_becomes_wrong_length_before_session_encryption() {
+        let mut device = Device::factory_default(DeviceConfig::default());
+        let authorization = device.session_authorization(1).unwrap();
+        let maximum =
+            Frame::new(CommandCode::GetPseudoRandom as u8, 3_116_u16.to_be_bytes()).unwrap();
+        assert_eq!(
+            device.execute_inner(authorization, &maximum).data.len(),
+            3_116
+        );
+
+        let oversized =
+            Frame::new(CommandCode::GetPseudoRandom as u8, 3_117_u16.to_be_bytes()).unwrap();
+        assert_eq!(
+            device.execute_inner(authorization, &oversized),
+            Frame::error(DeviceError::WrongLength)
         );
     }
 
@@ -4915,6 +5095,7 @@ mod tests {
 
         let reset = Frame::new(CommandCode::ResetDevice as u8, vec![0xde]).unwrap();
         assert!(restored.execute_inner(admin, &reset).data.is_empty());
+        assert_ne!(restored.device_static_private.as_ref(), &[7; 32]);
         assert!(restored.take_persistent_change().unwrap());
         assert_eq!(restored.state_epoch(), 2);
 

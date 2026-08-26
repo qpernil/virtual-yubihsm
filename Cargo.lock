@@ -1398,6 +1398,7 @@ dependencies = [
  "p256",
  "rsa",
  "serde",
+ "signature 3.0.0",
  "software-key-core",
  "spki 0.8.0",
  "subtle",

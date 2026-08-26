@@ -1,11 +1,15 @@
 use crate::{
+    frame::{HEADER_LENGTH, MAX_DATA_LENGTH},
     secure_channel_crypto::{
         cbc_decrypt, cbc_encrypt, cmac, encrypt_block, pad, unpad, BLOCK_SIZE,
     },
     DeviceError, Frame, Result, SessionAuthorization,
 };
-use p256::{ecdh::diffie_hellman, elliptic_curve::sec1::ToSec1Point, PublicKey, SecretKey};
-use software_key_core::secure_channel::{scp03_cryptogram, scp03_key, x963_kdf_sha256};
+use software_key_core::{
+    secure_channel::{scp03_cryptogram, scp03_key, x963_kdf_sha256},
+    software_key_agreement::derive_with_signing_key,
+    software_signing::{SoftwarePublicKey, SoftwareSigningAlgorithm, SoftwareSigningKey},
+};
 use subtle::ConstantTimeEq;
 use zeroize::Zeroizing;
 
@@ -15,6 +19,24 @@ pub(crate) const P256_PUBLIC_KEY_LENGTH: usize = 65;
 pub(crate) const AUTHENTICATION_ALGORITHM_AES128_YUBICO: u8 = 38;
 pub(crate) const AUTHENTICATION_ALGORITHM_EC_P256: u8 = 49;
 const SCP11_SHARED_INFO: [u8; 3] = [0x3c, 0x88, 0x10];
+
+pub(crate) fn secure_response_data_fits(data_length: usize) -> bool {
+    let Some(padded_length) = HEADER_LENGTH
+        .checked_add(data_length)
+        .and_then(|length| length.checked_add(1))
+        .and_then(|length| length.div_ceil(BLOCK_SIZE).checked_mul(BLOCK_SIZE))
+    else {
+        return false;
+    };
+    1_usize
+        .checked_add(padded_length)
+        .and_then(|length| length.checked_add(MAC_LENGTH))
+        .is_some_and(|length| length <= MAX_DATA_LENGTH)
+}
+
+pub(crate) fn secure_response_fits(response: &Frame) -> bool {
+    secure_response_data_fits(response.data.len())
+}
 
 #[derive(Debug)]
 pub(crate) struct SessionEntry {
@@ -65,34 +87,34 @@ impl SecureSession {
         host_static_public: &[u8],
         host_ephemeral_public: &[u8],
     ) -> Result<(Self, [u8; P256_PUBLIC_KEY_LENGTH], [u8; BLOCK_SIZE])> {
-        let device_static =
-            SecretKey::from_slice(device_static_private).map_err(|_| DeviceError::InvalidData)?;
+        let device_static = SoftwareSigningKey::from_serialized(
+            SoftwareSigningAlgorithm::EcdsaP256Sha256,
+            device_static_private,
+        )
+        .map_err(|_| DeviceError::InvalidData)?;
         let normalized_host_static = match host_static_public.len() {
             64 => [vec![0x04], host_static_public.to_vec()].concat(),
             65 => host_static_public.to_vec(),
             _ => return Err(DeviceError::WrongLength),
         };
-        let host_static = PublicKey::from_sec1_bytes(&normalized_host_static)
-            .map_err(|_| DeviceError::InvalidData)?;
-        let host_ephemeral = PublicKey::from_sec1_bytes(host_ephemeral_public)
-            .map_err(|_| DeviceError::InvalidData)?;
         let device_ephemeral = random_secret_key()?;
-        let encoded_ephemeral = device_ephemeral.public_key().to_sec1_point(false);
+        let SoftwarePublicKey::Ec {
+            uncompressed: encoded_ephemeral,
+            ..
+        } = device_ephemeral.public_key()
+        else {
+            return Err(DeviceError::SessionFailed);
+        };
         let device_ephemeral_public: [u8; P256_PUBLIC_KEY_LENGTH] = encoded_ephemeral
-            .as_bytes()
+            .as_slice()
             .try_into()
             .map_err(|_| DeviceError::SessionFailed)?;
 
-        let ephemeral = diffie_hellman(
-            device_ephemeral.to_nonzero_scalar(),
-            host_ephemeral.as_affine(),
-        );
-        let static_secret =
-            diffie_hellman(device_static.to_nonzero_scalar(), host_static.as_affine());
-        let session_keys = x963_session_keys(
-            ephemeral.raw_secret_bytes().as_slice(),
-            static_secret.raw_secret_bytes().as_slice(),
-        )?;
+        let ephemeral = derive_with_signing_key(&device_ephemeral, host_ephemeral_public)
+            .map_err(|_| DeviceError::InvalidData)?;
+        let static_secret = derive_with_signing_key(&device_static, &normalized_host_static)
+            .map_err(|_| DeviceError::InvalidData)?;
+        let session_keys = x963_session_keys(&ephemeral, &static_secret)?;
         let mut receipt_input = Vec::with_capacity(P256_PUBLIC_KEY_LENGTH * 2);
         receipt_input.extend_from_slice(&device_ephemeral_public);
         receipt_input.extend_from_slice(host_ephemeral_public);
@@ -204,15 +226,9 @@ impl SecureSession {
     }
 }
 
-pub(crate) fn random_secret_key() -> Result<SecretKey> {
-    for _ in 0..128 {
-        let mut bytes = Zeroizing::new([0; 32]);
-        getrandom::fill(bytes.as_mut()).map_err(|_| DeviceError::StorageFailed)?;
-        if let Ok(key) = SecretKey::from_slice(bytes.as_ref()) {
-            return Ok(key);
-        }
-    }
-    Err(DeviceError::StorageFailed)
+pub(crate) fn random_secret_key() -> Result<SoftwareSigningKey> {
+    SoftwareSigningKey::generate(SoftwareSigningAlgorithm::EcdsaP256Sha256)
+        .map_err(|_| DeviceError::StorageFailed)
 }
 
 fn derive_key(key: &[u8], constant: u8, context: &[u8]) -> Result<[u8; BLOCK_SIZE]> {
@@ -243,5 +259,17 @@ fn increment_counter(counter: &mut [u8; BLOCK_SIZE]) {
         if !overflow {
             break;
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn secure_response_limit_accounts_for_frame_padding_session_id_and_mac() {
+        assert!(secure_response_data_fits(3_116));
+        assert!(!secure_response_data_fits(3_117));
+        assert!(!secure_response_data_fits(usize::MAX));
     }
 }
