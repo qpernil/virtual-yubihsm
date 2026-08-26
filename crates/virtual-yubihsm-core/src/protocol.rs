@@ -66,6 +66,8 @@ pub enum CommandCode {
     PutRsaWrappedKey = 0x75,
     ExportRsaWrapped = 0x76,
     ImportRsaWrapped = 0x77,
+    /// Virtual-device extension for atomic prefixed ECDH key derivation.
+    DeriveEcdhKdf = 0x78,
 }
 
 impl CommandCode {
@@ -135,6 +137,7 @@ impl CommandCode {
             0x75 => PutRsaWrappedKey,
             0x76 => ExportRsaWrapped,
             0x77 => ImportRsaWrapped,
+            0x78 => DeriveEcdhKdf,
             _ => return None,
         })
     }
@@ -162,6 +165,7 @@ impl CommandCode {
             SignPss => Some(Capability::SignPss),
             SignEcdsa => Some(Capability::SignEcdsa),
             DeriveEcdh => Some(Capability::DeriveEcdh),
+            DeriveEcdhKdf => Some(Capability::DeriveEcdhKdf),
             DecryptOaep => Some(Capability::DecryptOaep),
             GenerateHmacKey => Some(Capability::GenerateHmacKey),
             GenerateWrapKey => Some(Capability::GenerateWrapKey),

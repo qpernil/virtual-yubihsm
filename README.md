@@ -37,6 +37,9 @@ dependency of other consumers.
 The proposed direct, in-process integration of this core as a built-in device
 inside `yubihsmrs-connector` is specified in the
 [built-in connector design](docs/yubihsmrs-connector-integration-design.md).
+The virtual `derive-ecdh-kdf` command and its proposed
+`CKM_PKCS11RS_PREFIXED_ECDH_DERIVE` mapping are specified in the
+[prefixed ECDH derivation design](docs/prefixed-ecdh-derive.md).
 
 An authenticated session receives exactly the Authentication Key object's:
 
@@ -71,6 +74,9 @@ deletion.
   Ed25519 import/generation, public projection, ECDSA, EdDSA and raw ECDH;
 - X25519 key import/generation, public projection and contributory key
   agreement as the first virtual extension algorithm;
+- atomic prefixed ECDH plus mandatory X9.63 derivation under a separate
+  `derive-ecdh-kdf` capability, allowing a static authentication key to derive
+  session-specific material without exposing its reusable raw ECDH secret;
 - HMAC SHA-1/SHA-256/SHA-384/SHA-512 import/generation/sign/verify;
 - AES-128/192/256 symmetric keys and ECB/CBC commands;
 - AES-CCM wrap keys, authenticated arbitrary-data wrapping, policy-preserving

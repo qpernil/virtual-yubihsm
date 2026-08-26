@@ -60,6 +60,11 @@ pub enum Capability {
     EncryptCbc = 0x35,
     PutPublicWrapKey = 0x36,
     DeletePublicWrapKey = 0x37,
+    /// Atomically augment an ECDH secret and pass it through a KDF.
+    ///
+    /// This is a virtual-device extension and is intentionally distinct from
+    /// `DeriveEcdh`, which returns the raw ECDH result.
+    DeriveEcdhKdf = 0x38,
 }
 
 /// The protocol's big-endian eight-byte capability bitmap.
