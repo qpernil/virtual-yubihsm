@@ -65,6 +65,9 @@ deletion.
 - symmetric SCP03-compatible handshake and encrypted message exchange;
 - asymmetric P-256 ECDH authentication with receipt and the common encrypted
   message exchange;
+- public-key retrieval for asymmetric P-256 Authentication Keys, a deliberate
+  virtual extension over firmware that rejects `GET PUBLIC KEY` for that object
+  type;
 - capability, delegated-capability and domain authorization;
 - Authentication Key create/change and Opaque object lifecycle;
 - list/get-info/delete object behavior with cross-domain hiding;
