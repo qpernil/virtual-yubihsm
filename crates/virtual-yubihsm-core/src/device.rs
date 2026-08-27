@@ -1656,7 +1656,10 @@ impl Device {
         };
         if !matches!(
             object_type,
-            ObjectType::AsymmetricKey | ObjectType::WrapKey | ObjectType::PublicWrapKey
+            ObjectType::AsymmetricKey
+                | ObjectType::AuthenticationKey
+                | ObjectType::WrapKey
+                | ObjectType::PublicWrapKey
         ) {
             return Err(DeviceError::InvalidData);
         }
@@ -1666,7 +1669,14 @@ impl Device {
             .ok_or(DeviceError::ObjectNotFound)?;
         authorization.require_visible(&object.info)?;
         let mut output = vec![object.info.algorithm];
-        if object.info.object_type == ObjectType::PublicWrapKey {
+        if object.info.object_type == ObjectType::AuthenticationKey {
+            match &object.material {
+                ObjectMaterial::Authentication(AuthenticationKeyMaterial::Asymmetric(public)) => {
+                    output.extend_from_slice(public)
+                }
+                _ => return Err(DeviceError::InvalidData),
+            }
+        } else if object.info.object_type == ObjectType::PublicWrapKey {
             match &object.material {
                 ObjectMaterial::Public(public) => output.extend_from_slice(public),
                 _ => return Err(DeviceError::InvalidData),
@@ -4595,6 +4605,37 @@ mod tests {
             device.execute_inner(wrong_domain, &sign),
             Frame::error(DeviceError::ObjectNotFound)
         );
+    }
+
+    #[test]
+    fn asymmetric_authentication_key_exposes_its_public_key() {
+        let mut device = Device::factory_default(DeviceConfig::default());
+        let admin = device.session_authorization(1).unwrap();
+        let host_static = p256::SecretKey::from_slice(&[1; 32]).unwrap();
+        let host_public = host_static.public_key().to_sec1_point(false);
+        let raw_public = &host_public.as_bytes()[1..];
+        let put = put_asymmetric_authentication_key_request(
+            44,
+            1,
+            CapabilitySet::NONE,
+            CapabilitySet::NONE,
+            raw_public,
+        );
+        assert_eq!(device.execute_inner(admin, &put).data, 44_u16.to_be_bytes());
+
+        let get_public = Frame::new(
+            CommandCode::GetPublicKey as u8,
+            [
+                44_u16.to_be_bytes().as_slice(),
+                &[ObjectType::AuthenticationKey as u8],
+            ]
+            .concat(),
+        )
+        .unwrap();
+        let response = device.execute_inner(admin, &get_public);
+        assert_eq!(response.command, CommandCode::GetPublicKey as u8 | 0x80);
+        assert_eq!(response.data[0], AUTHENTICATION_ALGORITHM_EC_P256);
+        assert_eq!(&response.data[1..], raw_public);
     }
 
     #[test]
