@@ -111,8 +111,10 @@ their general-purpose cryptographic command families are implemented. SSH
 certificate signing is intentionally out of scope; template storage remains
 available for protocol compatibility, while `Sign SSH Certificate` returns the
 documented `INVALID COMMAND` response. The wrapped-object plaintext
-representation is versioned for virtual-device round-trips; interoperability
-fixtures from physical YubiHSM exports remain a separate validation step.
+representation is the strict canonical CBOR format described in the
+[wrapped-object format](docs/wrapped-object-format.md). It is versioned only for
+virtual-device round-trips and is intentionally separate from physical
+YubiHSM internal object serialization.
 
 ## Persistence
 

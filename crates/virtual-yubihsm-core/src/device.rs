@@ -8,10 +8,11 @@ use crate::{
     Frame, ObjectInfo, ObjectKey, ObjectMaterial, ObjectRecord, ObjectType, Result,
     SessionAuthorization,
 };
+use ciborium::Value as CborValue;
 use const_oid::ObjectIdentifier;
 use der::{
     asn1::{Any, BitString, OctetString},
-    Decode, Encode,
+    Decode, Encode, Sequence,
 };
 use rsa::{pkcs8::EncodePublicKey as EncodeRsaPublicKey, BigUint, RsaPublicKey};
 use serde::{Deserialize, Serialize};
@@ -54,6 +55,15 @@ const DEFAULT_AUTHENTICATION_ALGORITHM: u8 = AUTHENTICATION_ALGORITHM_AES128_YUB
 const OPAQUE_DATA_ALGORITHM: u8 = 30;
 const PERSISTENT_STATE_SCHEMA: &str = "virtual-yubihsm-state";
 const PERSISTENT_STATE_VERSION: u16 = 3;
+const WRAPPED_OBJECT_SCHEMA: &str = "virtual-yubihsm-object";
+const WRAPPED_OBJECT_VERSION: u8 = 1;
+const WRAPPED_MATERIAL_SECRET: u8 = 0;
+const WRAPPED_MATERIAL_PKCS8: u8 = 1;
+const WRAPPED_MATERIAL_OPAQUE: u8 = 2;
+const WRAPPED_MATERIAL_PUBLIC: u8 = 3;
+const WRAPPED_MATERIAL_AUTHENTICATION_SYMMETRIC: u8 = 4;
+const WRAPPED_MATERIAL_AUTHENTICATION_ASYMMETRIC: u8 = 5;
+const WRAPPED_MATERIAL_OTP_AEAD: u8 = 6;
 const OPTION_FORCE_AUDIT: u8 = 0x01;
 const OPTION_COMMAND_AUDIT: u8 = 0x03;
 const OPTION_ALGORITHM_TOGGLE: u8 = 0x04;
@@ -2378,10 +2388,7 @@ impl Device {
             .ok_or(DeviceError::ObjectNotFound)?;
         let plaintext = if key_material_only {
             match target_key.object_type {
-                ObjectType::AsymmetricKey => signing_key(target)?
-                    .to_pkcs8_der()
-                    .map_err(|_| DeviceError::InvalidData)?
-                    .to_vec(),
+                ObjectType::AsymmetricKey => asymmetric_pkcs8(target)?,
                 ObjectType::SymmetricKey => object_secret(target)?.to_vec(),
                 _ => return Err(DeviceError::InvalidData),
             }
@@ -3105,30 +3112,7 @@ fn import_rsa_wrapped_key_material(
 ) -> Result<(ObjectMaterial, usize)> {
     match object_type {
         ObjectType::AsymmetricKey => {
-            if algorithm == Algorithm::X25519 {
-                return Err(DeviceError::InvalidData);
-            }
-            let (software_algorithm, _) = if algorithm.is_rsa_key() {
-                (SoftwareSigningAlgorithm::RsaPssSha256, 0)
-            } else {
-                asymmetric_key_algorithm(algorithm as u8)?
-            };
-            let key = SoftwareSigningKey::from_pkcs8_der(software_algorithm, plaintext)
-                .map_err(|_| DeviceError::InvalidData)?;
-            let material = if algorithm.is_rsa_key() {
-                let [p, q, _, _, _] = key
-                    .rsa_crt_components()
-                    .map_err(|_| DeviceError::InvalidData)?;
-                let logical_length = algorithm.asymmetric_key_length().unwrap();
-                let component_length = logical_length / 2;
-                let mut encoded = left_pad_component(&p, component_length)?;
-                encoded.extend_from_slice(&left_pad_component(&q, component_length)?);
-                encoded
-            } else {
-                key.serialized()
-                    .map_err(|_| DeviceError::InvalidData)?
-                    .to_vec()
-            };
+            let material = asymmetric_material_from_pkcs8(algorithm, plaintext)?;
             let logical_length = algorithm
                 .asymmetric_key_length()
                 .ok_or(DeviceError::InvalidData)?;
@@ -3349,77 +3333,372 @@ fn yubico_crc16(data: &[u8]) -> u16 {
     crc
 }
 
-fn encode_wrapped_object(object: &ObjectRecord) -> Result<Vec<u8>> {
-    let (material_kind, payload) = match &object.material {
-        ObjectMaterial::Secret(value) => (0, value.clone()),
-        ObjectMaterial::Opaque(value) => (1, value.clone()),
-        ObjectMaterial::Public(value) => (2, value.clone()),
-        ObjectMaterial::Authentication(AuthenticationKeyMaterial::Symmetric(value)) => {
-            (3, value.clone())
-        }
-        ObjectMaterial::Authentication(AuthenticationKeyMaterial::Asymmetric(value)) => {
-            (4, value.clone())
-        }
-        ObjectMaterial::OtpAeadKey { nonce_id, key } => {
-            (5, [nonce_id.as_slice(), key.as_slice()].concat())
-        }
+#[derive(Clone, Debug, Eq, PartialEq, Sequence)]
+struct Rfc8410PrivateKeyInfo {
+    version: u8,
+    private_key_algorithm: AlgorithmIdentifierOwned,
+    private_key: OctetString,
+}
+
+fn x25519_pkcs8(secret: &[u8]) -> Result<Vec<u8>> {
+    let secret: [u8; 32] = secret.try_into().map_err(|_| DeviceError::InvalidData)?;
+    SoftwareX25519Key::from_serialized(&secret).map_err(|_| DeviceError::InvalidData)?;
+    let inner = OctetString::new(secret.to_vec())
+        .map_err(|_| DeviceError::InvalidData)?
+        .to_der()
+        .map_err(|_| DeviceError::InvalidData)?;
+    Rfc8410PrivateKeyInfo {
+        version: 0,
+        private_key_algorithm: AlgorithmIdentifierOwned {
+            oid: ObjectIdentifier::new_unwrap("1.3.101.110"),
+            parameters: None,
+        },
+        private_key: OctetString::new(inner).map_err(|_| DeviceError::InvalidData)?,
+    }
+    .to_der()
+    .map_err(|_| DeviceError::InvalidData)
+}
+
+fn x25519_from_pkcs8(encoded: &[u8]) -> Result<Vec<u8>> {
+    let info = Rfc8410PrivateKeyInfo::from_der(encoded).map_err(|_| DeviceError::InvalidData)?;
+    if info.version != 0
+        || info.private_key_algorithm.oid != ObjectIdentifier::new_unwrap("1.3.101.110")
+        || info.private_key_algorithm.parameters.is_some()
+    {
+        return Err(DeviceError::InvalidData);
+    }
+    let secret = OctetString::from_der(info.private_key.as_bytes())
+        .map_err(|_| DeviceError::InvalidData)?
+        .as_bytes()
+        .to_vec();
+    SoftwareX25519Key::from_serialized(&secret).map_err(|_| DeviceError::InvalidData)?;
+    Ok(secret)
+}
+
+fn asymmetric_pkcs8(object: &ObjectRecord) -> Result<Vec<u8>> {
+    if object.info.algorithm == Algorithm::X25519 as u8 {
+        return x25519_pkcs8(object_secret(object)?);
+    }
+    signing_key(object)?
+        .to_pkcs8_der()
+        .map(|encoded| encoded.to_vec())
+        .map_err(|_| DeviceError::InvalidData)
+}
+
+fn asymmetric_material_from_pkcs8(algorithm: Algorithm, encoded: &[u8]) -> Result<Vec<u8>> {
+    if algorithm == Algorithm::X25519 {
+        return x25519_from_pkcs8(encoded);
+    }
+    let (software_algorithm, _) = if algorithm.is_rsa_key() {
+        (SoftwareSigningAlgorithm::RsaPssSha256, 0)
+    } else {
+        asymmetric_key_algorithm(algorithm as u8)?
     };
-    let payload_length: u16 = payload
-        .len()
-        .try_into()
-        .map_err(|_| DeviceError::WrongLength)?;
-    let mut output = Vec::with_capacity(71 + payload.len());
-    output.extend_from_slice(b"VYH1");
-    output.push(object.info.object_type as u8);
-    output.extend_from_slice(&object.info.id.to_be_bytes());
-    output.extend_from_slice(&object.info.domains.to_be_bytes());
-    output.extend_from_slice(&object.info.capabilities.to_bytes());
-    output.push(object.info.algorithm);
-    output.push(object.info.origin & 0x0f);
-    let mut label = [0; 40];
-    label[..object.info.label.len()].copy_from_slice(&object.info.label);
-    output.extend_from_slice(&label);
-    output.extend_from_slice(&object.info.delegated_capabilities.to_bytes());
-    output.push(material_kind);
-    output.extend_from_slice(&payload_length.to_be_bytes());
-    output.extend_from_slice(&payload);
+    let key = SoftwareSigningKey::from_pkcs8_der(software_algorithm, encoded)
+        .map_err(|_| DeviceError::InvalidData)?;
+    if algorithm.is_rsa_key() {
+        let SoftwarePublicKey::Rsa { modulus, exponent } = key.public_key() else {
+            return Err(DeviceError::InvalidData);
+        };
+        if exponent != [1, 0, 1] || algorithm.asymmetric_key_length() != Some(modulus.len()) {
+            return Err(DeviceError::InvalidData);
+        }
+        let [p, q, _, _, _] = key
+            .rsa_crt_components()
+            .map_err(|_| DeviceError::InvalidData)?;
+        let component_length = modulus.len() / 2;
+        let mut material = left_pad_component(&p, component_length)?;
+        material.extend_from_slice(&left_pad_component(&q, component_length)?);
+        return Ok(material);
+    }
+    let material = key
+        .serialized()
+        .map_err(|_| DeviceError::InvalidData)?
+        .to_vec();
+    if algorithm.asymmetric_key_length() != Some(material.len()) {
+        return Err(DeviceError::InvalidData);
+    }
+    Ok(material)
+}
+
+fn validate_wrapped_object(object: &ObjectRecord) -> Result<()> {
+    object.validate()?;
+    let algorithm = Algorithm::from_byte(object.info.algorithm).ok_or(DeviceError::InvalidData)?;
+    let valid = match (&object.info.object_type, &object.material) {
+        (ObjectType::Opaque, ObjectMaterial::Opaque(_)) => {
+            matches!(
+                algorithm,
+                Algorithm::OpaqueData | Algorithm::OpaqueX509Certificate
+            )
+        }
+        (ObjectType::Template, ObjectMaterial::Opaque(_)) => algorithm == Algorithm::TemplateSsh,
+        (ObjectType::AuthenticationKey, ObjectMaterial::Authentication(authentication)) => {
+            parse_authentication_key_material(
+                object.info.algorithm,
+                match authentication {
+                    AuthenticationKeyMaterial::Symmetric(value)
+                    | AuthenticationKeyMaterial::Asymmetric(value) => value,
+                },
+            )
+            .is_ok_and(|parsed| &parsed == authentication)
+        }
+        (ObjectType::AsymmetricKey, ObjectMaterial::Secret(value)) => {
+            algorithm.asymmetric_key_length() == Some(value.len())
+        }
+        (ObjectType::WrapKey, ObjectMaterial::Secret(value)) if algorithm.is_rsa_key() => {
+            algorithm.asymmetric_key_length() == Some(value.len())
+        }
+        (ObjectType::WrapKey, ObjectMaterial::Secret(value)) => {
+            matches!(
+                algorithm,
+                Algorithm::Aes128CcmWrap | Algorithm::Aes192CcmWrap | Algorithm::Aes256CcmWrap
+            ) && algorithm.aes_key_length() == Some(value.len())
+        }
+        (ObjectType::HmacKey, ObjectMaterial::Secret(value)) => {
+            algorithm.hmac_object_length().is_some() && (1..=128).contains(&value.len())
+        }
+        (ObjectType::OtpAeadKey, ObjectMaterial::OtpAeadKey { key, .. }) => {
+            matches!(
+                algorithm,
+                Algorithm::Aes128YubicoOtp
+                    | Algorithm::Aes192YubicoOtp
+                    | Algorithm::Aes256YubicoOtp
+            ) && algorithm.aes_key_length() == Some(key.len())
+        }
+        (ObjectType::SymmetricKey, ObjectMaterial::Secret(value)) => {
+            matches!(
+                algorithm,
+                Algorithm::Aes128 | Algorithm::Aes192 | Algorithm::Aes256
+            ) && algorithm.aes_key_length() == Some(value.len())
+        }
+        (ObjectType::PublicWrapKey, ObjectMaterial::Public(value)) => {
+            algorithm.is_rsa_key() && algorithm.asymmetric_key_length() == Some(value.len())
+        }
+        _ => false,
+    };
+    if valid {
+        Ok(())
+    } else {
+        Err(DeviceError::InvalidData)
+    }
+}
+
+fn wrapped_material(object: &ObjectRecord) -> Result<CborValue> {
+    let (kind, values) = match (&object.info.object_type, &object.material) {
+        (ObjectType::AsymmetricKey, ObjectMaterial::Secret(_))
+        | (ObjectType::WrapKey, ObjectMaterial::Secret(_))
+            if Algorithm::from_byte(object.info.algorithm).is_some_and(Algorithm::is_rsa_key)
+                || object.info.object_type == ObjectType::AsymmetricKey =>
+        {
+            (
+                WRAPPED_MATERIAL_PKCS8,
+                vec![CborValue::Bytes(asymmetric_pkcs8(object)?)],
+            )
+        }
+        (
+            ObjectType::WrapKey | ObjectType::HmacKey | ObjectType::SymmetricKey,
+            ObjectMaterial::Secret(value),
+        ) => (
+            WRAPPED_MATERIAL_SECRET,
+            vec![CborValue::Bytes(value.clone())],
+        ),
+        (ObjectType::Opaque | ObjectType::Template, ObjectMaterial::Opaque(value)) => (
+            WRAPPED_MATERIAL_OPAQUE,
+            vec![CborValue::Bytes(value.clone())],
+        ),
+        (ObjectType::PublicWrapKey, ObjectMaterial::Public(value)) => (
+            WRAPPED_MATERIAL_PUBLIC,
+            vec![CborValue::Bytes(value.clone())],
+        ),
+        (
+            ObjectType::AuthenticationKey,
+            ObjectMaterial::Authentication(AuthenticationKeyMaterial::Symmetric(value)),
+        ) => (
+            WRAPPED_MATERIAL_AUTHENTICATION_SYMMETRIC,
+            vec![CborValue::Bytes(value.clone())],
+        ),
+        (
+            ObjectType::AuthenticationKey,
+            ObjectMaterial::Authentication(AuthenticationKeyMaterial::Asymmetric(value)),
+        ) => (
+            WRAPPED_MATERIAL_AUTHENTICATION_ASYMMETRIC,
+            vec![CborValue::Bytes(value.clone())],
+        ),
+        (ObjectType::OtpAeadKey, ObjectMaterial::OtpAeadKey { nonce_id, key }) => (
+            WRAPPED_MATERIAL_OTP_AEAD,
+            vec![
+                CborValue::Bytes(nonce_id.to_vec()),
+                CborValue::Bytes(key.clone()),
+            ],
+        ),
+        _ => return Err(DeviceError::InvalidData),
+    };
+    Ok(CborValue::Array(
+        [vec![CborValue::Integer(kind.into())], values].concat(),
+    ))
+}
+
+fn encode_wrapped_object(object: &ObjectRecord) -> Result<Vec<u8>> {
+    validate_wrapped_object(object)?;
+    let value = CborValue::Array(vec![
+        CborValue::Text(WRAPPED_OBJECT_SCHEMA.to_owned()),
+        CborValue::Integer(WRAPPED_OBJECT_VERSION.into()),
+        CborValue::Integer((object.info.object_type as u8).into()),
+        CborValue::Integer(object.info.id.into()),
+        CborValue::Integer(object.info.domains.into()),
+        CborValue::Bytes(object.info.capabilities.to_bytes().to_vec()),
+        CborValue::Integer(object.info.algorithm.into()),
+        CborValue::Integer((object.info.origin & 0x0f).into()),
+        CborValue::Bytes(object.info.label.clone()),
+        CborValue::Bytes(object.info.delegated_capabilities.to_bytes().to_vec()),
+        wrapped_material(object)?,
+    ]);
+    let mut output = Vec::new();
+    ciborium::into_writer(&value, &mut output).map_err(|_| DeviceError::StorageFailed)?;
+    if output.len() > usize::from(u16::MAX) {
+        return Err(DeviceError::WrongLength);
+    }
     Ok(output)
 }
 
-fn decode_wrapped_object(mut data: &[u8]) -> Result<ObjectRecord> {
-    let version = take(&mut data, 4)?;
-    if version != b"VYH1" {
+fn wrapped_u8(value: CborValue) -> Result<u8> {
+    value
+        .into_integer()
+        .ok()
+        .and_then(|value| value.try_into().ok())
+        .ok_or(DeviceError::InvalidData)
+}
+
+fn wrapped_u16(value: CborValue) -> Result<u16> {
+    value
+        .into_integer()
+        .ok()
+        .and_then(|value| value.try_into().ok())
+        .ok_or(DeviceError::InvalidData)
+}
+
+fn wrapped_bytes(value: CborValue) -> Result<Vec<u8>> {
+    value.into_bytes().map_err(|_| DeviceError::InvalidData)
+}
+
+fn decode_wrapped_material(
+    object_type: ObjectType,
+    algorithm: Algorithm,
+    value: CborValue,
+) -> Result<ObjectMaterial> {
+    let CborValue::Array(values) = value else {
+        return Err(DeviceError::InvalidData);
+    };
+    let mut values = values.into_iter();
+    let kind = wrapped_u8(values.next().ok_or(DeviceError::InvalidData)?)?;
+    let material = match kind {
+        WRAPPED_MATERIAL_SECRET
+            if matches!(
+                object_type,
+                ObjectType::WrapKey | ObjectType::HmacKey | ObjectType::SymmetricKey
+            ) && !(object_type == ObjectType::WrapKey && algorithm.is_rsa_key()) =>
+        {
+            ObjectMaterial::Secret(wrapped_bytes(
+                values.next().ok_or(DeviceError::InvalidData)?,
+            )?)
+        }
+        WRAPPED_MATERIAL_PKCS8
+            if object_type == ObjectType::AsymmetricKey
+                || object_type == ObjectType::WrapKey && algorithm.is_rsa_key() =>
+        {
+            let encoded = wrapped_bytes(values.next().ok_or(DeviceError::InvalidData)?)?;
+            ObjectMaterial::Secret(asymmetric_material_from_pkcs8(algorithm, &encoded)?)
+        }
+        WRAPPED_MATERIAL_OPAQUE
+            if matches!(object_type, ObjectType::Opaque | ObjectType::Template) =>
+        {
+            ObjectMaterial::Opaque(wrapped_bytes(
+                values.next().ok_or(DeviceError::InvalidData)?,
+            )?)
+        }
+        WRAPPED_MATERIAL_PUBLIC if object_type == ObjectType::PublicWrapKey => {
+            ObjectMaterial::Public(wrapped_bytes(
+                values.next().ok_or(DeviceError::InvalidData)?,
+            )?)
+        }
+        WRAPPED_MATERIAL_AUTHENTICATION_SYMMETRIC
+            if object_type == ObjectType::AuthenticationKey =>
+        {
+            ObjectMaterial::Authentication(AuthenticationKeyMaterial::Symmetric(wrapped_bytes(
+                values.next().ok_or(DeviceError::InvalidData)?,
+            )?))
+        }
+        WRAPPED_MATERIAL_AUTHENTICATION_ASYMMETRIC
+            if object_type == ObjectType::AuthenticationKey =>
+        {
+            ObjectMaterial::Authentication(AuthenticationKeyMaterial::Asymmetric(wrapped_bytes(
+                values.next().ok_or(DeviceError::InvalidData)?,
+            )?))
+        }
+        WRAPPED_MATERIAL_OTP_AEAD if object_type == ObjectType::OtpAeadKey => {
+            let nonce_id: [u8; 4] = wrapped_bytes(values.next().ok_or(DeviceError::InvalidData)?)?
+                .try_into()
+                .map_err(|_| DeviceError::InvalidData)?;
+            let key = wrapped_bytes(values.next().ok_or(DeviceError::InvalidData)?)?;
+            ObjectMaterial::OtpAeadKey { nonce_id, key }
+        }
+        _ => return Err(DeviceError::InvalidData),
+    };
+    if values.next().is_some() {
+        return Err(DeviceError::InvalidData);
+    }
+    Ok(material)
+}
+
+fn decode_wrapped_object(data: &[u8]) -> Result<ObjectRecord> {
+    if data.len() > usize::from(u16::MAX) {
+        return Err(DeviceError::WrongLength);
+    }
+    let mut input = Cursor::new(data);
+    let value: CborValue =
+        ciborium::from_reader(&mut input).map_err(|_| DeviceError::InvalidData)?;
+    if input.position() != data.len() as u64 {
+        return Err(DeviceError::InvalidData);
+    }
+    let CborValue::Array(fields) = value else {
+        return Err(DeviceError::InvalidData);
+    };
+    if fields.len() != 11 {
+        return Err(DeviceError::InvalidData);
+    }
+    let mut fields = fields.into_iter();
+    if fields.next() != Some(CborValue::Text(WRAPPED_OBJECT_SCHEMA.to_owned()))
+        || wrapped_u8(fields.next().ok_or(DeviceError::InvalidData)?)? != WRAPPED_OBJECT_VERSION
+    {
         return Err(DeviceError::InvalidData);
     }
     let object_type =
-        ObjectType::from_byte(take(&mut data, 1)?[0]).ok_or(DeviceError::InvalidData)?;
-    let id = u16::from_be_bytes(take(&mut data, 2)?.try_into().unwrap());
-    let domains = u16::from_be_bytes(take(&mut data, 2)?.try_into().unwrap());
-    let capabilities = CapabilitySet::from_bytes(take(&mut data, 8)?.try_into().unwrap());
-    let algorithm = take(&mut data, 1)?[0];
-    let origin = take(&mut data, 1)?[0] & 0x0f;
-    let label = trim_label(take(&mut data, 40)?);
-    let delegated_capabilities = CapabilitySet::from_bytes(take(&mut data, 8)?.try_into().unwrap());
-    let material_kind = take(&mut data, 1)?[0];
-    let payload_length = u16::from_be_bytes(take(&mut data, 2)?.try_into().unwrap()) as usize;
-    let payload = take(&mut data, payload_length)?;
-    if !data.is_empty() {
-        return Err(DeviceError::WrongLength);
+        ObjectType::from_byte(wrapped_u8(fields.next().ok_or(DeviceError::InvalidData)?)?)
+            .ok_or(DeviceError::InvalidData)?;
+    let id = wrapped_u16(fields.next().ok_or(DeviceError::InvalidData)?)?;
+    let domains = wrapped_u16(fields.next().ok_or(DeviceError::InvalidData)?)?;
+    let capabilities = CapabilitySet::from_bytes(
+        wrapped_bytes(fields.next().ok_or(DeviceError::InvalidData)?)?
+            .try_into()
+            .map_err(|_| DeviceError::InvalidData)?,
+    );
+    let algorithm_byte = wrapped_u8(fields.next().ok_or(DeviceError::InvalidData)?)?;
+    let algorithm = Algorithm::from_byte(algorithm_byte).ok_or(DeviceError::InvalidData)?;
+    let origin = wrapped_u8(fields.next().ok_or(DeviceError::InvalidData)?)?;
+    if origin & 0xf0 != 0 {
+        return Err(DeviceError::InvalidData);
     }
-    let material = match material_kind {
-        0 => ObjectMaterial::Secret(payload.to_vec()),
-        1 => ObjectMaterial::Opaque(payload.to_vec()),
-        2 => ObjectMaterial::Public(payload.to_vec()),
-        3 => ObjectMaterial::Authentication(AuthenticationKeyMaterial::Symmetric(payload.to_vec())),
-        4 => {
-            ObjectMaterial::Authentication(AuthenticationKeyMaterial::Asymmetric(payload.to_vec()))
-        }
-        5 if payload.len() >= 4 => ObjectMaterial::OtpAeadKey {
-            nonce_id: payload[..4].try_into().unwrap(),
-            key: payload[4..].to_vec(),
-        },
-        _ => return Err(DeviceError::InvalidData),
-    };
+    let label = wrapped_bytes(fields.next().ok_or(DeviceError::InvalidData)?)?;
+    let delegated_capabilities = CapabilitySet::from_bytes(
+        wrapped_bytes(fields.next().ok_or(DeviceError::InvalidData)?)?
+            .try_into()
+            .map_err(|_| DeviceError::InvalidData)?,
+    );
+    let material = decode_wrapped_material(
+        object_type,
+        algorithm,
+        fields.next().ok_or(DeviceError::InvalidData)?,
+    )?;
     let mut record = ObjectRecord {
         info: ObjectInfo {
             capabilities,
@@ -3427,7 +3706,7 @@ fn decode_wrapped_object(mut data: &[u8]) -> Result<ObjectRecord> {
             length: 0,
             domains,
             object_type,
-            algorithm,
+            algorithm: algorithm_byte,
             sequence: 0,
             origin,
             label,
@@ -3437,6 +3716,9 @@ fn decode_wrapped_object(mut data: &[u8]) -> Result<ObjectRecord> {
     };
     record.normalize_info_length()?;
     record.validate()?;
+    if encode_wrapped_object(&record)? != data {
+        return Err(DeviceError::InvalidData);
+    }
     Ok(record)
 }
 
@@ -3786,6 +4068,37 @@ mod tests {
     };
     use p256::{ecdh::diffie_hellman, elliptic_curve::sec1::ToSec1Point};
     use software_key_core::software_signing::EcCurve;
+
+    fn wrapped_test_record(
+        id: u16,
+        object_type: ObjectType,
+        algorithm: Algorithm,
+        material: ObjectMaterial,
+    ) -> ObjectRecord {
+        let mut record = ObjectRecord {
+            info: ObjectInfo {
+                capabilities: CapabilitySet::from_capabilities([
+                    Capability::ExportableUnderWrap,
+                    Capability::DeleteOpaque,
+                ]),
+                id,
+                length: 0,
+                domains: 0x8001,
+                object_type,
+                algorithm: algorithm as u8,
+                sequence: 37,
+                origin: 0x12,
+                label: b"wrapped\0object".to_vec(),
+                delegated_capabilities: CapabilitySet::from_capabilities([
+                    Capability::GetOpaque,
+                    Capability::SignEcdsa,
+                ]),
+            },
+            material,
+        };
+        record.normalize_info_length().unwrap();
+        record
+    }
 
     fn put_opaque_request(id: u16, domains: u16, capabilities: CapabilitySet) -> Frame {
         put_opaque_request_with_payload(id, domains, capabilities, b"payload")
@@ -5144,6 +5457,172 @@ mod tests {
         assert_eq!(
             restored.material,
             ObjectMaterial::Opaque(b"payload".to_vec())
+        );
+    }
+
+    #[test]
+    fn wrapped_object_cbor_v1_round_trips_every_material_representation() {
+        let ec_secret = asymmetric_key_material(Algorithm::EcP256, true, &[]).unwrap();
+        let ed25519_secret = asymmetric_key_material(Algorithm::Ed25519, true, &[]).unwrap();
+        let x25519_secret = asymmetric_key_material(Algorithm::X25519, true, &[]).unwrap();
+        let rsa_secret = asymmetric_key_material(Algorithm::Rsa2048, true, &[]).unwrap();
+        let rsa_record = wrapped_test_record(
+            109,
+            ObjectType::WrapKey,
+            Algorithm::Rsa2048,
+            ObjectMaterial::Secret(rsa_secret),
+        );
+        let SoftwarePublicKey::Rsa { modulus, .. } = signing_key(&rsa_record).unwrap().public_key()
+        else {
+            panic!("generated RSA key did not have an RSA public key");
+        };
+        let auth_private =
+            SoftwareSigningKey::generate(SoftwareSigningAlgorithm::EcdsaP256Sha256).unwrap();
+        let SoftwarePublicKey::Ec {
+            uncompressed: auth_public,
+            ..
+        } = auth_private.public_key()
+        else {
+            panic!("generated P-256 key did not have an EC public key");
+        };
+
+        let records = vec![
+            wrapped_test_record(
+                100,
+                ObjectType::Opaque,
+                Algorithm::OpaqueData,
+                ObjectMaterial::Opaque(vec![0, 1, 2, 0xff]),
+            ),
+            wrapped_test_record(
+                101,
+                ObjectType::Template,
+                Algorithm::TemplateSsh,
+                ObjectMaterial::Opaque(b"template".to_vec()),
+            ),
+            wrapped_test_record(
+                102,
+                ObjectType::SymmetricKey,
+                Algorithm::Aes256,
+                ObjectMaterial::Secret(vec![0x22; 32]),
+            ),
+            wrapped_test_record(
+                103,
+                ObjectType::HmacKey,
+                Algorithm::HmacSha384,
+                ObjectMaterial::Secret(vec![0x33; 48]),
+            ),
+            wrapped_test_record(
+                104,
+                ObjectType::WrapKey,
+                Algorithm::Aes192CcmWrap,
+                ObjectMaterial::Secret(vec![0x44; 24]),
+            ),
+            wrapped_test_record(
+                105,
+                ObjectType::AuthenticationKey,
+                Algorithm::Aes128YubicoAuthentication,
+                ObjectMaterial::Authentication(AuthenticationKeyMaterial::Symmetric(vec![
+                    0x55;
+                    32
+                ])),
+            ),
+            wrapped_test_record(
+                106,
+                ObjectType::AuthenticationKey,
+                Algorithm::EcP256YubicoAuthentication,
+                ObjectMaterial::Authentication(AuthenticationKeyMaterial::Asymmetric(
+                    auth_public[1..].to_vec(),
+                )),
+            ),
+            wrapped_test_record(
+                107,
+                ObjectType::OtpAeadKey,
+                Algorithm::Aes128YubicoOtp,
+                ObjectMaterial::OtpAeadKey {
+                    nonce_id: [1, 2, 3, 4],
+                    key: vec![0x66; 16],
+                },
+            ),
+            wrapped_test_record(
+                108,
+                ObjectType::AsymmetricKey,
+                Algorithm::EcP256,
+                ObjectMaterial::Secret(ec_secret),
+            ),
+            rsa_record,
+            wrapped_test_record(
+                110,
+                ObjectType::PublicWrapKey,
+                Algorithm::Rsa2048,
+                ObjectMaterial::Public(modulus),
+            ),
+            wrapped_test_record(
+                111,
+                ObjectType::AsymmetricKey,
+                Algorithm::Ed25519,
+                ObjectMaterial::Secret(ed25519_secret),
+            ),
+            wrapped_test_record(
+                112,
+                ObjectType::AsymmetricKey,
+                Algorithm::X25519,
+                ObjectMaterial::Secret(x25519_secret),
+            ),
+        ];
+
+        for record in records {
+            let encoded = encode_wrapped_object(&record).unwrap();
+            let mut expected = record;
+            expected.info.sequence = 0;
+            expected.info.origin &= 0x0f;
+            assert_eq!(decode_wrapped_object(&encoded).unwrap(), expected);
+        }
+    }
+
+    #[test]
+    fn wrapped_object_cbor_v1_rejects_noncanonical_and_mismatched_records() {
+        let record = wrapped_test_record(
+            120,
+            ObjectType::Opaque,
+            Algorithm::OpaqueData,
+            ObjectMaterial::Opaque(b"payload".to_vec()),
+        );
+        let encoded = encode_wrapped_object(&record).unwrap();
+
+        let schema_offset = encoded
+            .windows(WRAPPED_OBJECT_SCHEMA.len())
+            .position(|window| window == WRAPPED_OBJECT_SCHEMA.as_bytes())
+            .unwrap();
+        let version_offset = schema_offset + WRAPPED_OBJECT_SCHEMA.len();
+        assert_eq!(encoded[version_offset], WRAPPED_OBJECT_VERSION);
+        let mut noncanonical = encoded.clone();
+        noncanonical.insert(version_offset, 0x18);
+        assert_eq!(
+            decode_wrapped_object(&noncanonical),
+            Err(DeviceError::InvalidData)
+        );
+
+        let mut trailing = encoded.clone();
+        trailing.push(0);
+        assert_eq!(
+            decode_wrapped_object(&trailing),
+            Err(DeviceError::InvalidData)
+        );
+
+        let mut input = Cursor::new(&encoded);
+        let mut value: CborValue = ciborium::from_reader(&mut input).unwrap();
+        let CborValue::Array(fields) = &mut value else {
+            panic!("wrapped object was not a CBOR array");
+        };
+        let CborValue::Array(material) = &mut fields[10] else {
+            panic!("wrapped material was not a CBOR array");
+        };
+        material[0] = CborValue::Integer(WRAPPED_MATERIAL_SECRET.into());
+        let mut mismatched = Vec::new();
+        ciborium::into_writer(&value, &mut mismatched).unwrap();
+        assert_eq!(
+            decode_wrapped_object(&mismatched),
+            Err(DeviceError::InvalidData)
         );
     }
 
