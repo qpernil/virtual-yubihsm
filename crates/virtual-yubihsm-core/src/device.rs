@@ -990,9 +990,7 @@ impl Device {
                 Ok(Vec::new())
             }
             CommandCode::ResetDevice => {
-                if request.data != [0xde] {
-                    return Err(DeviceError::InvalidData);
-                }
+                require_empty(&request.data)?;
                 let renewed_device_static_private = random_device_static_private()?;
                 self.objects.clear();
                 self.sequence_history.clear();
@@ -5590,11 +5588,18 @@ mod tests {
         );
         assert_eq!(restored.device_static_private.as_ref(), &[7; 32]);
 
-        let reset = Frame::new(CommandCode::ResetDevice as u8, vec![0xde]).unwrap();
+        let reset = Frame::new(CommandCode::ResetDevice as u8, Vec::new()).unwrap();
         assert!(restored.execute_inner(admin, &reset).data.is_empty());
         assert_ne!(restored.device_static_private.as_ref(), &[7; 32]);
         assert!(restored.take_persistent_change().unwrap());
         assert_eq!(restored.state_epoch(), 2);
+
+        let reset_with_payload = Frame::new(CommandCode::ResetDevice as u8, vec![0xde]).unwrap();
+        assert_eq!(
+            DeviceError::from_byte(restored.execute_inner(admin, &reset_with_payload).data[0])
+                .unwrap(),
+            DeviceError::WrongLength
+        );
 
         let foreign = DeviceConfig {
             serial: 78,
