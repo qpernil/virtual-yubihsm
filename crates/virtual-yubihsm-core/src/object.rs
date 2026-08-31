@@ -1,4 +1,4 @@
-use crate::{Capability, CapabilitySet, DeviceError, Result};
+use crate::{Algorithm, Capability, CapabilitySet, DeviceError, Result};
 use serde::{Deserialize, Serialize};
 use zeroize::{Zeroize, ZeroizeOnDrop};
 
@@ -144,9 +144,45 @@ pub struct ObjectRecord {
 }
 
 impl ObjectRecord {
+    pub fn expected_info_length(&self) -> Result<usize> {
+        match self.info.object_type {
+            ObjectType::AsymmetricKey => Algorithm::from_byte(self.info.algorithm)
+                .and_then(Algorithm::asymmetric_object_length)
+                .ok_or(DeviceError::InvalidData),
+            ObjectType::WrapKey
+                if Algorithm::from_byte(self.info.algorithm).is_some_and(Algorithm::is_rsa_key) =>
+            {
+                Algorithm::from_byte(self.info.algorithm)
+                    .and_then(Algorithm::asymmetric_object_length)
+                    .ok_or(DeviceError::InvalidData)
+            }
+            _ => Ok(self.material.len()),
+        }
+    }
+
+    pub fn normalize_info_length(&mut self) -> Result<()> {
+        self.info.length = self
+            .expected_info_length()?
+            .try_into()
+            .map_err(|_| DeviceError::WrongLength)?;
+        Ok(())
+    }
+
     pub fn validate(&self) -> Result<()> {
         self.info.validate()?;
-        if usize::from(self.info.length) != self.material.len() {
+        let algorithm = Algorithm::from_byte(self.info.algorithm);
+        let stores_private_asymmetric_key = matches!(
+            self.info.object_type,
+            ObjectType::AsymmetricKey | ObjectType::WrapKey
+        ) && algorithm.is_some_and(|algorithm| {
+            matches!(self.info.object_type, ObjectType::AsymmetricKey) || algorithm.is_rsa_key()
+        });
+        if stores_private_asymmetric_key
+            && algorithm.and_then(Algorithm::asymmetric_key_length) != Some(self.material.len())
+        {
+            return Err(DeviceError::InvalidData);
+        }
+        if usize::from(self.info.length) != self.expected_info_length()? {
             return Err(DeviceError::InvalidData);
         }
         Ok(())

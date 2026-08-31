@@ -41,7 +41,8 @@ the essential embedding surface:
 - `Device::handle_encoded` accepts and returns complete native YubiHSM frames;
 - `Device::take_persistent_change` identifies a successful durable mutation and
   advances the state epoch;
-- `Device::persistent_state` produces the version-1 CBOR image;
+- `Device::persistent_state` produces the version-2 CBOR image and restores
+  version-1 images through a checked metadata migration;
 - `Device::clear_sessions` drops transport-local volatile sessions.
 
 The main work is therefore not a second Virtual YubiHSM implementation. It is
@@ -60,7 +61,7 @@ The core owns:
 - the global numeric-object-ID generation mapping;
 - options, audit state and the 64-bit persisted state epoch;
 - factory bootstrap, trusted fixture provisioning and state restoration; and
-- serialization and validation of the schema-1 persistent image.
+- serialization and validation of the versioned persistent image.
 
 It must not acquire dependencies on:
 
@@ -192,7 +193,8 @@ For each built-in instance:
 - a missing file causes an explicit factory bootstrap and creation of the
   initial image before the device is advertised;
 - corrupt, unsupported or wrong-serial state fails closed;
-- schema remains version 1;
+- new state images use version 2; version-1 object-length metadata is migrated
+  after its original invariants have been validated;
 - the state epoch and global ID-generation mapping are restored unchanged;
 - sessions are never persisted;
 - graceful shutdown flushes pending batched state; and
@@ -274,7 +276,8 @@ Startup for each instance is:
 
 1. validate configuration and uniqueness;
 2. acquire exclusive state ownership;
-3. restore schema-1 state or perform explicit factory bootstrap;
+3. restore version-1 or version-2 state, migrating legacy object-length
+   metadata, or perform explicit factory bootstrap;
 4. start the shared persistence coordinator;
 5. register the backend as available; and
 6. begin accepting commands.
@@ -323,7 +326,7 @@ The implementation is complete when the following pass:
 7. Two virtual instances and physical devices can serve concurrently without a
    global command lock.
 8. Existing Virtual YubiHSM core, worker and persistence tests continue to pass
-   without schema changes.
+   without further schema changes.
 
 ## Implementation order
 
