@@ -1044,7 +1044,13 @@ impl Device {
                     Ok(())
                 }
             }
-            CommandCode::GetOpaque => first(ObjectType::Opaque, Capability::GetOpaque),
+            CommandCode::GetOpaque => self.require_object_visible(
+                authorization,
+                ObjectKey {
+                    object_type: ObjectType::Opaque,
+                    id: parse_u16_at(data, 0)?,
+                },
+            ),
             CommandCode::GetTemplate => first(ObjectType::Template, Capability::GetTemplate),
             CommandCode::ChangeAuthenticationKey => {
                 if parse_u16_at(data, 0)? != authorization.authentication_key_id {
@@ -3987,7 +3993,7 @@ mod tests {
     }
 
     #[test]
-    fn opaque_read_requires_get_opaque_on_session_and_object() {
+    fn opaque_read_requires_get_opaque_on_session_and_matching_domain() {
         let mut device = Device::factory_default(DeviceConfig::default());
         let admin = device.session_authorization(1).unwrap();
         let object_caps = CapabilitySet::from_capabilities([Capability::GetOpaque]);
@@ -4019,8 +4025,10 @@ mod tests {
         let get_without_object_capability =
             Frame::new(CommandCode::GetOpaque as u8, 13_u16.to_be_bytes()).unwrap();
         assert_eq!(
-            device.execute_inner(with_get_opaque, &get_without_object_capability),
-            Frame::error(DeviceError::InsufficientPermissions)
+            device
+                .execute_inner(with_get_opaque, &get_without_object_capability)
+                .data,
+            b"payload"
         );
 
         let info = Frame::new(
