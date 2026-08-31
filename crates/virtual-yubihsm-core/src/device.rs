@@ -1859,9 +1859,10 @@ impl Device {
         if matches!(algorithm, SoftwareSigningAlgorithm::Ed25519) {
             return Err(DeviceError::InvalidData);
         }
+        let curve = algorithm.ec_curve().ok_or(DeviceError::InvalidData)?;
         signing_key(object)?
             .sign_prehash(algorithm, &data[2..])
-            .map(|signature| signature.into_bytes())
+            .and_then(|signature| signature.to_ecdsa_der(curve))
             .map_err(|_| DeviceError::InvalidData)
     }
 
@@ -4584,12 +4585,15 @@ mod tests {
         )
         .unwrap();
         let signature = device.execute_inner(admin, &sign);
-        assert_eq!(signature.data.len(), 64);
+        assert_eq!(signature.data.first(), Some(&0x30));
+        let raw_signature =
+            software_key_core::software_signing::ecdsa_signature_from_der(&signature.data, 32)
+                .unwrap();
         public
             .verify_prehash(
                 SoftwareSigningAlgorithm::EcdsaP256Sha256,
                 &digest,
-                &signature.data,
+                &raw_signature,
             )
             .unwrap();
 
@@ -4836,8 +4840,15 @@ mod tests {
                 [id.to_be_bytes().as_slice(), &[0x5a; 64]].concat(),
             )
             .unwrap();
+            let signature = device.execute_inner(admin, &sign).data;
+            assert_eq!(signature.first(), Some(&0x30));
             assert_eq!(
-                device.execute_inner(admin, &sign).data.len(),
+                software_key_core::software_signing::ecdsa_signature_from_der(
+                    &signature,
+                    coordinate_length,
+                )
+                .unwrap()
+                .len(),
                 coordinate_length * 2
             );
         }
@@ -5210,7 +5221,14 @@ mod tests {
             [93_u16.to_be_bytes().as_slice(), &[0x5a; 32]].concat(),
         )
         .unwrap();
-        assert_eq!(device.execute_inner(admin, &sign).data.len(), 64);
+        let signature = device.execute_inner(admin, &sign).data;
+        assert_eq!(signature.first(), Some(&0x30));
+        assert_eq!(
+            software_key_core::software_signing::ecdsa_signature_from_der(&signature, 32)
+                .unwrap()
+                .len(),
+            64
+        );
     }
 
     #[test]
