@@ -150,7 +150,8 @@ impl Algorithm {
         )
     }
 
-    /// Logical private-object length used by YubiHSM object metadata.
+    /// Serialized private-key material length used by protocol imports and the
+    /// software crypto backend.
     pub const fn asymmetric_key_length(self) -> Option<usize> {
         match self {
             Self::Rsa2048 => Some(256),
@@ -163,6 +164,27 @@ impl Algorithm {
             Self::EcP384 | Self::EcBrainpoolP384 => Some(48),
             Self::EcP521 => Some(66),
             Self::EcBrainpoolP512 => Some(64),
+            _ => None,
+        }
+    }
+
+    /// Internal object size reported by the YubiHSM `GetObjectInfo` command.
+    ///
+    /// The device retains more than the imported private scalar or RSA primes:
+    /// RSA objects contain their CRT representation, while elliptic-curve
+    /// objects contain the private scalar and public coordinates. This size is
+    /// metadata only and must not be used as a modulus or wire-key length.
+    pub const fn asymmetric_object_length(self) -> Option<usize> {
+        match self {
+            Self::Rsa2048 => Some(896),
+            Self::Rsa3072 => Some(1_344),
+            Self::Rsa4096 => Some(1_792),
+            Self::EcP224 => Some(84),
+            Self::EcP256 | Self::EcK256 | Self::EcBrainpoolP256 => Some(96),
+            Self::EcP384 | Self::EcBrainpoolP384 => Some(144),
+            Self::EcP521 => Some(198),
+            Self::EcBrainpoolP512 => Some(192),
+            Self::Ed25519 | Self::X25519 => Some(64),
             _ => None,
         }
     }
@@ -192,5 +214,24 @@ mod tests {
         assert_eq!(Algorithm::from_byte(56), Some(Algorithm::X25519));
         assert_eq!(Algorithm::from_byte(57), Some(Algorithm::EcdhKdf));
         assert_eq!(Algorithm::from_byte(58), None);
+    }
+
+    #[test]
+    fn asymmetric_wire_material_and_internal_object_sizes_are_distinct() {
+        for (algorithm, material_length, object_length) in [
+            (Algorithm::Rsa2048, 256, 896),
+            (Algorithm::Rsa3072, 384, 1_344),
+            (Algorithm::Rsa4096, 512, 1_792),
+            (Algorithm::EcP224, 28, 84),
+            (Algorithm::EcP256, 32, 96),
+            (Algorithm::EcP384, 48, 144),
+            (Algorithm::EcP521, 66, 198),
+            (Algorithm::EcBrainpoolP512, 64, 192),
+            (Algorithm::Ed25519, 32, 64),
+            (Algorithm::X25519, 32, 64),
+        ] {
+            assert_eq!(algorithm.asymmetric_key_length(), Some(material_length));
+            assert_eq!(algorithm.asymmetric_object_length(), Some(object_length));
+        }
     }
 }
