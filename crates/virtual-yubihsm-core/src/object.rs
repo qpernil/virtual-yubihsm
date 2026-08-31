@@ -146,16 +146,25 @@ pub struct ObjectRecord {
 impl ObjectRecord {
     pub fn expected_info_length(&self) -> Result<usize> {
         match self.info.object_type {
+            ObjectType::AuthenticationKey => Ok(self.material.len() + 8),
             ObjectType::AsymmetricKey => Algorithm::from_byte(self.info.algorithm)
                 .and_then(Algorithm::asymmetric_object_length)
                 .ok_or(DeviceError::InvalidData),
-            ObjectType::WrapKey
-                if Algorithm::from_byte(self.info.algorithm).is_some_and(Algorithm::is_rsa_key) =>
-            {
-                Algorithm::from_byte(self.info.algorithm)
-                    .and_then(Algorithm::asymmetric_object_length)
-                    .ok_or(DeviceError::InvalidData)
-            }
+            ObjectType::WrapKey => match Algorithm::from_byte(self.info.algorithm) {
+                Some(algorithm) if algorithm.is_rsa_key() => algorithm
+                    .asymmetric_object_length()
+                    .and_then(|length| length.checked_add(8))
+                    .ok_or(DeviceError::InvalidData),
+                Some(
+                    Algorithm::Aes128CcmWrap | Algorithm::Aes192CcmWrap | Algorithm::Aes256CcmWrap,
+                ) => Ok(self.material.len() + 8),
+                _ => Err(DeviceError::InvalidData),
+            },
+            ObjectType::HmacKey => Algorithm::from_byte(self.info.algorithm)
+                .and_then(Algorithm::hmac_object_length)
+                .ok_or(DeviceError::InvalidData),
+            ObjectType::OtpAeadKey => Ok(self.material.len() + 4),
+            ObjectType::PublicWrapKey => Ok(self.material.len() + 8),
             _ => Ok(self.material.len()),
         }
     }
