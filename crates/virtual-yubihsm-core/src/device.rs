@@ -1339,7 +1339,7 @@ impl Device {
                     if !valid_option_value(pair[1]) {
                         return Err(DeviceError::InvalidData);
                     }
-                    if !command_can_be_audited(command) && pair[1] != OPTION_OFF {
+                    if command == CommandCode::SessionMessage && pair[1] != OPTION_OFF {
                         return Err(DeviceError::InvalidData);
                     }
                     if updated.get(&pair[0]) == Some(&OPTION_FIX) && pair[1] != OPTION_FIX {
@@ -4682,6 +4682,31 @@ mod tests {
             )
             .unwrap();
 
+        // The official command infers SHA-1/SHA-2 from raw digest lengths.
+        // Hashes with colliding lengths, such as SHA3-256, remain unambiguous
+        // when the caller supplies the complete DigestInfo payload.
+        let sha3_digest = RsaHashAlgorithm::Sha3_256.digest(b"encoded SHA3 DigestInfo");
+        let sha3_digest_info =
+            software_key_core::rsa_signing::digest_info(RsaHashAlgorithm::Sha3_256, &sha3_digest)
+                .unwrap();
+        let sign_encoded = Frame::new(
+            CommandCode::SignPkcs1 as u8,
+            [43_u16.to_be_bytes().as_slice(), sha3_digest_info.as_slice()].concat(),
+        )
+        .unwrap();
+        let encoded_signature = device.execute_inner(admin, &sign_encoded).data;
+        let rsa_public = RsaPublicKey::new(
+            BigUint::from_bytes_be(&public_response.data[1..]),
+            BigUint::from(65_537_u32),
+        )
+        .unwrap();
+        software_key_core::rsa_signing::rsa_verify_pkcs1v15_payload(
+            &rsa_public,
+            &sha3_digest_info,
+            &encoded_signature,
+        )
+        .unwrap();
+
         let plaintext = b"RSA decryption command";
         let ciphertext = public.encrypt_rsa_pkcs1v15(plaintext).unwrap();
         let decrypt = Frame::new(
@@ -5735,9 +5760,24 @@ mod tests {
             )
         );
 
+        let enable_session_message_audit = Frame::new(
+            CommandCode::SetOption as u8,
+            vec![
+                OPTION_COMMAND_AUDIT,
+                0,
+                2,
+                CommandCode::SessionMessage as u8,
+                OPTION_ON,
+            ],
+        )
+        .unwrap();
+        assert_eq!(
+            device.execute_inner(admin, &enable_session_message_audit),
+            Frame::error(DeviceError::InvalidData)
+        );
+
         for command in [
             CommandCode::Echo,
-            CommandCode::SessionMessage,
             CommandCode::GetDeviceInfo,
             CommandCode::GetDevicePublicKey,
             CommandCode::CloseSession,
@@ -5747,17 +5787,11 @@ mod tests {
                 vec![OPTION_COMMAND_AUDIT, 0, 2, command as u8, OPTION_ON],
             )
             .unwrap();
+            assert!(device.execute_inner(admin, &enable_audit).data.is_empty());
             assert_eq!(
-                device.execute_inner(admin, &enable_audit),
-                Frame::error(DeviceError::InvalidData)
+                device.options.command_audit.get(&(command as u8)),
+                Some(&OPTION_ON)
             );
-
-            // Keep the execution rule fail-safe if an invalid option map
-            // reaches memory through trusted state restoration.
-            device
-                .options
-                .command_audit
-                .insert(command as u8, OPTION_ON);
             assert!(!device.should_audit(command));
         }
     }
