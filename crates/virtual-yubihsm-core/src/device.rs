@@ -53,7 +53,7 @@ const MAX_SESSIONS: u8 = 16;
 const DEFAULT_AUTHENTICATION_ALGORITHM: u8 = AUTHENTICATION_ALGORITHM_AES128_YUBICO;
 const OPAQUE_DATA_ALGORITHM: u8 = 30;
 const PERSISTENT_STATE_SCHEMA: &str = "virtual-yubihsm-state";
-const PERSISTENT_STATE_VERSION: u16 = 2;
+const PERSISTENT_STATE_VERSION: u16 = 3;
 const OPTION_FORCE_AUDIT: u8 = 0x01;
 const OPTION_COMMAND_AUDIT: u8 = 0x03;
 const OPTION_ALGORITHM_TOGGLE: u8 = 0x04;
@@ -800,7 +800,7 @@ impl Device {
             ciborium::from_reader(&mut input).map_err(|_| DeviceError::InvalidData)?;
         if input.position() != encoded.len() as u64
             || state.schema != PERSISTENT_STATE_SCHEMA
-            || !matches!(state.version, 1 | PERSISTENT_STATE_VERSION)
+            || !matches!(state.version, 1 | 2 | PERSISTENT_STATE_VERSION)
             || state.config.serial != config.serial
             || state.audit.entries.len() > usize::from(state.config.log_capacity)
             || !valid_option_value(state.options.force_audit)
@@ -819,15 +819,20 @@ impl Device {
             &state.device_static_private,
         )
         .map_err(|_| DeviceError::InvalidData)?;
-        let legacy_object_lengths = state.version == 1;
+        let stored_version = state.version;
         let sequence_history = state.sequence_history;
         if !sequence_history.validate() {
             return Err(DeviceError::InvalidData);
         }
         let mut objects = BTreeMap::new();
         for mut object in state.objects {
-            if legacy_object_lengths {
-                if usize::from(object.info.length) != object.material.len() {
+            if stored_version < PERSISTENT_STATE_VERSION {
+                let previous_length = match stored_version {
+                    1 => object.material.len(),
+                    2 => version_two_object_length(&object)?,
+                    _ => return Err(DeviceError::InvalidData),
+                };
+                if usize::from(object.info.length) != previous_length {
                     return Err(DeviceError::InvalidData);
                 }
                 object.normalize_info_length()?;
@@ -1585,7 +1590,7 @@ impl Device {
         let info = ObjectInfo {
             capabilities: CapabilitySet::from_bytes(data[44..52].try_into().unwrap()),
             id,
-            length: key_length as u16,
+            length: (key_length + 8) as u16,
             domains: u16::from_be_bytes(data[42..44].try_into().unwrap()),
             object_type: ObjectType::AuthenticationKey,
             algorithm,
@@ -2051,7 +2056,9 @@ impl Device {
         let info = ObjectInfo {
             capabilities: CapabilitySet::from_bytes(data[44..52].try_into().unwrap()),
             id,
-            length: secret.len() as u16,
+            length: Algorithm::from_byte(algorithm)
+                .and_then(Algorithm::hmac_object_length)
+                .ok_or(DeviceError::InvalidData)? as u16,
             domains: u16::from_be_bytes(data[42..44].try_into().unwrap()),
             object_type: ObjectType::HmacKey,
             algorithm,
@@ -2177,9 +2184,10 @@ impl Device {
         let object_length = if algorithm.is_rsa_key() {
             algorithm
                 .asymmetric_object_length()
+                .and_then(|length| length.checked_add(8))
                 .ok_or(DeviceError::InvalidData)?
         } else {
-            key_length
+            key_length + 8
         };
         let info = ObjectInfo {
             capabilities: CapabilitySet::from_bytes(data[44..52].try_into().unwrap()),
@@ -2228,7 +2236,7 @@ impl Device {
         let info = ObjectInfo {
             capabilities: CapabilitySet::from_bytes(data[44..52].try_into().unwrap()),
             id,
-            length: key_length as u16,
+            length: (key_length + 8) as u16,
             domains: u16::from_be_bytes(data[42..44].try_into().unwrap()),
             object_type: ObjectType::PublicWrapKey,
             algorithm: algorithm as u8,
@@ -2670,7 +2678,7 @@ impl Device {
         let info = ObjectInfo {
             capabilities: CapabilitySet::from_bytes(data[44..52].try_into().unwrap()),
             id,
-            length: key_length as u16,
+            length: (key_length + 4) as u16,
             domains: u16::from_be_bytes(data[42..44].try_into().unwrap()),
             object_type: ObjectType::OtpAeadKey,
             algorithm: algorithm as u8,
@@ -2874,7 +2882,7 @@ impl Device {
             .cloned()
             .ok_or(DeviceError::ObjectNotFound)?;
         updated.info.algorithm = algorithm;
-        updated.info.length = key_length as u16;
+        updated.info.length = (key_length + 8) as u16;
         updated.material = ObjectMaterial::Authentication(material);
         self.write_object(updated)?;
         Ok(id.to_be_bytes().to_vec())
@@ -2934,7 +2942,7 @@ impl Device {
             info: ObjectInfo {
                 capabilities: CapabilitySet::ALL,
                 id: 1,
-                length: 32,
+                length: 40,
                 domains: u16::MAX,
                 object_type: ObjectType::AuthenticationKey,
                 algorithm: DEFAULT_AUTHENTICATION_ALGORITHM,
@@ -2950,6 +2958,24 @@ impl Device {
         let key = record.info.key();
         self.sequence_history.record(key.id, 0);
         self.objects.insert(key, record);
+    }
+}
+
+fn version_two_object_length(object: &ObjectRecord) -> Result<usize> {
+    let algorithm = Algorithm::from_byte(object.info.algorithm);
+    match object.info.object_type {
+        ObjectType::AsymmetricKey => match algorithm {
+            // Version 2 predated the physical-HSM measurement for Ed25519.
+            Some(Algorithm::Ed25519) => Ok(64),
+            Some(algorithm) => algorithm
+                .asymmetric_object_length()
+                .ok_or(DeviceError::InvalidData),
+            None => Err(DeviceError::InvalidData),
+        },
+        ObjectType::WrapKey if algorithm.is_some_and(Algorithm::is_rsa_key) => algorithm
+            .and_then(Algorithm::asymmetric_object_length)
+            .ok_or(DeviceError::InvalidData),
+        _ => Ok(object.material.len()),
     }
 }
 
@@ -5759,6 +5785,62 @@ mod tests {
         let upgraded: PersistentState =
             ciborium::from_reader(restored.persistent_state().unwrap().as_slice()).unwrap();
         assert_eq!(upgraded.version, PERSISTENT_STATE_VERSION);
+    }
+
+    #[test]
+    fn version_two_state_migrates_measured_object_lengths() {
+        let config = DeviceConfig {
+            serial: 79,
+            ..DeviceConfig::default()
+        };
+        let mut device = Device::factory_default(config.clone());
+        let admin = device.session_authorization(1).unwrap();
+        let generate = generate_asymmetric_key_request(
+            44,
+            1,
+            CapabilitySet::from_capabilities([Capability::SignEddsa]),
+            Algorithm::Ed25519 as u8,
+        );
+        assert_eq!(
+            device.execute_inner(admin, &generate).data,
+            44_u16.to_be_bytes()
+        );
+
+        let current = device.persistent_state().unwrap();
+        let mut version_two: PersistentState = ciborium::from_reader(current.as_slice()).unwrap();
+        version_two.version = 2;
+        for object in &mut version_two.objects {
+            object.info.length = version_two_object_length(object)
+                .unwrap()
+                .try_into()
+                .unwrap();
+        }
+        let mut encoded_version_two = Vec::new();
+        ciborium::into_writer(&version_two, &mut encoded_version_two).unwrap();
+
+        let restored = Device::from_persistent_state(config, &encoded_version_two).unwrap();
+        assert_eq!(
+            restored
+                .object(ObjectKey {
+                    object_type: ObjectType::AuthenticationKey,
+                    id: 1,
+                })
+                .unwrap()
+                .info
+                .length,
+            40
+        );
+        assert_eq!(
+            restored
+                .object(ObjectKey {
+                    object_type: ObjectType::AsymmetricKey,
+                    id: 44,
+                })
+                .unwrap()
+                .info
+                .length,
+            128
+        );
     }
 
     #[test]

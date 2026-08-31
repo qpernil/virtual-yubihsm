@@ -168,12 +168,8 @@ impl Algorithm {
         }
     }
 
-    /// Internal object size reported by the YubiHSM `GetObjectInfo` command.
-    ///
-    /// The device retains more than the imported private scalar or RSA primes:
-    /// RSA objects contain their CRT representation, while elliptic-curve
-    /// objects contain the private scalar and public coordinates. This size is
-    /// metadata only and must not be used as a modulus or wire-key length.
+    /// Object size reported by a physical YubiHSM through `GetObjectInfo`.
+    /// This is metadata only and must not be used as a key or wire length.
     pub const fn asymmetric_object_length(self) -> Option<usize> {
         match self {
             Self::Rsa2048 => Some(896),
@@ -184,7 +180,17 @@ impl Algorithm {
             Self::EcP384 | Self::EcBrainpoolP384 => Some(144),
             Self::EcP521 => Some(198),
             Self::EcBrainpoolP512 => Some(192),
-            Self::Ed25519 | Self::X25519 => Some(64),
+            Self::Ed25519 => Some(128),
+            Self::X25519 => Some(64),
+            _ => None,
+        }
+    }
+
+    /// Object size reported by a physical YubiHSM through `GetObjectInfo`.
+    pub const fn hmac_object_length(self) -> Option<usize> {
+        match self {
+            Self::HmacSha1 | Self::HmacSha256 => Some(128),
+            Self::HmacSha384 | Self::HmacSha512 => Some(256),
             _ => None,
         }
     }
@@ -227,7 +233,7 @@ mod tests {
             (Algorithm::EcP384, 48, 144),
             (Algorithm::EcP521, 66, 198),
             (Algorithm::EcBrainpoolP512, 64, 192),
-            (Algorithm::Ed25519, 32, 64),
+            (Algorithm::Ed25519, 32, 128),
             (Algorithm::X25519, 32, 64),
         ] {
             assert_eq!(algorithm.asymmetric_key_length(), Some(material_length));

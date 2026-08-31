@@ -193,8 +193,8 @@ For each built-in instance:
 - a missing file causes an explicit factory bootstrap and creation of the
   initial image before the device is advertised;
 - corrupt, unsupported or wrong-serial state fails closed;
-- new state images use version 2; version-1 object-length metadata is migrated
-  after its original invariants have been validated;
+- new state images use version 3; version-1 and version-2 object-length metadata
+  is migrated after its original invariants have been validated;
 - the state epoch and global ID-generation mapping are restored unchanged;
 - sessions are never persisted;
 - graceful shutdown flushes pending batched state; and
@@ -276,8 +276,8 @@ Startup for each instance is:
 
 1. validate configuration and uniqueness;
 2. acquire exclusive state ownership;
-3. restore version-1 or version-2 state, migrating legacy object-length
-   metadata, or perform explicit factory bootstrap;
+3. restore version-1, version-2 or version-3 state, migrating legacy
+   object-length metadata, or perform explicit factory bootstrap;
 4. start the shared persistence coordinator;
 5. register the backend as available; and
 6. begin accepting commands.
