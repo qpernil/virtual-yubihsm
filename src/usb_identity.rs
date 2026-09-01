@@ -114,10 +114,12 @@ mod tests {
                 && descriptor.descriptor == string_descriptor("87654321")
         }));
         for address in [BULK_OUT, BULK_IN] {
-            assert!(personality
-                .configuration_descriptor
-                .windows(3)
-                .any(|bytes| bytes == [7, 5, address]));
+            assert!(
+                personality
+                    .configuration_descriptor
+                    .windows(3)
+                    .any(|bytes| bytes == [7, 5, address])
+            );
         }
     }
 }

@@ -1,9 +1,9 @@
 use crate::{
+    DeviceError, Frame, Result, SessionAuthorization,
     frame::{HEADER_LENGTH, MAX_DATA_LENGTH},
     secure_channel_crypto::{
-        cbc_decrypt, cbc_encrypt, cmac, encrypt_block, pad, unpad, BLOCK_SIZE,
+        BLOCK_SIZE, cbc_decrypt, cbc_encrypt, cmac, encrypt_block, pad, unpad,
     },
-    DeviceError, Frame, Result, SessionAuthorization,
 };
 use software_key_core::{
     secure_channel::{scp03_cryptogram, scp03_key, x963_kdf_sha256},

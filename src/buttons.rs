@@ -5,8 +5,8 @@ use std::io::{self, Read};
 use std::os::fd::AsRawFd;
 use std::os::unix::net::UnixDatagram;
 use std::sync::{
-    atomic::{AtomicBool, Ordering},
     Arc,
+    atomic::{AtomicBool, Ordering},
 };
 use std::thread::{self, JoinHandle};
 
@@ -69,7 +69,7 @@ impl Controller {
                     ));
                 }
                 Err(error) if error.kind() == io::ErrorKind::WouldBlock => {
-                    return Ok(self.reconnect_pressed())
+                    return Ok(self.reconnect_pressed());
                 }
                 Err(error) if error.kind() == io::ErrorKind::Interrupted => continue,
                 Err(error) => return Err(error),

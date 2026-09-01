@@ -1,8 +1,8 @@
 [package]
 name = "virtual-yubihsm"
 version = "0.1.0"
-edition = "2021"
-rust-version = "1.85"
+edition = "2024"
+rust-version = "1.94"
 description = "A privilege-separated software implementation of the YubiHSM 2 device protocol"
 license = "MIT OR Apache-2.0"
 publish = false

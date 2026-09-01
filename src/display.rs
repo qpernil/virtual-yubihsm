@@ -24,8 +24,8 @@ use std::io;
 use std::os::fd::AsRawFd;
 #[cfg(target_os = "linux")]
 use std::sync::{
-    mpsc::{self, Receiver, RecvTimeoutError, Sender},
     Arc, Mutex,
+    mpsc::{self, Receiver, RecvTimeoutError, Sender},
 };
 #[cfg(target_os = "linux")]
 use std::thread::{self, JoinHandle};
@@ -368,8 +368,10 @@ mod tests {
         assert_eq!(LED_ON_FRAME.len(), COLOR_FRAME_SIZE);
         let mut changed = 0;
         for (index, (off, on)) in LED_OFF_FRAME
-            .chunks_exact(2)
-            .zip(LED_ON_FRAME.chunks_exact(2))
+            .as_chunks::<2>()
+            .0
+            .iter()
+            .zip(LED_ON_FRAME.as_chunks::<2>().0.iter())
             .enumerate()
         {
             if off == on {

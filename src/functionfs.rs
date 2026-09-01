@@ -3,7 +3,7 @@
 
 use crate::{
     usb_identity::{BULK_IN, BULK_OUT, MAX_PACKET_SIZE},
-    worker_protocol::{validate_initial_resources, Channel, Kind, Record, STATE_DIRECTORY_ENV},
+    worker_protocol::{Channel, Kind, Record, STATE_DIRECTORY_ENV, validate_initial_resources},
 };
 use std::{
     env, fs,
@@ -12,14 +12,14 @@ use std::{
     os::fd::AsRawFd,
     path::{Path, PathBuf},
     sync::{
-        atomic::{AtomicBool, Ordering},
         Arc, Mutex,
+        atomic::{AtomicBool, Ordering},
     },
     thread,
 };
 use usb_gadget_worker::{
-    replace_file_atomically, EndpointLifecycle, PersistenceMode, StateLock, StatePersistence,
-    StatePersistenceHandle, UsbBusEvent,
+    EndpointLifecycle, PersistenceMode, StateLock, StatePersistence, StatePersistenceHandle,
+    UsbBusEvent, replace_file_atomically,
 };
 use virtual_yubihsm_core::{
     CommandCode, Device, DeviceConfig, DeviceError, Frame, SessionAuthorization,
@@ -648,8 +648,8 @@ fn log_outer_failure(
     };
     match request {
         Ok(request) => {
-            let context = session_id(request)
-                .map_or_else(String::new, |sid| format!("; session={sid}"));
+            let context =
+                session_id(request).map_or_else(String::new, |sid| format!("; session={sid}"));
             if request.command == CommandCode::SessionMessage as u8 {
                 eprintln!(
                     "virtual-yubihsm-worker: secure session envelope failed before inner command dispatch: {} ({:#04x}){}",
