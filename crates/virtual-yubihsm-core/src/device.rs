@@ -1,3 +1,4 @@
+use crate::object::StoredObjectRecord;
 use crate::{
     session::{
         random_secret_key, secure_response_data_fits, secure_response_fits, SecureSession,
@@ -22,7 +23,7 @@ use software_key_core::{
     rsa_signing::RsaHashAlgorithm,
     secure_channel::yubico_password_kdf,
     software_key_agreement::{derive_with_signing_key, SoftwareX25519Key},
-    software_signing::{EcCurve, SoftwarePublicKey, SoftwareSigningAlgorithm, SoftwareSigningKey},
+    software_signing::{EcCurve, KeyKind, SignatureScheme, SoftwarePublicKey, SoftwareSigningKey},
     software_symmetric::{
         decrypt_aes_cbc, decrypt_aes_ccm, decrypt_aes_ecb, decrypt_yubico_otp_aead,
         encrypt_aes_cbc, encrypt_aes_ccm, encrypt_aes_ecb, encrypt_yubico_otp_aead, unwrap_aes_kwp,
@@ -131,7 +132,7 @@ struct PersistentState {
     schema: String,
     version: u16,
     config: DeviceConfig,
-    objects: Vec<ObjectRecord>,
+    objects: Vec<StoredObjectRecord>,
     device_static_private: [u8; 32],
     state_epoch: u64,
     sequence_history: SequenceHistory,
@@ -189,12 +190,7 @@ struct P256CertificateSigner {
 }
 
 impl P256CertificateSigner {
-    fn from_serialized(serialized: &[u8]) -> Result<Self> {
-        let key = SoftwareSigningKey::from_serialized(
-            SoftwareSigningAlgorithm::EcdsaP256Sha256,
-            serialized,
-        )
-        .map_err(|_| DeviceError::InvalidData)?;
+    fn from_key(key: &SoftwareSigningKey) -> Result<Self> {
         let SoftwarePublicKey::Ec {
             curve: EcCurve::P256,
             uncompressed,
@@ -203,7 +199,7 @@ impl P256CertificateSigner {
             return Err(DeviceError::InvalidData);
         };
         Ok(Self {
-            key,
+            key: key.clone(),
             verifying_key: P256CertificateVerifyingKey(uncompressed),
         })
     }
@@ -240,7 +236,7 @@ impl Signer<P256CertificateSignature> for P256CertificateSigner {
         message: &[u8],
     ) -> core::result::Result<P256CertificateSignature, signature::Error> {
         self.key
-            .sign_message(SoftwareSigningAlgorithm::EcdsaP256Sha256, message)
+            .sign_message(SignatureScheme::EcdsaP256Sha256, message)
             .and_then(|signature| signature.to_ecdsa_der(EcCurve::P256))
             .map(P256CertificateSignature)
             .map_err(|_| signature::Error::new())
@@ -306,7 +302,7 @@ pub struct Device {
     config: DeviceConfig,
     objects: BTreeMap<ObjectKey, ObjectRecord>,
     sessions: BTreeMap<u8, SessionEntry>,
-    device_static_private: Zeroizing<[u8; 32]>,
+    device_static_private: SoftwareSigningKey,
     state_epoch: u64,
     sequence_history: SequenceHistory,
     options: DeviceOptions,
@@ -332,8 +328,8 @@ impl Device {
         config: DeviceConfig,
         device_static_private: [u8; 32],
     ) -> Result<Self> {
-        SoftwareSigningKey::from_serialized(
-            SoftwareSigningAlgorithm::EcdsaP256Sha256,
+        let device_static_private = SoftwareSigningKey::from_serialized_for_kind(
+            KeyKind::Ec(EcCurve::P256),
             &device_static_private,
         )
         .map_err(|_| DeviceError::InvalidData)?;
@@ -341,7 +337,7 @@ impl Device {
             config,
             objects: BTreeMap::new(),
             sessions: BTreeMap::new(),
-            device_static_private: Zeroizing::new(device_static_private),
+            device_static_private,
             state_epoch: 0,
             sequence_history: SequenceHistory::default(),
             options: DeviceOptions::default(),
@@ -693,15 +689,10 @@ impl Device {
 
     fn get_device_public_key(&self, data: &[u8]) -> Result<Vec<u8>> {
         require_empty(data)?;
-        let private = SoftwareSigningKey::from_serialized(
-            SoftwareSigningAlgorithm::EcdsaP256Sha256,
-            self.device_static_private.as_ref(),
-        )
-        .map_err(|_| DeviceError::StorageFailed)?;
         let SoftwarePublicKey::Ec {
             uncompressed: mut public,
             ..
-        } = private.public_key()
+        } = self.device_static_private.public_key()
         else {
             return Err(DeviceError::StorageFailed);
         };
@@ -765,6 +756,8 @@ impl Device {
     /// Install or replace an object as part of trusted device provisioning.
     /// Normal protocol clients must use the authorized PUT/GENERATE commands.
     pub fn provision_object(&mut self, object: ObjectRecord) -> Result<()> {
+        let mut object = object;
+        object.promote_private_material()?;
         object.validate()?;
         let key = object.info.key();
         self.sequence_history
@@ -786,12 +779,24 @@ impl Device {
     /// Encode durable device state. Secure sessions and transport counters are
     /// intentionally excluded, just as they are on a physical power cycle.
     pub fn persistent_state(&self) -> Result<Vec<u8>> {
+        let objects = self
+            .objects
+            .values()
+            .map(ObjectRecord::to_stored)
+            .collect::<Result<Vec<_>>>()?;
+        let device_static_private = self
+            .device_static_private
+            .serialized()
+            .map_err(|_| DeviceError::StorageFailed)?
+            .as_slice()
+            .try_into()
+            .map_err(|_| DeviceError::StorageFailed)?;
         let state = PersistentState {
             schema: PERSISTENT_STATE_SCHEMA.to_owned(),
             version: PERSISTENT_STATE_VERSION,
             config: self.config.clone(),
-            objects: self.objects.values().cloned().collect(),
-            device_static_private: *self.device_static_private,
+            objects,
+            device_static_private,
             state_epoch: self.state_epoch,
             sequence_history: self.sequence_history.clone(),
             options: self.options.clone(),
@@ -824,8 +829,8 @@ impl Device {
         {
             return Err(DeviceError::InvalidData);
         }
-        SoftwareSigningKey::from_serialized(
-            SoftwareSigningAlgorithm::EcdsaP256Sha256,
+        let device_static_private = SoftwareSigningKey::from_serialized_for_kind(
+            KeyKind::Ec(EcCurve::P256),
             &state.device_static_private,
         )
         .map_err(|_| DeviceError::InvalidData)?;
@@ -835,10 +840,12 @@ impl Device {
             return Err(DeviceError::InvalidData);
         }
         let mut objects = BTreeMap::new();
-        for mut object in state.objects {
+        for stored in state.objects {
+            let stored_material_length = stored.material.len();
+            let mut object = ObjectRecord::from_stored(stored)?;
             if stored_version < PERSISTENT_STATE_VERSION {
                 let previous_length = match stored_version {
-                    1 => object.material.len(),
+                    1 => stored_material_length,
                     2 => version_two_object_length(&object)?,
                     _ => return Err(DeviceError::InvalidData),
                 };
@@ -857,7 +864,7 @@ impl Device {
             config: state.config,
             objects,
             sessions: BTreeMap::new(),
-            device_static_private: Zeroizing::new(state.device_static_private),
+            device_static_private,
             state_epoch: state.state_epoch,
             sequence_history,
             options: state.options,
@@ -1013,11 +1020,13 @@ impl Device {
             }
             CommandCode::ResetDevice => {
                 require_empty(&request.data)?;
-                let renewed_device_static_private = random_device_static_private()?;
+                let renewed_device_static_private =
+                    SoftwareSigningKey::generate_for_kind(KeyKind::Ec(EcCurve::P256))
+                        .map_err(|_| DeviceError::StorageFailed)?;
                 self.objects.clear();
                 self.sequence_history.clear();
                 self.sessions.clear();
-                *self.device_static_private = renewed_device_static_private;
+                self.device_static_private = renewed_device_static_private;
                 self.options = DeviceOptions::default();
                 self.audit = AuditState {
                     next_number: 1,
@@ -1636,8 +1645,8 @@ impl Device {
             .asymmetric_key_length()
             .ok_or(DeviceError::InvalidData)?;
         let supplied = &data[HEADER_LENGTH..];
-        let secret = asymmetric_key_material(algorithm, generate, supplied)?;
-        if secret.len() != expected_length {
+        let material = asymmetric_key_material(algorithm, generate, supplied)?;
+        if material.len() != expected_length {
             return Err(DeviceError::InvalidData);
         }
         let id = self.resolve_id(
@@ -1664,10 +1673,7 @@ impl Device {
             delegated_capabilities: CapabilitySet::NONE,
         };
         authorization.authorize_create(&info, capability)?;
-        let record = ObjectRecord {
-            info,
-            material: ObjectMaterial::Secret(secret),
-        };
+        let record = ObjectRecord { info, material };
         record.validate()?;
         self.write_object(record)?;
         Ok(id.to_be_bytes().to_vec())
@@ -1737,15 +1743,10 @@ impl Device {
         let target_id = u16::from_be_bytes(data[..2].try_into().unwrap());
         let attesting_id = u16::from_be_bytes(data[2..].try_into().unwrap());
         let (target_spki, target_info) = if target_id == 0 {
-            let private = SoftwareSigningKey::from_serialized(
-                SoftwareSigningAlgorithm::EcdsaP256Sha256,
-                self.device_static_private.as_ref(),
-            )
-            .map_err(|_| DeviceError::StorageFailed)?;
             let SoftwarePublicKey::Ec {
                 uncompressed: public,
                 ..
-            } = private.public_key()
+            } = self.device_static_private.public_key()
             else {
                 return Err(DeviceError::StorageFailed);
             };
@@ -1774,7 +1775,7 @@ impl Device {
         };
         let (attesting_private, issuer) = if attesting_id == 0 {
             (
-                *self.device_static_private,
+                &self.device_static_private,
                 format!("CN=Virtual YubiHSM {} Attestation", self.config.serial),
             )
         } else {
@@ -1782,15 +1783,12 @@ impl Device {
             if attesting.info.algorithm != Algorithm::EcP256 as u8 {
                 return Err(DeviceError::InvalidData);
             }
-            let secret: [u8; 32] = object_secret(attesting)?
-                .try_into()
-                .map_err(|_| DeviceError::InvalidData)?;
             (
-                secret,
+                signing_key(attesting)?,
                 format!("CN=Virtual YubiHSM Attestation Key {attesting_id}"),
             )
         };
-        let signer = P256CertificateSigner::from_serialized(&attesting_private)?;
+        let signer = P256CertificateSigner::from_key(attesting_private)?;
         let mut subject = Name::from_str(&format!("CN=Virtual YubiHSM Key {target_id}"))
             .map_err(|_| DeviceError::InvalidData)?;
         let mut issuer = Name::from_str(&issuer).map_err(|_| DeviceError::InvalidData)?;
@@ -1886,7 +1884,7 @@ impl Device {
         let id = u16::from_be_bytes(data[..2].try_into().unwrap());
         let object = self.asymmetric_object(authorization, id)?;
         let (algorithm, _) = asymmetric_key_algorithm(object.info.algorithm)?;
-        if matches!(algorithm, SoftwareSigningAlgorithm::Ed25519) {
+        if matches!(algorithm, SignatureScheme::Ed25519) {
             return Err(DeviceError::InvalidData);
         }
         let curve = algorithm.ec_curve().ok_or(DeviceError::InvalidData)?;
@@ -1906,7 +1904,7 @@ impl Device {
             return Err(DeviceError::InvalidData);
         }
         signing_key(object)?
-            .sign_message(SoftwareSigningAlgorithm::Ed25519, &data[2..])
+            .sign_message(SignatureScheme::Ed25519, &data[2..])
             .map(|signature| signature.into_bytes())
             .map_err(|_| DeviceError::InvalidData)
     }
@@ -2170,17 +2168,17 @@ impl Device {
             }
             _ => return Err(DeviceError::InvalidData),
         };
-        let secret = if algorithm.is_rsa_key() {
+        let material = if algorithm.is_rsa_key() {
             asymmetric_key_material(algorithm, generate, &data[HEADER_LENGTH..])?
         } else if generate {
             let mut secret = vec![0; key_length];
             getrandom::fill(&mut secret).map_err(|_| DeviceError::StorageFailed)?;
-            secret
+            ObjectMaterial::Secret(secret)
         } else {
             if data.len() != HEADER_LENGTH + key_length {
                 return Err(DeviceError::WrongLength);
             }
-            data[HEADER_LENGTH..].to_vec()
+            ObjectMaterial::Secret(data[HEADER_LENGTH..].to_vec())
         };
         let id = self.resolve_id(
             ObjectType::WrapKey,
@@ -2212,10 +2210,7 @@ impl Device {
             delegated_capabilities: CapabilitySet::from_bytes(data[53..61].try_into().unwrap()),
         };
         authorization.authorize_create(&info, capability)?;
-        let record = ObjectRecord {
-            info,
-            material: ObjectMaterial::Secret(secret),
-        };
+        let record = ObjectRecord { info, material };
         record.validate()?;
         self.write_object(record)?;
         Ok(id.to_be_bytes().to_vec())
@@ -2424,7 +2419,7 @@ impl Device {
             }
             let wrapped_end = data.len() - label_length;
             let plaintext = rsa_aes_unwrap(
-                &signing_key(wrap_key)?,
+                signing_key(wrap_key)?,
                 &data[4..wrapped_end],
                 modulus_length,
                 &data[wrapped_end..],
@@ -2475,7 +2470,7 @@ impl Device {
             }
             let wrapped_end = data.len() - label_digest_length;
             let plaintext = rsa_aes_unwrap(
-                &signing_key(wrap_key)?,
+                signing_key(wrap_key)?,
                 &data[HEADER_LENGTH..wrapped_end],
                 modulus_length,
                 &data[wrapped_end..],
@@ -2934,6 +2929,7 @@ impl Device {
     }
 
     fn write_object(&mut self, mut record: ObjectRecord) -> Result<()> {
+        record.promote_private_material()?;
         record.validate()?;
         let key = record.info.key();
         let generation = self.next_generation(key.id);
@@ -3028,17 +3024,17 @@ fn parse_authentication_key_material(
     }
 }
 
-fn asymmetric_key_algorithm(algorithm: u8) -> Result<(SoftwareSigningAlgorithm, usize)> {
+fn asymmetric_key_algorithm(algorithm: u8) -> Result<(SignatureScheme, usize)> {
     match algorithm {
-        47 => Ok((SoftwareSigningAlgorithm::EcdsaP224Sha224, 28)),
-        12 => Ok((SoftwareSigningAlgorithm::EcdsaP256Sha256, 32)),
-        13 => Ok((SoftwareSigningAlgorithm::EcdsaP384Sha384, 48)),
-        14 => Ok((SoftwareSigningAlgorithm::EcdsaP521Sha512, 66)),
-        15 => Ok((SoftwareSigningAlgorithm::EcdsaSecp256k1Sha256, 32)),
-        16 => Ok((SoftwareSigningAlgorithm::EcdsaBrainpoolP256Sha256, 32)),
-        17 => Ok((SoftwareSigningAlgorithm::EcdsaBrainpoolP384Sha384, 48)),
-        18 => Ok((SoftwareSigningAlgorithm::EcdsaBrainpoolP512Sha512, 64)),
-        46 => Ok((SoftwareSigningAlgorithm::Ed25519, 32)),
+        47 => Ok((SignatureScheme::EcdsaP224Sha224, 28)),
+        12 => Ok((SignatureScheme::EcdsaP256Sha256, 32)),
+        13 => Ok((SignatureScheme::EcdsaP384Sha384, 48)),
+        14 => Ok((SignatureScheme::EcdsaP521Sha512, 66)),
+        15 => Ok((SignatureScheme::EcdsaSecp256k1Sha256, 32)),
+        16 => Ok((SignatureScheme::EcdsaBrainpoolP256Sha256, 32)),
+        17 => Ok((SignatureScheme::EcdsaBrainpoolP384Sha384, 48)),
+        18 => Ok((SignatureScheme::EcdsaBrainpoolP512Sha512, 64)),
+        46 => Ok((SignatureScheme::Ed25519, 32)),
         _ => Err(DeviceError::InvalidData),
     }
 }
@@ -3047,7 +3043,7 @@ fn asymmetric_key_material(
     algorithm: Algorithm,
     generate: bool,
     supplied: &[u8],
-) -> Result<Vec<u8>> {
+) -> Result<ObjectMaterial> {
     let expected_length = algorithm
         .asymmetric_key_length()
         .ok_or(DeviceError::InvalidData)?;
@@ -3063,12 +3059,14 @@ fn asymmetric_key_material(
             }
             SoftwareX25519Key::from_serialized(supplied).map_err(|_| DeviceError::InvalidData)?
         };
-        return Ok(key.serialized().to_vec());
+        return Ok(ObjectMaterial::X25519Key(key));
     }
     if algorithm.is_rsa_key() {
         let key = if generate {
-            SoftwareSigningKey::generate_rsa(expected_length * 8)
-                .map_err(|_| DeviceError::StorageFailed)?
+            SoftwareSigningKey::generate_for_kind(KeyKind::Rsa {
+                modulus_bits: expected_length * 8,
+            })
+            .map_err(|_| DeviceError::StorageFailed)?
         } else {
             if supplied.len() != expected_length {
                 return Err(DeviceError::WrongLength);
@@ -3077,32 +3075,40 @@ fn asymmetric_key_material(
             SoftwareSigningKey::from_rsa_primes(p, q, &[1, 0, 1])
                 .map_err(|_| DeviceError::InvalidData)?
         };
-        let [p, q, _, _, _] = key
-            .rsa_crt_components()
-            .map_err(|_| DeviceError::InvalidData)?;
-        let component_length = expected_length / 2;
-        let mut encoded = left_pad_component(&p, component_length)?;
-        encoded.extend_from_slice(&left_pad_component(&q, component_length)?);
-        return Ok(encoded);
+        return Ok(ObjectMaterial::SigningKey(key));
     }
-    let (software_algorithm, _) = asymmetric_key_algorithm(algorithm as u8)?;
+    let key_kind = asymmetric_key_kind(algorithm)?;
     let key = if generate {
-        SoftwareSigningKey::generate(software_algorithm).map_err(|_| DeviceError::StorageFailed)?
+        SoftwareSigningKey::generate_for_kind(key_kind).map_err(|_| DeviceError::StorageFailed)?
     } else {
         if supplied.len() != expected_length {
             return Err(DeviceError::WrongLength);
         }
-        SoftwareSigningKey::from_serialized(software_algorithm, supplied)
+        SoftwareSigningKey::from_serialized_for_kind(key_kind, supplied)
             .map_err(|_| DeviceError::InvalidData)?
     };
-    let secret = key
-        .serialized()
-        .map_err(|_| DeviceError::InvalidData)?
-        .to_vec();
-    if secret.len() != expected_length {
+    if key.private_value().map_or(0, |secret| secret.len()) != expected_length {
         return Err(DeviceError::InvalidData);
     }
-    Ok(secret)
+    Ok(ObjectMaterial::SigningKey(key))
+}
+
+fn asymmetric_key_kind(algorithm: Algorithm) -> Result<KeyKind> {
+    Ok(match algorithm {
+        Algorithm::EcP224 => KeyKind::Ec(EcCurve::P224),
+        Algorithm::EcP256 => KeyKind::Ec(EcCurve::P256),
+        Algorithm::EcP384 => KeyKind::Ec(EcCurve::P384),
+        Algorithm::EcP521 => KeyKind::Ec(EcCurve::P521),
+        Algorithm::EcK256 => KeyKind::Ec(EcCurve::Secp256k1),
+        Algorithm::EcBrainpoolP256 => KeyKind::Ec(EcCurve::BrainpoolP256),
+        Algorithm::EcBrainpoolP384 => KeyKind::Ec(EcCurve::BrainpoolP384),
+        Algorithm::EcBrainpoolP512 => KeyKind::Ec(EcCurve::BrainpoolP512),
+        Algorithm::Ed25519 => KeyKind::Ed25519,
+        Algorithm::Rsa2048 => KeyKind::Rsa { modulus_bits: 2048 },
+        Algorithm::Rsa3072 => KeyKind::Rsa { modulus_bits: 3072 },
+        Algorithm::Rsa4096 => KeyKind::Rsa { modulus_bits: 4096 },
+        _ => return Err(DeviceError::InvalidData),
+    })
 }
 
 fn import_rsa_wrapped_key_material(
@@ -3119,7 +3125,7 @@ fn import_rsa_wrapped_key_material(
             if material.len() != logical_length {
                 return Err(DeviceError::InvalidData);
             }
-            Ok((ObjectMaterial::Secret(material), logical_length))
+            Ok((material, logical_length))
         }
         ObjectType::SymmetricKey => {
             let key_length = match algorithm {
@@ -3137,30 +3143,17 @@ fn import_rsa_wrapped_key_material(
     }
 }
 
-fn left_pad_component(component: &[u8], length: usize) -> Result<Vec<u8>> {
-    if component.len() > length {
-        return Err(DeviceError::InvalidData);
-    }
-    let mut padded = vec![0; length];
-    padded[length - component.len()..].copy_from_slice(component);
-    Ok(padded)
-}
-
-fn signing_key(object: &ObjectRecord) -> Result<SoftwareSigningKey> {
-    let ObjectMaterial::Secret(secret) = &object.material else {
+fn signing_key(object: &ObjectRecord) -> Result<&SoftwareSigningKey> {
+    let ObjectMaterial::SigningKey(key) = &object.material else {
         return Err(DeviceError::InvalidData);
     };
     let algorithm = Algorithm::from_byte(object.info.algorithm).ok_or(DeviceError::InvalidData)?;
-    if algorithm.is_rsa_key() {
-        if algorithm.asymmetric_key_length() != Some(secret.len()) || secret.len() % 2 != 0 {
-            return Err(DeviceError::InvalidData);
-        }
-        let (p, q) = secret.split_at(secret.len() / 2);
-        return SoftwareSigningKey::from_rsa_primes(p, q, &[1, 0, 1])
-            .map_err(|_| DeviceError::InvalidData);
+    if algorithm == Algorithm::X25519
+        || algorithm.is_rsa_key() != matches!(key, SoftwareSigningKey::Rsa(_))
+    {
+        return Err(DeviceError::InvalidData);
     }
-    let (algorithm, _) = asymmetric_key_algorithm(object.info.algorithm)?;
-    SoftwareSigningKey::from_serialized(algorithm, secret).map_err(|_| DeviceError::InvalidData)
+    Ok(key)
 }
 
 fn rsa_modulus_length(object: &ObjectRecord) -> Result<usize> {
@@ -3262,7 +3255,7 @@ fn attestation_metadata_extensions(
         .collect()
 }
 
-fn rsa_key(object: &ObjectRecord) -> Result<SoftwareSigningKey> {
+fn rsa_key(object: &ObjectRecord) -> Result<&SoftwareSigningKey> {
     let algorithm = Algorithm::from_byte(object.info.algorithm).ok_or(DeviceError::InvalidData)?;
     if !algorithm.is_rsa_key() {
         return Err(DeviceError::InvalidData);
@@ -3270,14 +3263,14 @@ fn rsa_key(object: &ObjectRecord) -> Result<SoftwareSigningKey> {
     signing_key(object)
 }
 
-fn x25519_key(object: &ObjectRecord) -> Result<SoftwareX25519Key> {
+fn x25519_key(object: &ObjectRecord) -> Result<&SoftwareX25519Key> {
     if object.info.algorithm != Algorithm::X25519 as u8 {
         return Err(DeviceError::InvalidData);
     }
-    let ObjectMaterial::Secret(secret) = &object.material else {
+    let ObjectMaterial::X25519Key(key) = &object.material else {
         return Err(DeviceError::InvalidData);
     };
-    SoftwareX25519Key::from_serialized(secret).map_err(|_| DeviceError::InvalidData)
+    Ok(key)
 }
 
 fn object_secret(object: &ObjectRecord) -> Result<&[u8]> {
@@ -3377,7 +3370,7 @@ fn x25519_from_pkcs8(encoded: &[u8]) -> Result<Vec<u8>> {
 
 fn asymmetric_pkcs8(object: &ObjectRecord) -> Result<Vec<u8>> {
     if object.info.algorithm == Algorithm::X25519 as u8 {
-        return x25519_pkcs8(object_secret(object)?);
+        return x25519_pkcs8(&x25519_key(object)?.serialized());
     }
     signing_key(object)?
         .to_pkcs8_der()
@@ -3385,16 +3378,14 @@ fn asymmetric_pkcs8(object: &ObjectRecord) -> Result<Vec<u8>> {
         .map_err(|_| DeviceError::InvalidData)
 }
 
-fn asymmetric_material_from_pkcs8(algorithm: Algorithm, encoded: &[u8]) -> Result<Vec<u8>> {
+fn asymmetric_material_from_pkcs8(algorithm: Algorithm, encoded: &[u8]) -> Result<ObjectMaterial> {
     if algorithm == Algorithm::X25519 {
-        return x25519_from_pkcs8(encoded);
+        let serialized = x25519_from_pkcs8(encoded)?;
+        return SoftwareX25519Key::from_serialized(&serialized)
+            .map(ObjectMaterial::X25519Key)
+            .map_err(|_| DeviceError::InvalidData);
     }
-    let (software_algorithm, _) = if algorithm.is_rsa_key() {
-        (SoftwareSigningAlgorithm::RsaPssSha256, 0)
-    } else {
-        asymmetric_key_algorithm(algorithm as u8)?
-    };
-    let key = SoftwareSigningKey::from_pkcs8_der(software_algorithm, encoded)
+    let key = SoftwareSigningKey::from_pkcs8_der_for_kind(asymmetric_key_kind(algorithm)?, encoded)
         .map_err(|_| DeviceError::InvalidData)?;
     if algorithm.is_rsa_key() {
         let SoftwarePublicKey::Rsa { modulus, exponent } = key.public_key() else {
@@ -3403,22 +3394,12 @@ fn asymmetric_material_from_pkcs8(algorithm: Algorithm, encoded: &[u8]) -> Resul
         if exponent != [1, 0, 1] || algorithm.asymmetric_key_length() != Some(modulus.len()) {
             return Err(DeviceError::InvalidData);
         }
-        let [p, q, _, _, _] = key
-            .rsa_crt_components()
-            .map_err(|_| DeviceError::InvalidData)?;
-        let component_length = modulus.len() / 2;
-        let mut material = left_pad_component(&p, component_length)?;
-        material.extend_from_slice(&left_pad_component(&q, component_length)?);
-        return Ok(material);
+        return Ok(ObjectMaterial::SigningKey(key));
     }
-    let material = key
-        .serialized()
-        .map_err(|_| DeviceError::InvalidData)?
-        .to_vec();
-    if algorithm.asymmetric_key_length() != Some(material.len()) {
+    if algorithm.asymmetric_key_length() != key.private_value().as_deref().map(Vec::len) {
         return Err(DeviceError::InvalidData);
     }
-    Ok(material)
+    Ok(ObjectMaterial::SigningKey(key))
 }
 
 fn validate_wrapped_object(object: &ObjectRecord) -> Result<()> {
@@ -3442,11 +3423,17 @@ fn validate_wrapped_object(object: &ObjectRecord) -> Result<()> {
             )
             .is_ok_and(|parsed| &parsed == authentication)
         }
-        (ObjectType::AsymmetricKey, ObjectMaterial::Secret(value)) => {
-            algorithm.asymmetric_key_length() == Some(value.len())
+        (ObjectType::AsymmetricKey, ObjectMaterial::SigningKey(value)) => {
+            algorithm != Algorithm::X25519
+                && algorithm.asymmetric_key_length()
+                    == Some(value.private_value().map_or_else(
+                        || algorithm.asymmetric_key_length().unwrap_or_default(),
+                        |private| private.len(),
+                    ))
         }
-        (ObjectType::WrapKey, ObjectMaterial::Secret(value)) if algorithm.is_rsa_key() => {
-            algorithm.asymmetric_key_length() == Some(value.len())
+        (ObjectType::AsymmetricKey, ObjectMaterial::X25519Key(_)) => algorithm == Algorithm::X25519,
+        (ObjectType::WrapKey, ObjectMaterial::SigningKey(value)) if algorithm.is_rsa_key() => {
+            matches!(value, SoftwareSigningKey::Rsa(_))
         }
         (ObjectType::WrapKey, ObjectMaterial::Secret(value)) => {
             matches!(
@@ -3485,8 +3472,9 @@ fn validate_wrapped_object(object: &ObjectRecord) -> Result<()> {
 
 fn wrapped_material(object: &ObjectRecord) -> Result<CborValue> {
     let (kind, values) = match (&object.info.object_type, &object.material) {
-        (ObjectType::AsymmetricKey, ObjectMaterial::Secret(_))
-        | (ObjectType::WrapKey, ObjectMaterial::Secret(_))
+        (ObjectType::AsymmetricKey, ObjectMaterial::SigningKey(_))
+        | (ObjectType::AsymmetricKey, ObjectMaterial::X25519Key(_))
+        | (ObjectType::WrapKey, ObjectMaterial::SigningKey(_))
             if Algorithm::from_byte(object.info.algorithm).is_some_and(Algorithm::is_rsa_key)
                 || object.info.object_type == ObjectType::AsymmetricKey =>
         {
@@ -3607,7 +3595,7 @@ fn decode_wrapped_material(
                 || object_type == ObjectType::WrapKey && algorithm.is_rsa_key() =>
         {
             let encoded = wrapped_bytes(values.next().ok_or(DeviceError::InvalidData)?)?;
-            ObjectMaterial::Secret(asymmetric_material_from_pkcs8(algorithm, &encoded)?)
+            asymmetric_material_from_pkcs8(algorithm, &encoded)?
         }
         WRAPPED_MATERIAL_OPAQUE
             if matches!(object_type, ObjectType::Opaque | ObjectType::Template) =>
@@ -3826,7 +3814,7 @@ fn raw_ecdh_secret(object: &ObjectRecord, peer_public: &[u8]) -> Result<Zeroizin
             .derive(peer_public)
             .map_err(|_| DeviceError::InvalidData)
     } else {
-        derive_with_signing_key(&signing_key(object)?, peer_public)
+        derive_with_signing_key(signing_key(object)?, peer_public)
             .map_err(|_| DeviceError::InvalidData)
     }
 }
@@ -4967,11 +4955,7 @@ mod tests {
             software_key_core::software_signing::ecdsa_signature_from_der(&signature.data, 32)
                 .unwrap();
         public
-            .verify_prehash(
-                SoftwareSigningAlgorithm::EcdsaP256Sha256,
-                &digest,
-                &raw_signature,
-            )
+            .verify_prehash(SignatureScheme::EcdsaP256Sha256, &digest, &raw_signature)
             .unwrap();
 
         let wrong_domain = SessionAuthorization {
@@ -5063,11 +5047,7 @@ mod tests {
         let signature = device.execute_inner(admin, &sign);
         assert_eq!(signature.data.len(), 256);
         public
-            .verify_prehash(
-                SoftwareSigningAlgorithm::RsaPkcs1Sha256,
-                &digest,
-                &signature.data,
-            )
+            .verify_prehash(SignatureScheme::RsaPkcs1Sha256, &digest, &signature.data)
             .unwrap();
 
         // The official command infers SHA-1/SHA-2 from raw digest lengths.
@@ -5466,18 +5446,14 @@ mod tests {
         let ed25519_secret = asymmetric_key_material(Algorithm::Ed25519, true, &[]).unwrap();
         let x25519_secret = asymmetric_key_material(Algorithm::X25519, true, &[]).unwrap();
         let rsa_secret = asymmetric_key_material(Algorithm::Rsa2048, true, &[]).unwrap();
-        let rsa_record = wrapped_test_record(
-            109,
-            ObjectType::WrapKey,
-            Algorithm::Rsa2048,
-            ObjectMaterial::Secret(rsa_secret),
-        );
+        let rsa_record =
+            wrapped_test_record(109, ObjectType::WrapKey, Algorithm::Rsa2048, rsa_secret);
         let SoftwarePublicKey::Rsa { modulus, .. } = signing_key(&rsa_record).unwrap().public_key()
         else {
             panic!("generated RSA key did not have an RSA public key");
         };
         let auth_private =
-            SoftwareSigningKey::generate(SoftwareSigningAlgorithm::EcdsaP256Sha256).unwrap();
+            SoftwareSigningKey::generate_for_kind(KeyKind::Ec(EcCurve::P256)).unwrap();
         let SoftwarePublicKey::Ec {
             uncompressed: auth_public,
             ..
@@ -5543,12 +5519,7 @@ mod tests {
                     key: vec![0x66; 16],
                 },
             ),
-            wrapped_test_record(
-                108,
-                ObjectType::AsymmetricKey,
-                Algorithm::EcP256,
-                ObjectMaterial::Secret(ec_secret),
-            ),
+            wrapped_test_record(108, ObjectType::AsymmetricKey, Algorithm::EcP256, ec_secret),
             rsa_record,
             wrapped_test_record(
                 110,
@@ -5560,13 +5531,13 @@ mod tests {
                 111,
                 ObjectType::AsymmetricKey,
                 Algorithm::Ed25519,
-                ObjectMaterial::Secret(ed25519_secret),
+                ed25519_secret,
             ),
             wrapped_test_record(
                 112,
                 ObjectType::AsymmetricKey,
                 Algorithm::X25519,
-                ObjectMaterial::Secret(x25519_secret),
+                x25519_secret,
             ),
         ];
 
@@ -6196,11 +6167,25 @@ mod tests {
             restored.options.command_audit[&(CommandCode::GetPseudoRandom as u8)],
             OPTION_ON
         );
-        assert_eq!(restored.device_static_private.as_ref(), &[7; 32]);
+        assert_eq!(
+            restored
+                .device_static_private
+                .serialized()
+                .unwrap()
+                .as_slice(),
+            &[7; 32]
+        );
 
         let reset = Frame::new(CommandCode::ResetDevice as u8, Vec::new()).unwrap();
         assert!(restored.execute_inner(admin, &reset).data.is_empty());
-        assert_ne!(restored.device_static_private.as_ref(), &[7; 32]);
+        assert_ne!(
+            restored
+                .device_static_private
+                .serialized()
+                .unwrap()
+                .as_slice(),
+            &[7; 32]
+        );
         assert!(restored.take_persistent_change().unwrap());
         assert_eq!(restored.state_epoch(), 2);
 
@@ -6289,7 +6274,8 @@ mod tests {
         let mut version_two: PersistentState = ciborium::from_reader(current.as_slice()).unwrap();
         version_two.version = 2;
         for object in &mut version_two.objects {
-            object.info.length = version_two_object_length(object)
+            let runtime = ObjectRecord::from_stored(object.clone()).unwrap();
+            object.info.length = version_two_object_length(&runtime)
                 .unwrap()
                 .try_into()
                 .unwrap();

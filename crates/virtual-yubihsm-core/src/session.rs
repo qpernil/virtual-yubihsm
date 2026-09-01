@@ -8,7 +8,7 @@ use crate::{
 use software_key_core::{
     secure_channel::{scp03_cryptogram, scp03_key, x963_kdf_sha256},
     software_key_agreement::derive_with_signing_key,
-    software_signing::{SoftwarePublicKey, SoftwareSigningAlgorithm, SoftwareSigningKey},
+    software_signing::{EcCurve, KeyKind, SoftwarePublicKey, SoftwareSigningKey},
 };
 use subtle::ConstantTimeEq;
 use zeroize::Zeroizing;
@@ -83,15 +83,13 @@ impl SecureSession {
 
     pub(crate) fn begin_asymmetric(
         sid: u8,
-        device_static_private: &[u8; 32],
+        device_static: &SoftwareSigningKey,
         host_static_public: &[u8],
         host_ephemeral_public: &[u8],
     ) -> Result<(Self, [u8; P256_PUBLIC_KEY_LENGTH], [u8; BLOCK_SIZE])> {
-        let device_static = SoftwareSigningKey::from_serialized(
-            SoftwareSigningAlgorithm::EcdsaP256Sha256,
-            device_static_private,
-        )
-        .map_err(|_| DeviceError::InvalidData)?;
+        if device_static.key_kind() != KeyKind::Ec(EcCurve::P256) {
+            return Err(DeviceError::InvalidData);
+        }
         let normalized_host_static = match host_static_public.len() {
             64 => [vec![0x04], host_static_public.to_vec()].concat(),
             65 => host_static_public.to_vec(),
@@ -112,7 +110,7 @@ impl SecureSession {
 
         let ephemeral = derive_with_signing_key(&device_ephemeral, host_ephemeral_public)
             .map_err(|_| DeviceError::InvalidData)?;
-        let static_secret = derive_with_signing_key(&device_static, &normalized_host_static)
+        let static_secret = derive_with_signing_key(device_static, &normalized_host_static)
             .map_err(|_| DeviceError::InvalidData)?;
         let session_keys = x963_session_keys(&ephemeral, &static_secret)?;
         let mut receipt_input = Vec::with_capacity(P256_PUBLIC_KEY_LENGTH * 2);
@@ -227,7 +225,7 @@ impl SecureSession {
 }
 
 pub(crate) fn random_secret_key() -> Result<SoftwareSigningKey> {
-    SoftwareSigningKey::generate(SoftwareSigningAlgorithm::EcdsaP256Sha256)
+    SoftwareSigningKey::generate_for_kind(KeyKind::Ec(EcCurve::P256))
         .map_err(|_| DeviceError::StorageFailed)
 }
 
