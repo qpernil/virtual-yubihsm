@@ -34,6 +34,20 @@ counters, audit policy, and device error mapping. This keeps the cryptography
 shared without making either the HSM protocol or its authorization model a
 dependency of other consumers.
 
+The in-memory object store keeps private asymmetric keys in their typed
+runtime form. Generation and import parse once; RSA CRT precomputation,
+Ed25519 expansion, EC validation, and X25519 construction are therefore not
+repeated by each command. Signing and agreement borrow the stored key directly.
+The static P-256 device identity follows the same rule.
+
+Runtime objects are deliberately distinct from persistence and wrapped-object
+DTOs. A snapshot converts typed keys to the established compact material
+(RSA `p || q`, EC scalar, Ed25519 seed, or X25519 scalar), while wrapped
+asymmetric objects use PKCS#8. Restore decodes every DTO into a typed key and
+rejects the entire image if any key is invalid, before accepting commands.
+Private runtime keys and temporary serialized buffers carry zeroization-on-drop
+guarantees.
+
 The proposed direct, in-process integration of this core as a built-in device
 inside `yubihsmrs-connector` is specified in the
 [built-in connector design](docs/yubihsmrs-connector-integration-design.md).
@@ -136,6 +150,9 @@ and must only be accessible to the worker identity and the administrator.
 Secure sessions and secure-message counters are never serialized. `ResetDevice`
 clears objects, options, audit state and sessions, then reinstalls the factory
 Authentication Key and generates a new static P-256 device identity.
+
+Serialized bytes exist only while reading, writing, importing, or wrapping.
+They are not the authoritative in-memory object representation.
 
 Persistent state retains the latest generation for every numeric object ID seen
 since the last device reset, including deleted objects. The mapping is shared
