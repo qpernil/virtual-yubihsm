@@ -1,8 +1,8 @@
 use crate::{Algorithm, Capability, CapabilitySet, DeviceError, Result};
 use serde::{Deserialize, Serialize};
 use software_key_core::{
-    software_key_agreement::SoftwareX25519Key,
-    software_signing::{EcCurve, KeyKind, SoftwareSigningKey},
+    software_key_agreement::{MontgomeryCurve, SoftwareMontgomeryKey},
+    software_signing::{EcCurve, EdwardsCurve, KeyKind, SoftwareSigningKey},
 };
 use zeroize::{Zeroize, ZeroizeOnDrop};
 
@@ -120,8 +120,8 @@ pub enum ObjectMaterial {
     Authentication(AuthenticationKeyMaterial),
     /// Parsed, validated, and precomputed private signing key used at runtime.
     SigningKey(SoftwareSigningKey),
-    /// Parsed X25519 private key used at runtime.
-    X25519Key(SoftwareX25519Key),
+    /// Parsed Montgomery-curve private key used at runtime.
+    MontgomeryKey(SoftwareMontgomeryKey),
     /// Symmetric, HMAC, and other byte-oriented secret material.
     Secret(Vec<u8>),
     Opaque(Vec<u8>),
@@ -142,11 +142,11 @@ impl ObjectMaterial {
             | Self::Public(value) => value.len(),
             Self::SigningKey(key) => match key.key_kind() {
                 KeyKind::Ec(curve) => ec_private_length(curve),
-                KeyKind::Ed25519 => 32,
+                KeyKind::Edwards(curve) => curve.private_key_length(),
                 KeyKind::Rsa { modulus_bits } => modulus_bits / 8,
                 KeyKind::MlDsa(_) => key.serialized().map_or(0, |value| value.len()),
             },
-            Self::X25519Key(_) => 32,
+            Self::MontgomeryKey(key) => key.serialized().len(),
             Self::OtpAeadKey { key, .. } => key.len(),
         }
     }
@@ -163,7 +163,7 @@ impl PartialEq for ObjectMaterial {
             (Self::SigningKey(a), Self::SigningKey(b)) => {
                 a.key_kind() == b.key_kind() && a.serialized().ok() == b.serialized().ok()
             }
-            (Self::X25519Key(a), Self::X25519Key(b)) => a.serialized() == b.serialized(),
+            (Self::MontgomeryKey(a), Self::MontgomeryKey(b)) => a.serialized() == b.serialized(),
             (Self::Secret(a), Self::Secret(b))
             | (Self::Opaque(a), Self::Opaque(b))
             | (Self::Public(a), Self::Public(b)) => a == b,
@@ -191,7 +191,7 @@ impl Zeroize for ObjectMaterial {
             // Typed private keys clear themselves when their owning wrapper is
             // dropped; they are intentionally never converted back to bytes
             // merely to wipe a temporary representation.
-            Self::SigningKey(_) | Self::X25519Key(_) => {}
+            Self::SigningKey(_) | Self::MontgomeryKey(_) => {}
             Self::Secret(value) | Self::Opaque(value) | Self::Public(value) => value.zeroize(),
             Self::OtpAeadKey { nonce_id, key } => {
                 nonce_id.zeroize();
@@ -272,7 +272,7 @@ impl ObjectRecord {
                 };
                 StoredObjectMaterial::Secret(encoded)
             }
-            ObjectMaterial::X25519Key(key) => {
+            ObjectMaterial::MontgomeryKey(key) => {
                 StoredObjectMaterial::Secret(key.serialized().to_vec())
             }
             ObjectMaterial::Secret(value) => StoredObjectMaterial::Secret(value.clone()),
@@ -387,8 +387,8 @@ impl ObjectRecord {
 fn typed_private_material(info: &ObjectInfo, encoded: &[u8]) -> Result<ObjectMaterial> {
     let algorithm = Algorithm::from_byte(info.algorithm).ok_or(DeviceError::InvalidData)?;
     if algorithm == Algorithm::X25519 {
-        return SoftwareX25519Key::from_serialized(encoded)
-            .map(ObjectMaterial::X25519Key)
+        return SoftwareMontgomeryKey::from_serialized(MontgomeryCurve::X25519, encoded)
+            .map(ObjectMaterial::MontgomeryKey)
             .map_err(|_| DeviceError::InvalidData);
     }
     let key = if algorithm.is_rsa_key() {
@@ -417,7 +417,7 @@ fn key_kind(algorithm: Algorithm) -> Result<KeyKind> {
         Algorithm::EcBrainpoolP256 => KeyKind::Ec(EcCurve::BrainpoolP256),
         Algorithm::EcBrainpoolP384 => KeyKind::Ec(EcCurve::BrainpoolP384),
         Algorithm::EcBrainpoolP512 => KeyKind::Ec(EcCurve::BrainpoolP512),
-        Algorithm::Ed25519 => KeyKind::Ed25519,
+        Algorithm::Ed25519 => KeyKind::Edwards(EdwardsCurve::Ed25519),
         Algorithm::Rsa2048 => KeyKind::Rsa { modulus_bits: 2048 },
         Algorithm::Rsa3072 => KeyKind::Rsa { modulus_bits: 3072 },
         Algorithm::Rsa4096 => KeyKind::Rsa { modulus_bits: 4096 },
