@@ -478,7 +478,7 @@ impl Endpoints {
         }
         let mut output = None;
         let mut input = None;
-        for (entry, file) in record.body[2..].chunks_exact(4).zip(record.files) {
+        for (entry, file) in record.body[2..].as_chunks::<4>().0.iter().zip(record.files) {
             set_nonblocking(&file)?;
             let address = entry[0];
             let transfer_type = entry[1];
@@ -752,6 +752,10 @@ fn required_path(name: &str) -> io::Result<PathBuf> {
         .filter(|value| !value.is_empty())
         .map(PathBuf::from)
         .ok_or_else(|| io::Error::new(io::ErrorKind::NotFound, format!("{name} is not set")))?;
+    require_absolute_path(name, path)
+}
+
+fn require_absolute_path(name: &str, path: PathBuf) -> io::Result<PathBuf> {
     if !path.is_absolute() {
         return invalid(format!("{name} must be an absolute path"));
     }
@@ -777,11 +781,11 @@ mod tests {
     #[test]
     fn rejects_relative_state_directories() {
         let name = "VIRTUAL_YUBIHSM_TEST_STATE_DIRECTORY";
-        env::set_var(name, "relative");
         assert_eq!(
-            required_path(name).unwrap_err().kind(),
+            require_absolute_path(name, PathBuf::from("relative"))
+                .unwrap_err()
+                .kind(),
             io::ErrorKind::InvalidData
         );
-        env::remove_var(name);
     }
 }
