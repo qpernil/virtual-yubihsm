@@ -45,6 +45,24 @@ created object. It does not reset the device or change options. A failed or
 interrupted run can leave temporary objects behind, so use it only on a managed
 qualification target.
 
+The managed crypto scenarios additionally cover:
+
+- the FIPS-197 AES-128, AES-192, and AES-256 ECB known-answer vectors, plus CBC
+  encrypt/decrypt round trips;
+- the RFC 4231 HMAC-SHA-256 known answer, positive verification, and tamper
+  rejection;
+- authenticated `Wrap Data`/`Unwrap Data` and wrapped-object export/delete/
+  import recovery;
+- generation, public-key encoding, DER-signature decoding, and independent
+  verification for every official Weierstrass curve;
+- RSA-2048 PKCS #1 and PSS signatures, PKCS #1 decryption, and OAEP decryption;
+- Ed25519 signing; and
+- two-party P-256 ECDH agreement.
+
+Expected signatures and shared secrets are verified by the independent client
+side using public keys returned over the protocol. AES and HMAC use fixed
+published vectors rather than values produced by the device implementation.
+
 `ephemeral` adds persistent audit configuration and audit-log assertions. It
 proves that Create Session and Authenticate Session can be audited while the
 Session Message meta-command cannot. Because audit entries cannot be removed
@@ -97,8 +115,20 @@ For example, a USB disconnect test should interrupt a normal command exchange,
 wait for the connector to rediscover the target, and then rerun the common
 read-only or managed scenario set.
 
-The next scenario groups are cryptographic known-answer and round-trip tests,
-wrap/import/export formats, force-audit capacity, options, and negative command
-matrices. Physical-hardware observations should be captured as explicit
-expected data or a narrowly documented target exception, never as a branch in
-the virtual implementation itself.
+The next scenario groups are RSA-wrapped import/export, OTP AEAD, attestation,
+asymmetric authentication, remaining options, and negative command matrices.
+Virtual-only X25519 and
+prefixed-ECDH extensions stay outside the physical-hardware profile. Physical
+hardware observations should be captured as explicit expected data or a
+narrowly documented target exception, never as a branch in the virtual
+implementation itself.
+
+## Ownership of tests
+
+Public wire behavior belongs here so the same assertion can run through every
+transport. Once an equivalent qualification scenario is established, the old
+device-side wire test is removed. Unit tests in `virtual-yubihsm-core` remain
+for internal invariants such as authorization helper behavior, global object
+generation history, persistence migrations, canonical wrapped-object CBOR,
+key-material promotion, and size limits that cannot be observed precisely from
+the public protocol.
