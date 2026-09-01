@@ -4,11 +4,15 @@
 //! The same expectations can therefore exercise the in-process virtual core, a
 //! connector-hosted embedded core, a USB-gadget instance, or physical hardware.
 
+use der::Decode;
+use p256::{ecdh::diffie_hellman, elliptic_curve::sec1::ToSec1Point};
 use software_key_core::{
     digest::{HashAlgorithm, hmac},
     secure_channel::{
-        pad_iso7816, scp03_cryptogram, scp03_key, unpad_iso7816, yubico_password_kdf,
+        pad_iso7816, scp03_cryptogram, scp03_key, unpad_iso7816, x963_kdf_sha256,
+        yubico_password_kdf,
     },
+    software_key_agreement::{MontgomeryCurve, SoftwareMontgomeryKey},
     software_signing::{
         EcCurve, EdwardsCurve, SignatureScheme, SoftwarePublicKey, ecdsa_signature_from_der,
     },
@@ -28,6 +32,7 @@ use virtual_yubihsm_core::{
     Algorithm, Capability, CapabilitySet, CommandCode, Device, DeviceConfig, DeviceError, Frame,
     ObjectType,
 };
+use x509_cert::Certificate;
 use zeroize::Zeroizing;
 
 const RESPONSE_BIT: u8 = 0x80;
@@ -279,6 +284,8 @@ pub enum Profile {
     Smoke,
     /// Authenticated checks plus temporary objects which are deleted afterward.
     Managed,
+    /// Managed checks plus project-supported protocol and algorithm additions.
+    Extensions,
     /// Managed checks plus persistent audit-option/log checks; disposable targets only.
     Ephemeral,
 }
@@ -424,6 +431,10 @@ pub fn run(
         })?;
         run_managed(transport, credentials, &mut passed)?;
     }
+    if profile == Profile::Extensions {
+        let credentials = credentials.unwrap();
+        run_extensions(transport, credentials, &mut passed)?;
+    }
     if profile == Profile::Ephemeral {
         let credentials = credentials.unwrap();
         run_ephemeral_audit(transport, credentials, &mut passed)?;
@@ -515,6 +526,20 @@ fn run_managed(
         || authorization_scenario(transport, credentials),
     )?;
 
+    run_case(
+        passed,
+        "asymmetric authentication and session snapshot",
+        || asymmetric_authentication_scenario(transport, credentials),
+    )?;
+
+    run_case(passed, "option inventory and validation", || {
+        option_scenario(transport, credentials)
+    })?;
+
+    run_case(passed, "authenticated negative command matrix", || {
+        negative_command_scenario(transport, credentials)
+    })?;
+
     run_case(passed, "HMAC-SHA-256 known answer and verification", || {
         hmac_scenario(transport, credentials)
     })?;
@@ -535,9 +560,119 @@ fn run_managed(
         rsa_scenario(transport, credentials)
     })?;
 
-    run_case(passed, "Ed25519 signing and P-256 key agreement", || {
+    run_case(passed, "RSA-AES wrapped objects and key material", || {
+        rsa_wrapping_scenario(transport, credentials)
+    })?;
+
+    run_case(passed, "Ed25519 signing and P-256 ECDH", || {
         ed25519_and_ecdh_scenario(transport, credentials)
+    })?;
+
+    run_case(passed, "Yubico OTP AEAD known credential", || {
+        otp_aead_scenario(transport, credentials)
+    })?;
+
+    run_case(passed, "attestation binds the generated public key", || {
+        attestation_scenario(transport, credentials)
     })
+}
+
+fn otp_aead_scenario(transport: &mut dyn FrameTransport, credentials: &Credentials) -> CaseResult {
+    let mut session = SymmetricSession::open(transport, credentials)?;
+    let objects = list_objects(transport, &mut session)?;
+    let id = unused_id(&objects, ObjectType::OtpAeadKey, 0x7b00)?;
+    let capabilities = CapabilitySet::from_capabilities([
+        Capability::CreateOtpAead,
+        Capability::RandomizeOtpAead,
+        Capability::DecryptOtp,
+        Capability::RewrapFromOtpAeadKey,
+        Capability::RewrapToOtpAeadKey,
+    ]);
+    let master_key = (0x80..=0x8f).collect::<Vec<_>>();
+    let response = session.command(
+        transport,
+        put_otp_aead_key(id, capabilities, 0x1234_5678, &master_key),
+    )?;
+    expect_response(&response, CommandCode::PutOtpAeadKey)?;
+    let credential_key = (0..=15).collect::<Vec<_>>();
+    let mut create = id.to_be_bytes().to_vec();
+    create.extend_from_slice(&credential_key);
+    create.extend_from_slice(&[1, 2, 3, 4, 5, 6]);
+    let response = session.command(
+        transport,
+        Frame::new(CommandCode::CreateOtpAead as u8, create).unwrap(),
+    )?;
+    let aead = expect_response(&response, CommandCode::CreateOtpAead)?.to_vec();
+    ensure(aead.len() == 36, "Create OTP AEAD did not return 36 bytes")?;
+    let otp = [
+        0x2f, 0x5d, 0x71, 0xa4, 0x91, 0x5d, 0xec, 0x30, 0x4a, 0xa1, 0x3c, 0xcf, 0x97, 0xbb, 0x0d,
+        0xbb,
+    ];
+    let mut decrypt = id.to_be_bytes().to_vec();
+    decrypt.extend_from_slice(&aead);
+    decrypt.extend_from_slice(&otp);
+    let response = session.command(
+        transport,
+        Frame::new(CommandCode::DecryptOtp as u8, decrypt).unwrap(),
+    )?;
+    ensure(
+        expect_response(&response, CommandCode::DecryptOtp)? == [1, 0, 1, 1, 1, 0],
+        "Decrypt OTP returned unexpected counters",
+    )?;
+    let response = session.command(
+        transport,
+        Frame::new(CommandCode::RandomizeOtpAead as u8, id.to_be_bytes()).unwrap(),
+    )?;
+    ensure(
+        expect_response(&response, CommandCode::RandomizeOtpAead)?.len() == 36,
+        "Randomize OTP AEAD did not return 36 bytes",
+    )?;
+    delete_object(transport, &mut session, id, ObjectType::OtpAeadKey)?;
+    session.close(transport)
+}
+
+fn attestation_scenario(
+    transport: &mut dyn FrameTransport,
+    credentials: &Credentials,
+) -> CaseResult {
+    let mut session = SymmetricSession::open(transport, credentials)?;
+    let objects = list_objects(transport, &mut session)?;
+    let id = unused_id(&objects, ObjectType::AsymmetricKey, 0x7b40)?;
+    let response = session.command(
+        transport,
+        generate_asymmetric_key(
+            id,
+            CapabilitySet::from_capabilities([Capability::SignEcdsa]),
+            Algorithm::EcP256,
+            "qualification attest",
+        ),
+    )?;
+    expect_response(&response, CommandCode::GenerateAsymmetricKey)?;
+    let public = get_public_key(transport, &mut session, id, ObjectType::AsymmetricKey)?;
+    let mut request = id.to_be_bytes().to_vec();
+    request.extend_from_slice(&0_u16.to_be_bytes());
+    let response = session.command(
+        transport,
+        Frame::new(CommandCode::SignAttestationCertificate as u8, request).unwrap(),
+    )?;
+    let certificate = Certificate::from_der(expect_response(
+        &response,
+        CommandCode::SignAttestationCertificate,
+    )?)
+    .map_err(|error| format!("attestation is not a DER certificate: {error}"))?;
+    let certificate_public = certificate
+        .tbs_certificate()
+        .subject_public_key_info()
+        .subject_public_key
+        .raw_bytes();
+    let mut expected_public = vec![0x04];
+    expected_public.extend_from_slice(&public[1..]);
+    ensure(
+        certificate_public == expected_public,
+        "attestation certificate contains a different public key",
+    )?;
+    delete_object(transport, &mut session, id, ObjectType::AsymmetricKey)?;
+    session.close(transport)
 }
 
 fn ec_signing_scenario(
@@ -698,6 +833,190 @@ fn rsa_scenario(transport: &mut dyn FrameTransport, credentials: &Credentials) -
     session.close(transport)
 }
 
+fn rsa_wrapping_scenario(
+    transport: &mut dyn FrameTransport,
+    credentials: &Credentials,
+) -> CaseResult {
+    let mut session = SymmetricSession::open(transport, credentials)?;
+    let mut objects = list_objects(transport, &mut session)?;
+    let private_wrap_id = unused_id(&objects, ObjectType::WrapKey, 0x7a00)?;
+    objects.insert((private_wrap_id, ObjectType::WrapKey));
+    let public_wrap_id = unused_id(&objects, ObjectType::PublicWrapKey, 0x7a10)?;
+    objects.insert((public_wrap_id, ObjectType::PublicWrapKey));
+    let opaque_id = unused_id(&objects, ObjectType::Opaque, 0x7a20)?;
+    objects.insert((opaque_id, ObjectType::Opaque));
+    let ec_id = unused_id(&objects, ObjectType::AsymmetricKey, 0x7a30)?;
+    let opaque_capabilities =
+        CapabilitySet::from_capabilities([Capability::GetOpaque, Capability::ExportableUnderWrap]);
+    let ec_capabilities =
+        CapabilitySet::from_capabilities([Capability::SignEcdsa, Capability::ExportableUnderWrap]);
+    let delegated = CapabilitySet::from_capabilities([
+        Capability::GetOpaque,
+        Capability::SignEcdsa,
+        Capability::ExportableUnderWrap,
+    ]);
+
+    let response = session.command(
+        transport,
+        generate_wrap_key(
+            private_wrap_id,
+            Algorithm::Rsa2048,
+            CapabilitySet::from_capabilities([Capability::ImportWrapped]),
+            delegated,
+            "qualification private wrap",
+        ),
+    )?;
+    expect_response(&response, CommandCode::GenerateWrapKey)?;
+    let private_public = get_public_key(
+        transport,
+        &mut session,
+        private_wrap_id,
+        ObjectType::WrapKey,
+    )?;
+    ensure(
+        private_public.len() == 257 && private_public[0] == Algorithm::Rsa2048 as u8,
+        "RSA private wrap key returned an invalid public key",
+    )?;
+    let response = session.command(
+        transport,
+        put_public_wrap_key(
+            public_wrap_id,
+            Algorithm::Rsa2048,
+            CapabilitySet::from_capabilities([Capability::ExportWrapped]),
+            delegated,
+            &private_public[1..],
+        ),
+    )?;
+    expect_response(&response, CommandCode::PutPublicWrapKey)?;
+
+    let response = session.command(
+        transport,
+        put_opaque(
+            opaque_id,
+            1,
+            opaque_capabilities,
+            "rsa-wrapped-object",
+            b"RSA wrapped qualification object",
+        ),
+    )?;
+    expect_response(&response, CommandCode::PutOpaque)?;
+    let label_digest = HashAlgorithm::Sha256.digest(b"qualification RSA wrap label");
+    let mut export = public_wrap_id.to_be_bytes().to_vec();
+    export.push(ObjectType::Opaque as u8);
+    export.extend_from_slice(&opaque_id.to_be_bytes());
+    export.extend_from_slice(&[
+        Algorithm::Aes256 as u8,
+        Algorithm::RsaOaepSha256 as u8,
+        Algorithm::Mgf1Sha384 as u8,
+    ]);
+    export.extend_from_slice(&label_digest);
+    let response = session.command(
+        transport,
+        Frame::new(CommandCode::ExportRsaWrapped as u8, export).unwrap(),
+    )?;
+    let wrapped_object = expect_response(&response, CommandCode::ExportRsaWrapped)?.to_vec();
+    ensure(
+        wrapped_object.len() > 256,
+        "RSA-wrapped object is too short",
+    )?;
+    delete_object(transport, &mut session, opaque_id, ObjectType::Opaque)?;
+    let mut import = private_wrap_id.to_be_bytes().to_vec();
+    import.extend_from_slice(&[Algorithm::RsaOaepSha256 as u8, Algorithm::Mgf1Sha384 as u8]);
+    import.extend_from_slice(&wrapped_object);
+    import.extend_from_slice(&label_digest);
+    let response = session.command(
+        transport,
+        Frame::new(CommandCode::ImportRsaWrapped as u8, import).unwrap(),
+    )?;
+    ensure(
+        expect_response(&response, CommandCode::ImportRsaWrapped)?
+            == [
+                ObjectType::Opaque as u8,
+                opaque_id.to_be_bytes()[0],
+                opaque_id.to_be_bytes()[1],
+            ],
+        "Import RSA Wrapped returned a different object identity",
+    )?;
+    let response = session.command(
+        transport,
+        Frame::new(CommandCode::GetOpaque as u8, opaque_id.to_be_bytes()).unwrap(),
+    )?;
+    ensure(
+        expect_response(&response, CommandCode::GetOpaque)? == b"RSA wrapped qualification object",
+        "RSA-wrapped object material changed",
+    )?;
+
+    let response = session.command(
+        transport,
+        generate_asymmetric_key(ec_id, ec_capabilities, Algorithm::EcP256, "wrapped ec key"),
+    )?;
+    expect_response(&response, CommandCode::GenerateAsymmetricKey)?;
+    let ec_public = get_public_key(transport, &mut session, ec_id, ObjectType::AsymmetricKey)?;
+    let mut get_wrapped = public_wrap_id.to_be_bytes().to_vec();
+    get_wrapped.push(ObjectType::AsymmetricKey as u8);
+    get_wrapped.extend_from_slice(&ec_id.to_be_bytes());
+    get_wrapped.extend_from_slice(&[
+        Algorithm::Aes256 as u8,
+        Algorithm::RsaOaepSha256 as u8,
+        Algorithm::Mgf1Sha384 as u8,
+    ]);
+    get_wrapped.extend_from_slice(&label_digest);
+    let response = session.command(
+        transport,
+        Frame::new(CommandCode::GetRsaWrappedKey as u8, get_wrapped).unwrap(),
+    )?;
+    let wrapped_key = expect_response(&response, CommandCode::GetRsaWrappedKey)?.to_vec();
+    delete_object(transport, &mut session, ec_id, ObjectType::AsymmetricKey)?;
+
+    let mut put_wrapped = private_wrap_id.to_be_bytes().to_vec();
+    put_wrapped.push(ObjectType::AsymmetricKey as u8);
+    put_wrapped.extend_from_slice(&ec_id.to_be_bytes());
+    put_wrapped.extend_from_slice(b"wrapped ec key");
+    put_wrapped.resize(45, 0);
+    put_wrapped.extend_from_slice(&1_u16.to_be_bytes());
+    put_wrapped.extend_from_slice(&ec_capabilities.to_bytes());
+    put_wrapped.extend_from_slice(&[
+        Algorithm::EcP256 as u8,
+        Algorithm::RsaOaepSha256 as u8,
+        Algorithm::Mgf1Sha384 as u8,
+    ]);
+    put_wrapped.extend_from_slice(&wrapped_key);
+    put_wrapped.extend_from_slice(&label_digest);
+    let response = session.command(
+        transport,
+        Frame::new(CommandCode::PutRsaWrappedKey as u8, put_wrapped).unwrap(),
+    )?;
+    expect_response(&response, CommandCode::PutRsaWrappedKey)?;
+    let digest = HashAlgorithm::Sha256.digest(b"restored RSA-wrapped EC key");
+    let mut sign = ec_id.to_be_bytes().to_vec();
+    sign.extend_from_slice(&digest);
+    let response = session.command(
+        transport,
+        Frame::new(CommandCode::SignEcdsa as u8, sign).unwrap(),
+    )?;
+    let signature =
+        ecdsa_signature_from_der(expect_response(&response, CommandCode::SignEcdsa)?, 32)
+            .map_err(|error| format!("restored EC key returned invalid DER: {error:?}"))?;
+    let mut uncompressed = vec![0x04];
+    uncompressed.extend_from_slice(&ec_public[1..]);
+    SoftwarePublicKey::Ec {
+        curve: EcCurve::P256,
+        uncompressed,
+    }
+    .verify_prehash(SignatureScheme::EcdsaP256Sha256, &digest, &signature)
+    .map_err(|error| format!("restored RSA-wrapped EC key changed: {error:?}"))?;
+
+    for (id, object_type) in [
+        (opaque_id, ObjectType::Opaque),
+        (ec_id, ObjectType::AsymmetricKey),
+        (public_wrap_id, ObjectType::PublicWrapKey),
+        (private_wrap_id, ObjectType::WrapKey),
+    ] {
+        delete_object(transport, &mut session, id, object_type)?;
+    }
+    session.close(transport)
+}
+
 fn ed25519_and_ecdh_scenario(
     transport: &mut dyn FrameTransport,
     credentials: &Credentials,
@@ -770,9 +1089,129 @@ fn ed25519_and_ecdh_scenario(
         first_secret == second_secret && first_secret.len() == 32,
         "P-256 ECDH peers derived different secrets",
     )?;
+
     for id in [ed_id, first_id, second_id] {
         delete_object(transport, &mut session, id, ObjectType::AsymmetricKey)?;
     }
+    session.close(transport)
+}
+
+fn run_extensions(
+    transport: &mut dyn FrameTransport,
+    credentials: &Credentials,
+    passed: &mut Vec<&'static str>,
+) -> Result<(), QualificationError> {
+    run_case(passed, "X25519 key agreement", || {
+        x25519_scenario(transport, credentials)
+    })?;
+    run_case(passed, "prefixed ECDH KDF", || {
+        prefixed_ecdh_kdf_scenario(transport, credentials)
+    })
+}
+
+fn x25519_scenario(transport: &mut dyn FrameTransport, credentials: &Credentials) -> CaseResult {
+    let mut session = SymmetricSession::open(transport, credentials)?;
+    let objects = list_objects(transport, &mut session)?;
+    let id = unused_id(&objects, ObjectType::AsymmetricKey, 0x7980)?;
+    let response = session.command(
+        transport,
+        generate_asymmetric_key(
+            id,
+            CapabilitySet::from_capabilities([Capability::DeriveEcdh]),
+            Algorithm::X25519,
+            "qualification x25519",
+        ),
+    )?;
+    expect_response(&response, CommandCode::GenerateAsymmetricKey)?;
+    let public = get_public_key(transport, &mut session, id, ObjectType::AsymmetricKey)?;
+    ensure(
+        public.len() == 33 && public[0] == Algorithm::X25519 as u8,
+        "X25519 returned an invalid public key",
+    )?;
+    let peer = SoftwareMontgomeryKey::from_serialized(MontgomeryCurve::X25519, &[0x33; 32])
+        .map_err(|error| format!("invalid X25519 qualification peer: {error:?}"))?;
+    let device_secret = derive_x25519(transport, &mut session, id, &peer.public_key())?;
+    let peer_secret = peer
+        .derive(&public[1..])
+        .map_err(|error| format!("independent X25519 derivation failed: {error:?}"))?;
+    ensure(
+        device_secret == *peer_secret && device_secret.len() == 32,
+        "X25519 device and independent peer derived different secrets",
+    )?;
+    delete_object(transport, &mut session, id, ObjectType::AsymmetricKey)?;
+    session.close(transport)
+}
+
+fn prefixed_ecdh_kdf_scenario(
+    transport: &mut dyn FrameTransport,
+    credentials: &Credentials,
+) -> CaseResult {
+    let mut session = SymmetricSession::open(transport, credentials)?;
+    let objects = list_objects(transport, &mut session)?;
+    let id = unused_id(&objects, ObjectType::AsymmetricKey, 0x79a0)?;
+    let response = session.command(
+        transport,
+        generate_asymmetric_key(
+            id,
+            CapabilitySet::from_capabilities([Capability::DeriveEcdhKdf]),
+            Algorithm::EcP256,
+            "qualification prefixed ecdh",
+        ),
+    )?;
+    expect_response(&response, CommandCode::GenerateAsymmetricKey)?;
+    let public = get_public_key(transport, &mut session, id, ObjectType::AsymmetricKey)?;
+    ensure(
+        public.len() == 65 && public[0] == Algorithm::EcP256 as u8,
+        "prefixed ECDH key returned an invalid public key",
+    )?;
+    let peer = p256::SecretKey::from_slice(&[0x44; 32])
+        .map_err(|error| format!("invalid prefixed-ECDH peer key: {error}"))?;
+    let peer_public = peer.public_key().to_sec1_point(false);
+    let device_public = p256::PublicKey::from_sec1_bytes(&[&[0x04], &public[1..]].concat())
+        .map_err(|error| format!("invalid prefixed-ECDH device public key: {error}"))?;
+    let raw_secret = diffie_hellman(peer.to_nonzero_scalar(), device_public.as_affine());
+    let prefix = [0x41; 32];
+    let shared_info = [0x3c, 0x88, 0x10];
+    let mut kdf_input = Vec::with_capacity(prefix.len() + raw_secret.raw_secret_bytes().len());
+    kdf_input.extend_from_slice(&prefix);
+    kdf_input.extend_from_slice(raw_secret.raw_secret_bytes());
+    let expected = x963_kdf_sha256(&kdf_input, &shared_info, 64)
+        .map_err(|error| format!("independent prefixed-ECDH KDF failed: {error:?}"))?;
+    let mut request = id.to_be_bytes().to_vec();
+    request.push(3);
+    request.extend_from_slice(&64_u16.to_be_bytes());
+    for length in [
+        peer_public.as_bytes().len(),
+        prefix.len(),
+        shared_info.len(),
+    ] {
+        request.extend_from_slice(
+            &u16::try_from(length)
+                .map_err(|_| "prefixed-ECDH input length overflow".to_owned())?
+                .to_be_bytes(),
+        );
+    }
+    request.extend_from_slice(peer_public.as_bytes());
+    request.extend_from_slice(&prefix);
+    request.extend_from_slice(&shared_info);
+    let response = session.command(
+        transport,
+        Frame::new(CommandCode::DeriveEcdhKdf as u8, request).unwrap(),
+    )?;
+    ensure(
+        expect_response(&response, CommandCode::DeriveEcdhKdf)? == expected.as_slice(),
+        "prefixed ECDH returned a different KDF result",
+    )?;
+    let response = session.command(
+        transport,
+        Frame::new(
+            CommandCode::DeriveEcdh as u8,
+            [id.to_be_bytes().as_slice(), peer_public.as_bytes()].concat(),
+        )
+        .unwrap(),
+    )?;
+    expect_device_error(&response, DeviceError::InsufficientPermissions)?;
+    delete_object(transport, &mut session, id, ObjectType::AsymmetricKey)?;
     session.close(transport)
 }
 
@@ -1133,6 +1572,188 @@ fn authorization_scenario(
     cleanup_opaque?;
     cleanup_authentication?;
     close
+}
+
+fn asymmetric_authentication_scenario(
+    transport: &mut dyn FrameTransport,
+    credentials: &Credentials,
+) -> CaseResult {
+    let mut admin = SymmetricSession::open(transport, credentials)?;
+    let objects = list_objects(transport, &mut admin)?;
+    let authentication_id = unused_id(&objects, ObjectType::AuthenticationKey, 0x79c0)?;
+    let host_static = p256::SecretKey::from_slice(&[0x11; 32])
+        .map_err(|error| format!("invalid static qualification key: {error}"))?;
+    let host_static_public = host_static.public_key().to_sec1_point(false);
+    let response = admin.command(
+        transport,
+        put_asymmetric_authentication_key(
+            authentication_id,
+            4,
+            CapabilitySet::from_capabilities([Capability::GetPseudoRandom]),
+            CapabilitySet::from_capabilities([Capability::PutOpaque]),
+            &host_static_public.as_bytes()[1..],
+        ),
+    )?;
+    expect_response(&response, CommandCode::PutAuthenticationKey)?;
+
+    let host_ephemeral = p256::SecretKey::from_slice(&[0x22; 32])
+        .map_err(|error| format!("invalid ephemeral qualification key: {error}"))?;
+    let host_ephemeral_public = host_ephemeral.public_key().to_sec1_point(false);
+    let mut create = authentication_id.to_be_bytes().to_vec();
+    create.extend_from_slice(host_ephemeral_public.as_bytes());
+    let response = exchange_frame(
+        transport,
+        Frame::new(CommandCode::CreateSession as u8, create.clone()).unwrap(),
+    )?;
+    let create_response = expect_response(&response, CommandCode::CreateSession)?;
+    ensure(
+        create_response.len() == 82,
+        format!(
+            "asymmetric Create Session returned {} bytes",
+            create_response.len()
+        ),
+    )?;
+    let sid = create_response[0];
+    let device_ephemeral = p256::PublicKey::from_sec1_bytes(&create_response[1..66])
+        .map_err(|error| format!("invalid device ephemeral key: {error}"))?;
+    let ephemeral_secret = diffie_hellman(
+        host_ephemeral.to_nonzero_scalar(),
+        device_ephemeral.as_affine(),
+    );
+    let device_public_response = exchange_frame(
+        transport,
+        Frame::new(CommandCode::GetDevicePublicKey as u8, Vec::new()).unwrap(),
+    )?;
+    let device_public = expect_response(&device_public_response, CommandCode::GetDevicePublicKey)?;
+    let mut device_static_encoded = vec![0x04];
+    device_static_encoded.extend_from_slice(&device_public[1..]);
+    let device_static = p256::PublicKey::from_sec1_bytes(&device_static_encoded)
+        .map_err(|error| format!("invalid device static key: {error}"))?;
+    let static_secret = diffie_hellman(host_static.to_nonzero_scalar(), device_static.as_affine());
+    let mut shared_secret = Vec::with_capacity(64);
+    shared_secret.extend_from_slice(ephemeral_secret.raw_secret_bytes());
+    shared_secret.extend_from_slice(static_secret.raw_secret_bytes());
+    let session_keys = x963_kdf_sha256(&shared_secret, &[0x3c, 0x88, 0x10], 64)
+        .map_err(|error| format!("asymmetric session KDF failed: {error:?}"))?;
+    let mut receipt_input = create_response[1..66].to_vec();
+    receipt_input.extend_from_slice(host_ephemeral_public.as_bytes());
+    let receipt = aes_cmac(&session_keys[..16], &receipt_input)
+        .map_err(|error| format!("asymmetric session receipt failed: {error:?}"))?;
+    ensure(
+        create_response[66..] == receipt,
+        "asymmetric session receipt did not verify",
+    )?;
+    let mut counter = [0; AES_BLOCK_SIZE];
+    counter[AES_BLOCK_SIZE - 1] = 1;
+    let mut asymmetric = SymmetricSession {
+        sid,
+        s_enc: session_keys[16..32].try_into().unwrap(),
+        s_mac: session_keys[32..48].try_into().unwrap(),
+        s_rmac: session_keys[48..64].try_into().unwrap(),
+        counter,
+        command_mac: receipt,
+    };
+    let response = asymmetric.command(
+        transport,
+        Frame::new(CommandCode::GetPseudoRandom as u8, 16_u16.to_be_bytes()).unwrap(),
+    )?;
+    ensure(
+        expect_response(&response, CommandCode::GetPseudoRandom)?.len() == 16,
+        "asymmetric session command returned the wrong length",
+    )?;
+
+    delete_object(
+        transport,
+        &mut admin,
+        authentication_id,
+        ObjectType::AuthenticationKey,
+    )?;
+    let response = asymmetric.command(
+        transport,
+        Frame::new(CommandCode::GetPseudoRandom as u8, 8_u16.to_be_bytes()).unwrap(),
+    )?;
+    ensure(
+        expect_response(&response, CommandCode::GetPseudoRandom)?.len() == 8,
+        "established asymmetric session lost its authorization snapshot",
+    )?;
+    let response = exchange_frame(
+        transport,
+        Frame::new(CommandCode::CreateSession as u8, create).unwrap(),
+    )?;
+    expect_device_error(&response, DeviceError::ObjectNotFound)?;
+    asymmetric.close(transport)?;
+    admin.close(transport)
+}
+
+fn option_scenario(transport: &mut dyn FrameTransport, credentials: &Credentials) -> CaseResult {
+    let mut session = SymmetricSession::open(transport, credentials)?;
+    for (option, expected_shape) in [
+        (OPTION_FORCE_AUDIT, "scalar"),
+        (OPTION_COMMAND_AUDIT, "pairs"),
+        (0x04, "pairs"),
+        (0x05, "scalar"),
+    ] {
+        let response = session.command(
+            transport,
+            Frame::new(CommandCode::GetOption as u8, vec![option]).unwrap(),
+        )?;
+        let value = expect_response(&response, CommandCode::GetOption)?;
+        match expected_shape {
+            "scalar" => ensure(
+                value.len() == 1 && value[0] <= 2,
+                format!("option 0x{option:02x} is not a valid scalar"),
+            )?,
+            "pairs" => ensure(
+                !value.is_empty()
+                    && value.len().is_multiple_of(2)
+                    && value.as_chunks::<2>().0.iter().all(|pair| pair[1] <= 2),
+                format!("option 0x{option:02x} is not a valid pair list"),
+            )?,
+            _ => unreachable!(),
+        }
+        if option == OPTION_COMMAND_AUDIT {
+            ensure(
+                value
+                    .as_chunks::<2>()
+                    .0
+                    .iter()
+                    .find(|pair| pair[0] == CommandCode::SessionMessage as u8)
+                    .is_none_or(|pair| pair[1] == 0),
+                "Session Message was enabled in the command-audit option",
+            )?;
+        }
+    }
+    let response = session.command(
+        transport,
+        Frame::new(CommandCode::GetOption as u8, vec![0xff]).unwrap(),
+    )?;
+    expect_device_error(&response, DeviceError::InvalidData)?;
+    session.close(transport)
+}
+
+fn negative_command_scenario(
+    transport: &mut dyn FrameTransport,
+    credentials: &Credentials,
+) -> CaseResult {
+    let mut session = SymmetricSession::open(transport, credentials)?;
+    for (command, data, expected) in [
+        (
+            CommandCode::GetPseudoRandom,
+            vec![],
+            DeviceError::WrongLength,
+        ),
+        (CommandCode::GetOption, vec![], DeviceError::WrongLength),
+        (CommandCode::ListObjects, vec![1], DeviceError::WrongLength),
+        (
+            CommandCode::GetObjectInfo,
+            vec![0, 1],
+            DeviceError::WrongLength,
+        ),
+    ] {
+        let response = session.command(transport, Frame::new(command as u8, data).unwrap())?;
+        expect_device_error(&response, expected)?;
+    }
+    session.close(transport)
 }
 
 fn run_ephemeral_audit(
@@ -1610,6 +2231,21 @@ fn derive_ecdh(
     expect_response(&response, CommandCode::DeriveEcdh).map(<[u8]>::to_vec)
 }
 
+fn derive_x25519(
+    transport: &mut dyn FrameTransport,
+    session: &mut SymmetricSession,
+    id: u16,
+    peer_public: &[u8],
+) -> CaseResult<Vec<u8>> {
+    let mut data = id.to_be_bytes().to_vec();
+    data.extend_from_slice(peer_public);
+    let response = session.command(
+        transport,
+        Frame::new(CommandCode::DeriveEcdh as u8, data).unwrap(),
+    )?;
+    expect_response(&response, CommandCode::DeriveEcdh).map(<[u8]>::to_vec)
+}
+
 fn put_wrap_key(
     id: u16,
     algorithm: Algorithm,
@@ -1628,6 +2264,53 @@ fn put_wrap_key(
     Frame::new(CommandCode::PutWrapKey as u8, data).unwrap()
 }
 
+fn generate_wrap_key(
+    id: u16,
+    algorithm: Algorithm,
+    capabilities: CapabilitySet,
+    delegated_capabilities: CapabilitySet,
+    label: &str,
+) -> Frame {
+    let mut data = id.to_be_bytes().to_vec();
+    data.extend_from_slice(label.as_bytes());
+    data.resize(42, 0);
+    data.extend_from_slice(&1_u16.to_be_bytes());
+    data.extend_from_slice(&capabilities.to_bytes());
+    data.push(algorithm as u8);
+    data.extend_from_slice(&delegated_capabilities.to_bytes());
+    Frame::new(CommandCode::GenerateWrapKey as u8, data).unwrap()
+}
+
+fn put_public_wrap_key(
+    id: u16,
+    algorithm: Algorithm,
+    capabilities: CapabilitySet,
+    delegated_capabilities: CapabilitySet,
+    modulus: &[u8],
+) -> Frame {
+    let mut data = id.to_be_bytes().to_vec();
+    data.extend_from_slice(b"qualification public wrap");
+    data.resize(42, 0);
+    data.extend_from_slice(&1_u16.to_be_bytes());
+    data.extend_from_slice(&capabilities.to_bytes());
+    data.push(algorithm as u8);
+    data.extend_from_slice(&delegated_capabilities.to_bytes());
+    data.extend_from_slice(modulus);
+    Frame::new(CommandCode::PutPublicWrapKey as u8, data).unwrap()
+}
+
+fn put_otp_aead_key(id: u16, capabilities: CapabilitySet, nonce_id: u32, key: &[u8]) -> Frame {
+    let mut data = id.to_be_bytes().to_vec();
+    data.extend_from_slice(b"qualification otp");
+    data.resize(42, 0);
+    data.extend_from_slice(&1_u16.to_be_bytes());
+    data.extend_from_slice(&capabilities.to_bytes());
+    data.push(Algorithm::Aes128YubicoOtp as u8);
+    data.extend_from_slice(&nonce_id.to_le_bytes());
+    data.extend_from_slice(key);
+    Frame::new(CommandCode::PutOtpAeadKey as u8, data).unwrap()
+}
+
 fn put_authentication_key(
     id: u16,
     domains: u16,
@@ -1643,6 +2326,24 @@ fn put_authentication_key(
     data.push(AUTHENTICATION_ALGORITHM_AES128_YUBICO);
     data.extend_from_slice(&delegated_capabilities.to_bytes());
     data.extend_from_slice(static_keys);
+    Frame::new(CommandCode::PutAuthenticationKey as u8, data).unwrap()
+}
+
+fn put_asymmetric_authentication_key(
+    id: u16,
+    domains: u16,
+    capabilities: CapabilitySet,
+    delegated_capabilities: CapabilitySet,
+    public_key: &[u8],
+) -> Frame {
+    let mut data = id.to_be_bytes().to_vec();
+    data.extend_from_slice(b"qualification asymmetric auth");
+    data.resize(42, 0);
+    data.extend_from_slice(&domains.to_be_bytes());
+    data.extend_from_slice(&capabilities.to_bytes());
+    data.push(Algorithm::EcP256YubicoAuthentication as u8);
+    data.extend_from_slice(&delegated_capabilities.to_bytes());
+    data.extend_from_slice(public_key);
     Frame::new(CommandCode::PutAuthenticationKey as u8, data).unwrap()
 }
 
@@ -1674,7 +2375,16 @@ mod tests {
         let credentials = Credentials::from_password(1, b"password");
         let report = run(&mut transport, Profile::Ephemeral, Some(&credentials)).unwrap();
         assert_eq!(report.identity.serial, DeviceConfig::default().serial);
-        assert_eq!(report.passed.len(), 16);
+        assert_eq!(report.passed.len(), 22);
+        assert_eq!(transport.device().active_session_count(), 0);
+    }
+
+    #[test]
+    fn factory_core_passes_the_extension_profile() {
+        let mut transport = InProcessTransport::factory_default();
+        let credentials = Credentials::from_password(1, b"password");
+        let report = run(&mut transport, Profile::Extensions, Some(&credentials)).unwrap();
+        assert_eq!(report.passed.len(), 22);
         assert_eq!(transport.device().active_session_count(), 0);
     }
 

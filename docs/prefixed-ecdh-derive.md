@@ -2,8 +2,8 @@
 
 ## Status and purpose
 
-The virtual YubiHSM implements a `DeriveEcdhKdf` extension command. A future
-PKCS11RS provider mechanism maps directly onto this command:
+The virtual YubiHSM implements a `DeriveEcdhKdf` extension command. The
+PKCS11RS provider maps this directly to:
 
 ```text
 CKM_PKCS11RS_PREFIXED_ECDH_DERIVE
@@ -55,9 +55,9 @@ typedef struct CK_PKCS11RS_PREFIXED_ECDH_DERIVE_PARAMS {
 
 The mechanism is used through `C_DeriveKey`. The base object is the HSM-held
 private key. The output length and output key type come from the ordinary
-derived-key template. The initial provider implementation should accept the
-same ANSI X9.63 `CKD_*_KDF` values as `CKM_ECDH1_DERIVE`, but must reject
-`CKD_NULL` and the differently ordered SP 800-56A variants.
+derived-key template. The provider accepts the same ANSI X9.63 `CKD_*_KDF`
+values as `CKM_ECDH1_DERIVE`, but rejects `CKD_NULL` and the differently
+ordered SP 800-56A variants.
 
 The mechanism is vendor-qualified and intentionally does not contain `ECDH1`,
 `ECDH2`, or `ECDH3`. Those names could incorrectly imply compatibility with
