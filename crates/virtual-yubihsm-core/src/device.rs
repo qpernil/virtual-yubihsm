@@ -22,8 +22,10 @@ use software_key_core::{
     digest::{x963_kdf, HashAlgorithm},
     rsa_signing::RsaHashAlgorithm,
     secure_channel::yubico_password_kdf,
-    software_key_agreement::{derive_with_signing_key, SoftwareX25519Key},
-    software_signing::{EcCurve, KeyKind, SignatureScheme, SoftwarePublicKey, SoftwareSigningKey},
+    software_key_agreement::{derive_with_signing_key, MontgomeryCurve, SoftwareMontgomeryKey},
+    software_signing::{
+        EcCurve, EdwardsCurve, KeyKind, SignatureScheme, SoftwarePublicKey, SoftwareSigningKey,
+    },
     software_symmetric::{
         decrypt_aes_cbc, decrypt_aes_ccm, decrypt_aes_ecb, decrypt_yubico_otp_aead,
         encrypt_aes_cbc, encrypt_aes_ccm, encrypt_aes_ecb, encrypt_yubico_otp_aead, unwrap_aes_kwp,
@@ -173,9 +175,9 @@ struct AttestationProfile {
 }
 
 #[derive(Clone)]
-struct P256CertificateVerifyingKey(Vec<u8>);
+struct CertificateVerifyingKey(Vec<u8>);
 
-impl spki::EncodePublicKey for P256CertificateVerifyingKey {
+impl spki::EncodePublicKey for CertificateVerifyingKey {
     fn to_public_key_der(&self) -> spki::Result<spki::Document> {
         let encoded = ec_subject_public_key_info(EcCurve::P256, &self.0)
             .map_err(|_| spki::Error::KeyMalformed)?
@@ -184,12 +186,12 @@ impl spki::EncodePublicKey for P256CertificateVerifyingKey {
     }
 }
 
-struct P256CertificateSigner {
+struct CertificateSigner {
     key: SoftwareSigningKey,
-    verifying_key: P256CertificateVerifyingKey,
+    verifying_key: CertificateVerifyingKey,
 }
 
-impl P256CertificateSigner {
+impl CertificateSigner {
     fn from_key(key: &SoftwareSigningKey) -> Result<Self> {
         let SoftwarePublicKey::Ec {
             curve: EcCurve::P256,
@@ -200,20 +202,20 @@ impl P256CertificateSigner {
         };
         Ok(Self {
             key: key.clone(),
-            verifying_key: P256CertificateVerifyingKey(uncompressed),
+            verifying_key: CertificateVerifyingKey(uncompressed),
         })
     }
 }
 
-impl Keypair for P256CertificateSigner {
-    type VerifyingKey = P256CertificateVerifyingKey;
+impl Keypair for CertificateSigner {
+    type VerifyingKey = CertificateVerifyingKey;
 
     fn verifying_key(&self) -> Self::VerifyingKey {
         self.verifying_key.clone()
     }
 }
 
-impl DynSignatureAlgorithmIdentifier for P256CertificateSigner {
+impl DynSignatureAlgorithmIdentifier for CertificateSigner {
     fn signature_algorithm_identifier(&self) -> spki::Result<AlgorithmIdentifierOwned> {
         Ok(AlgorithmIdentifierOwned {
             oid: ObjectIdentifier::new_unwrap("1.2.840.10045.4.3.2"),
@@ -222,23 +224,23 @@ impl DynSignatureAlgorithmIdentifier for P256CertificateSigner {
     }
 }
 
-struct P256CertificateSignature(Vec<u8>);
+struct CertificateSignature(Vec<u8>);
 
-impl SignatureBitStringEncoding for P256CertificateSignature {
+impl SignatureBitStringEncoding for CertificateSignature {
     fn to_bitstring(&self) -> der::Result<BitString> {
         BitString::from_bytes(&self.0)
     }
 }
 
-impl Signer<P256CertificateSignature> for P256CertificateSigner {
+impl Signer<CertificateSignature> for CertificateSigner {
     fn try_sign(
         &self,
         message: &[u8],
-    ) -> core::result::Result<P256CertificateSignature, signature::Error> {
+    ) -> core::result::Result<CertificateSignature, signature::Error> {
         self.key
             .sign_message(SignatureScheme::EcdsaP256Sha256, message)
             .and_then(|signature| signature.to_ecdsa_der(EcCurve::P256))
-            .map(P256CertificateSignature)
+            .map(CertificateSignature)
             .map_err(|_| signature::Error::new())
     }
 }
@@ -1722,7 +1724,14 @@ impl Device {
                 SoftwarePublicKey::Ec { uncompressed, .. } => {
                     output.extend_from_slice(&uncompressed[1..]);
                 }
-                SoftwarePublicKey::Ed25519(public) => output.extend_from_slice(&public),
+                SoftwarePublicKey::Edwards {
+                    curve: EdwardsCurve::Ed25519,
+                    public_key,
+                } => output.extend_from_slice(&public_key),
+                SoftwarePublicKey::Edwards {
+                    curve: EdwardsCurve::Ed448,
+                    ..
+                } => return Err(DeviceError::InvalidData),
                 SoftwarePublicKey::Rsa { modulus, .. } => output.extend_from_slice(&modulus),
                 SoftwarePublicKey::MlDsa { public_key, .. } => {
                     output.extend_from_slice(&public_key)
@@ -1788,7 +1797,7 @@ impl Device {
                 format!("CN=Virtual YubiHSM Attestation Key {attesting_id}"),
             )
         };
-        let signer = P256CertificateSigner::from_key(attesting_private)?;
+        let signer = CertificateSigner::from_key(attesting_private)?;
         let mut subject = Name::from_str(&format!("CN=Virtual YubiHSM Key {target_id}"))
             .map_err(|_| DeviceError::InvalidData)?;
         let mut issuer = Name::from_str(&issuer).map_err(|_| DeviceError::InvalidData)?;
@@ -1839,7 +1848,7 @@ impl Device {
         )
         .map_err(|_| DeviceError::InvalidData)?;
         let certificate = builder
-            .build::<_, P256CertificateSignature>(&signer)
+            .build::<_, CertificateSignature>(&signer)
             .map_err(|_| DeviceError::StorageFailed)?;
         certificate.to_der().map_err(|_| DeviceError::StorageFailed)
     }
@@ -3052,14 +3061,16 @@ fn asymmetric_key_material(
     }
     if algorithm == Algorithm::X25519 {
         let key = if generate {
-            SoftwareX25519Key::generate().map_err(|_| DeviceError::StorageFailed)?
+            SoftwareMontgomeryKey::generate(MontgomeryCurve::X25519)
+                .map_err(|_| DeviceError::StorageFailed)?
         } else {
             if supplied.len() != expected_length {
                 return Err(DeviceError::WrongLength);
             }
-            SoftwareX25519Key::from_serialized(supplied).map_err(|_| DeviceError::InvalidData)?
+            SoftwareMontgomeryKey::from_serialized(MontgomeryCurve::X25519, supplied)
+                .map_err(|_| DeviceError::InvalidData)?
         };
-        return Ok(ObjectMaterial::X25519Key(key));
+        return Ok(ObjectMaterial::MontgomeryKey(key));
     }
     if algorithm.is_rsa_key() {
         let key = if generate {
@@ -3103,7 +3114,7 @@ fn asymmetric_key_kind(algorithm: Algorithm) -> Result<KeyKind> {
         Algorithm::EcBrainpoolP256 => KeyKind::Ec(EcCurve::BrainpoolP256),
         Algorithm::EcBrainpoolP384 => KeyKind::Ec(EcCurve::BrainpoolP384),
         Algorithm::EcBrainpoolP512 => KeyKind::Ec(EcCurve::BrainpoolP512),
-        Algorithm::Ed25519 => KeyKind::Ed25519,
+        Algorithm::Ed25519 => KeyKind::Edwards(EdwardsCurve::Ed25519),
         Algorithm::Rsa2048 => KeyKind::Rsa { modulus_bits: 2048 },
         Algorithm::Rsa3072 => KeyKind::Rsa { modulus_bits: 3072 },
         Algorithm::Rsa4096 => KeyKind::Rsa { modulus_bits: 4096 },
@@ -3179,14 +3190,21 @@ fn object_subject_public_key_info(object: &ObjectRecord) -> Result<SubjectPublic
             curve,
             uncompressed,
         } => ec_subject_public_key_info(curve, &uncompressed),
-        SoftwarePublicKey::Ed25519(public) => Ok(SubjectPublicKeyInfoOwned {
+        SoftwarePublicKey::Edwards {
+            curve: EdwardsCurve::Ed25519,
+            public_key,
+        } => Ok(SubjectPublicKeyInfoOwned {
             algorithm: AlgorithmIdentifierOwned {
                 oid: ObjectIdentifier::new_unwrap("1.3.101.112"),
                 parameters: None,
             },
-            subject_public_key: BitString::from_bytes(&public)
+            subject_public_key: BitString::from_bytes(&public_key)
                 .map_err(|_| DeviceError::InvalidData)?,
         }),
+        SoftwarePublicKey::Edwards {
+            curve: EdwardsCurve::Ed448,
+            ..
+        } => Err(DeviceError::InvalidData),
         SoftwarePublicKey::Rsa { modulus, exponent } => {
             let public = RsaPublicKey::new(
                 BigUint::from_bytes_be(&modulus),
@@ -3263,13 +3281,16 @@ fn rsa_key(object: &ObjectRecord) -> Result<&SoftwareSigningKey> {
     signing_key(object)
 }
 
-fn x25519_key(object: &ObjectRecord) -> Result<&SoftwareX25519Key> {
+fn x25519_key(object: &ObjectRecord) -> Result<&SoftwareMontgomeryKey> {
     if object.info.algorithm != Algorithm::X25519 as u8 {
         return Err(DeviceError::InvalidData);
     }
-    let ObjectMaterial::X25519Key(key) = &object.material else {
+    let ObjectMaterial::MontgomeryKey(key) = &object.material else {
         return Err(DeviceError::InvalidData);
     };
+    if key.curve() != MontgomeryCurve::X25519 {
+        return Err(DeviceError::InvalidData);
+    }
     Ok(key)
 }
 
@@ -3335,7 +3356,8 @@ struct Rfc8410PrivateKeyInfo {
 
 fn x25519_pkcs8(secret: &[u8]) -> Result<Vec<u8>> {
     let secret: [u8; 32] = secret.try_into().map_err(|_| DeviceError::InvalidData)?;
-    SoftwareX25519Key::from_serialized(&secret).map_err(|_| DeviceError::InvalidData)?;
+    SoftwareMontgomeryKey::from_serialized(MontgomeryCurve::X25519, &secret)
+        .map_err(|_| DeviceError::InvalidData)?;
     let inner = OctetString::new(secret.to_vec())
         .map_err(|_| DeviceError::InvalidData)?
         .to_der()
@@ -3364,7 +3386,8 @@ fn x25519_from_pkcs8(encoded: &[u8]) -> Result<Vec<u8>> {
         .map_err(|_| DeviceError::InvalidData)?
         .as_bytes()
         .to_vec();
-    SoftwareX25519Key::from_serialized(&secret).map_err(|_| DeviceError::InvalidData)?;
+    SoftwareMontgomeryKey::from_serialized(MontgomeryCurve::X25519, &secret)
+        .map_err(|_| DeviceError::InvalidData)?;
     Ok(secret)
 }
 
@@ -3381,8 +3404,8 @@ fn asymmetric_pkcs8(object: &ObjectRecord) -> Result<Vec<u8>> {
 fn asymmetric_material_from_pkcs8(algorithm: Algorithm, encoded: &[u8]) -> Result<ObjectMaterial> {
     if algorithm == Algorithm::X25519 {
         let serialized = x25519_from_pkcs8(encoded)?;
-        return SoftwareX25519Key::from_serialized(&serialized)
-            .map(ObjectMaterial::X25519Key)
+        return SoftwareMontgomeryKey::from_serialized(MontgomeryCurve::X25519, &serialized)
+            .map(ObjectMaterial::MontgomeryKey)
             .map_err(|_| DeviceError::InvalidData);
     }
     let key = SoftwareSigningKey::from_pkcs8_der_for_kind(asymmetric_key_kind(algorithm)?, encoded)
@@ -3431,7 +3454,9 @@ fn validate_wrapped_object(object: &ObjectRecord) -> Result<()> {
                         |private| private.len(),
                     ))
         }
-        (ObjectType::AsymmetricKey, ObjectMaterial::X25519Key(_)) => algorithm == Algorithm::X25519,
+        (ObjectType::AsymmetricKey, ObjectMaterial::MontgomeryKey(_)) => {
+            algorithm == Algorithm::X25519
+        }
         (ObjectType::WrapKey, ObjectMaterial::SigningKey(value)) if algorithm.is_rsa_key() => {
             matches!(value, SoftwareSigningKey::Rsa(_))
         }
@@ -3473,7 +3498,7 @@ fn validate_wrapped_object(object: &ObjectRecord) -> Result<()> {
 fn wrapped_material(object: &ObjectRecord) -> Result<CborValue> {
     let (kind, values) = match (&object.info.object_type, &object.material) {
         (ObjectType::AsymmetricKey, ObjectMaterial::SigningKey(_))
-        | (ObjectType::AsymmetricKey, ObjectMaterial::X25519Key(_))
+        | (ObjectType::AsymmetricKey, ObjectMaterial::MontgomeryKey(_))
         | (ObjectType::WrapKey, ObjectMaterial::SigningKey(_))
             if Algorithm::from_byte(object.info.algorithm).is_some_and(Algorithm::is_rsa_key)
                 || object.info.object_type == ObjectType::AsymmetricKey =>
