@@ -53,15 +53,29 @@ The managed crypto scenarios additionally cover:
   rejection;
 - authenticated `Wrap Data`/`Unwrap Data` and wrapped-object export/delete/
   import recovery;
+- RSA-AES object export/import and PKCS #8 key-material recovery through public
+  and private RSA wrap keys;
 - generation, public-key encoding, DER-signature decoding, and independent
   verification for every official Weierstrass curve;
 - RSA-2048 PKCS #1 and PSS signatures, PKCS #1 decryption, and OAEP decryption;
-- Ed25519 signing; and
-- two-party P-256 ECDH agreement.
+- Ed25519 signing and two-party P-256 ECDH agreement;
+- the official Yubico OTP credential vector, AEAD creation, decryption, and
+  randomization;
+- attestation-certificate DER parsing and binding to the generated target key;
+- asymmetric P-256 session authentication, receipt verification, and the
+  authorization snapshot retained by an established session;
+- non-mutating reads of every standard option and rejection of invalid options;
+  and
+- a negative matrix for malformed authenticated commands.
 
 Expected signatures and shared secrets are verified by the independent client
 side using public keys returned over the protocol. AES and HMAC use fixed
 published vectors rather than values produced by the device implementation.
+
+`extensions` adds X25519 agreement against an independently implemented peer
+and prefixed ECDH with an independently calculated X9.63 KDF result. It includes
+the complete `managed` profile first, but keeps additions outside the standard
+command set visibly separate.
 
 `ephemeral` adds persistent audit configuration and audit-log assertions. It
 proves that Create Session and Authenticate Session can be audited while the
@@ -96,6 +110,9 @@ cargo run -p yubihsm-qualification -- \
   connector http://127.0.0.1:12345 12345678 managed
 ```
 
+Use `extensions` instead of `managed` to include the additional command and
+algorithm checks.
+
 The current HTTP adapter intentionally accepts only plain `http://`. Run it on
 loopback or a private test network. TLS and mutual-TLS policy are connector
 tests, while this suite qualifies the YubiHSM frame behavior behind the HTTP
@@ -115,11 +132,8 @@ For example, a USB disconnect test should interrupt a normal command exchange,
 wait for the connector to rediscover the target, and then rerun the common
 read-only or managed scenario set.
 
-The next scenario groups are RSA-wrapped import/export, OTP AEAD, attestation,
-asymmetric authentication, remaining options, and negative command matrices.
-Virtual-only X25519 and
-prefixed-ECDH extensions stay outside the physical-hardware profile. Physical
-hardware observations should be captured as explicit expected data or a
+X25519 and the prefixed-ECDH KDF command belong to the explicit extension
+profile. Target observations should be captured as explicit expected data or a
 narrowly documented target exception, never as a branch in the virtual
 implementation itself.
 

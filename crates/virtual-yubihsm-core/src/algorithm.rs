@@ -1,7 +1,7 @@
 /// Algorithm identifiers from the YubiHSM 2 protocol.
 ///
-/// `X25519` and `EcdhKdf` are virtual-device extensions. The official registry
-/// currently ends at `AesKwp`.
+/// The published registry ends at `AesKwp`. `X25519` and `EcdhKdf` are
+/// project-supported additions.
 #[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
 #[repr(u8)]
 pub enum Algorithm {
@@ -210,7 +210,7 @@ mod tests {
     use super::*;
 
     #[test]
-    fn official_registry_is_contiguous_and_x25519_is_the_first_extension() {
+    fn published_registry_is_contiguous_before_x25519() {
         assert_eq!(Algorithm::OFFICIAL.len(), 55);
         for (index, algorithm) in Algorithm::OFFICIAL.into_iter().enumerate() {
             assert_eq!(algorithm as usize, index + 1);
