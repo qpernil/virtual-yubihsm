@@ -1,0 +1,17 @@
+[package]
+name = "yubihsm-qualification"
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.94"
+description = "Transport-independent qualification scenarios for YubiHSM-compatible devices"
+license = "MIT OR Apache-2.0"
+publish = false
+
+[dependencies]
+software-key-core = { workspace = true }
+virtual-yubihsm-core = { path = "../virtual-yubihsm-core" }
+zeroize = "1.9.0"
+
+[[bin]]
+name = "yubihsm-qualification"
+path = "src/main.rs"

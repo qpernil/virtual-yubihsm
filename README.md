@@ -278,6 +278,20 @@ cargo test --workspace
 cargo clippy --workspace --all-targets -- -D warnings
 ```
 
+The workspace also contains a transport-independent qualification runner. It
+uses complete encoded YubiHSM frames and can run the same scenarios directly
+against `virtual-yubihsm-core` or through a `pkcs11rs-connector` serving an
+embedded core, the USB gadget, or physical hardware:
+
+```sh
+cargo run -p yubihsm-qualification -- core
+cargo run -p yubihsm-qualification -- \
+  connector http://127.0.0.1:12345 SERIAL smoke
+```
+
+See [YubiHSM qualification](docs/qualification.md) for the target matrix,
+managed profile, safety boundaries, and extension rules.
+
 The factory Authentication Key is object ID 1, all capabilities, all delegated
 capabilities and all domains. Its compatibility password is `password`; change
 or delete it before connecting the core to any persistent deployment.
