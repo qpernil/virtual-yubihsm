@@ -1,35 +1,35 @@
 use crate::object::StoredObjectRecord;
 use crate::{
-    session::{
-        random_secret_key, secure_response_data_fits, secure_response_fits, SecureSession,
-        SessionEntry, AUTHENTICATION_ALGORITHM_AES128_YUBICO, AUTHENTICATION_ALGORITHM_EC_P256,
-        CHALLENGE_LENGTH, P256_PUBLIC_KEY_LENGTH,
-    },
     Algorithm, AuthenticationKeyMaterial, Capability, CapabilitySet, CommandCode, DeviceError,
     Frame, ObjectInfo, ObjectKey, ObjectMaterial, ObjectRecord, ObjectType, Result,
     SessionAuthorization,
+    session::{
+        AUTHENTICATION_ALGORITHM_AES128_YUBICO, AUTHENTICATION_ALGORITHM_EC_P256, CHALLENGE_LENGTH,
+        P256_PUBLIC_KEY_LENGTH, SecureSession, SessionEntry, random_secret_key,
+        secure_response_data_fits, secure_response_fits,
+    },
 };
 use ciborium::Value as CborValue;
 use const_oid::ObjectIdentifier;
 use der::{
-    asn1::{Any, BitString, OctetString},
     Decode, Encode, Sequence,
+    asn1::{Any, BitString, OctetString},
 };
-use rsa::{pkcs8::EncodePublicKey as EncodeRsaPublicKey, BigUint, RsaPublicKey};
+use rsa::{BigUint, RsaPublicKey, pkcs8::EncodePublicKey as EncodeRsaPublicKey};
 use serde::{Deserialize, Serialize};
 use signature::{Keypair, Signer};
 use software_key_core::{
-    digest::{x963_kdf, HashAlgorithm},
+    digest::{HashAlgorithm, x963_kdf},
     rsa_signing::RsaHashAlgorithm,
     secure_channel::yubico_password_kdf,
-    software_key_agreement::{derive_with_signing_key, MontgomeryCurve, SoftwareMontgomeryKey},
+    software_key_agreement::{MontgomeryCurve, SoftwareMontgomeryKey, derive_with_signing_key},
     software_signing::{
         EcCurve, EdwardsCurve, KeyKind, SignatureScheme, SoftwarePublicKey, SoftwareSigningKey,
     },
     software_symmetric::{
-        decrypt_aes_cbc, decrypt_aes_ccm, decrypt_aes_ecb, decrypt_yubico_otp_aead,
-        encrypt_aes_cbc, encrypt_aes_ccm, encrypt_aes_ecb, encrypt_yubico_otp_aead, unwrap_aes_kwp,
-        wrap_aes_kwp, AES_BLOCK_SIZE, AES_CCM_NONCE_SIZE, AES_CCM_TAG_SIZE,
+        AES_BLOCK_SIZE, AES_CCM_NONCE_SIZE, AES_CCM_TAG_SIZE, decrypt_aes_cbc, decrypt_aes_ccm,
+        decrypt_aes_ecb, decrypt_yubico_otp_aead, encrypt_aes_cbc, encrypt_aes_ccm,
+        encrypt_aes_ecb, encrypt_yubico_otp_aead, unwrap_aes_kwp, wrap_aes_kwp,
     },
 };
 use spki::{
@@ -40,11 +40,11 @@ use std::{collections::BTreeMap, io::Cursor};
 use std::{str::FromStr, time::Duration};
 use subtle::ConstantTimeEq;
 use x509_cert::{
-    builder::{profile::BuilderProfile, Builder, CertificateBuilder},
+    builder::{Builder, CertificateBuilder, profile::BuilderProfile},
     certificate::TbsCertificate,
     ext::{
-        pkix::{BasicConstraints, KeyUsage, KeyUsages},
         Extension, ToExtension,
+        pkix::{BasicConstraints, KeyUsage, KeyUsages},
     },
     name::Name,
     serial_number::SerialNumber,
@@ -1367,11 +1367,11 @@ impl Device {
                 set_option_value(&mut self.options.force_audit, value)?;
             }
             OPTION_COMMAND_AUDIT => {
-                if values.is_empty() || values.len() % 2 != 0 {
+                if values.is_empty() || !values.len().is_multiple_of(2) {
                     return Err(DeviceError::WrongLength);
                 }
                 let mut updated = self.options.command_audit.clone();
-                for pair in values.chunks_exact(2) {
+                for pair in values.as_chunks::<2>().0 {
                     let Some(command) = CommandCode::from_byte(pair[0]) else {
                         return Err(DeviceError::InvalidData);
                     };
@@ -1390,11 +1390,11 @@ impl Device {
             }
             OPTION_ALGORITHM_TOGGLE => {
                 self.require_fresh_device_for_algorithm_options()?;
-                if values.is_empty() || values.len() % 2 != 0 {
+                if values.is_empty() || !values.len().is_multiple_of(2) {
                     return Err(DeviceError::WrongLength);
                 }
                 let mut updated = self.options.algorithm_toggle.clone();
-                for pair in values.chunks_exact(2) {
+                for pair in values.as_chunks::<2>().0 {
                     if !self.config.algorithms.contains(&pair[0]) || !valid_option_value(pair[1]) {
                         return Err(DeviceError::InvalidData);
                     }
@@ -1804,26 +1804,26 @@ impl Device {
         let mut validity = Validity::from_now(Duration::from_secs(10 * 365 * 86_400))
             .map_err(|_| DeviceError::StorageFailed)?;
         let mut template_extensions = Vec::new();
-        if attesting_id != 0 {
-            if let Some(template) = self.objects.get(&ObjectKey {
+        if attesting_id != 0
+            && let Some(template) = self.objects.get(&ObjectKey {
                 object_type: ObjectType::Opaque,
                 id: attesting_id,
-            }) {
-                authorization.require_visible(&template.info)?;
-                if template.info.algorithm != Algorithm::OpaqueX509Certificate as u8 {
-                    return Err(DeviceError::InvalidData);
-                }
-                let ObjectMaterial::Opaque(encoded) = &template.material else {
-                    return Err(DeviceError::InvalidData);
-                };
-                let certificate = x509_cert::Certificate::from_der(encoded)
-                    .map_err(|_| DeviceError::InvalidData)?;
-                let tbs = certificate.tbs_certificate();
-                subject = tbs.subject().clone();
-                issuer = tbs.issuer().clone();
-                validity = *tbs.validity();
-                template_extensions = tbs.extensions().cloned().unwrap_or_default();
+            })
+        {
+            authorization.require_visible(&template.info)?;
+            if template.info.algorithm != Algorithm::OpaqueX509Certificate as u8 {
+                return Err(DeviceError::InvalidData);
             }
+            let ObjectMaterial::Opaque(encoded) = &template.material else {
+                return Err(DeviceError::InvalidData);
+            };
+            let certificate =
+                x509_cert::Certificate::from_der(encoded).map_err(|_| DeviceError::InvalidData)?;
+            let tbs = certificate.tbs_certificate();
+            subject = tbs.subject().clone();
+            issuer = tbs.issuer().clone();
+            validity = *tbs.validity();
+            template_extensions = tbs.extensions().cloned().unwrap_or_default();
         }
         let algorithm =
             Algorithm::from_byte(target_info.algorithm).ok_or(DeviceError::InvalidData)?;
@@ -2588,7 +2588,7 @@ impl Device {
         data: &[u8],
         encrypt: bool,
     ) -> Result<Vec<u8>> {
-        if data.len() < 2 + AES_BLOCK_SIZE || (data.len() - 2) % AES_BLOCK_SIZE != 0 {
+        if data.len() < 2 + AES_BLOCK_SIZE || !(data.len() - 2).is_multiple_of(AES_BLOCK_SIZE) {
             return Err(DeviceError::WrongLength);
         }
         let id = u16::from_be_bytes(data[..2].try_into().unwrap());
@@ -2609,7 +2609,7 @@ impl Device {
         encrypt: bool,
     ) -> Result<Vec<u8>> {
         if data.len() < 2 + AES_BLOCK_SIZE * 2
-            || (data.len() - 2 - AES_BLOCK_SIZE) % AES_BLOCK_SIZE != 0
+            || !(data.len() - 2 - AES_BLOCK_SIZE).is_multiple_of(AES_BLOCK_SIZE)
         {
             return Err(DeviceError::WrongLength);
         }
@@ -4077,7 +4077,7 @@ fn audit_key_ids(command: CommandCode, data: &[u8]) -> (u16, u16) {
 mod tests {
     use super::*;
     use crate::secure_channel_crypto::{
-        cbc_decrypt, cbc_encrypt, cmac, encrypt_block, pad, scp03_kdf, unpad, BLOCK_SIZE,
+        BLOCK_SIZE, cbc_decrypt, cbc_encrypt, cmac, encrypt_block, pad, scp03_kdf, unpad,
     };
     use p256::{ecdh::diffie_hellman, elliptic_curve::sec1::ToSec1Point};
     use software_key_core::software_signing::EcCurve;
@@ -4606,10 +4606,12 @@ mod tests {
         assert_ne!(symmetric_id, 0);
         assert_ne!(symmetric_id, u16::MAX);
         assert_ne!(symmetric_id, opaque_id);
-        assert!(device
-            .objects
-            .keys()
-            .all(|key| key.id != 0 && key.id != u16::MAX));
+        assert!(
+            device
+                .objects
+                .keys()
+                .all(|key| key.id != 0 && key.id != u16::MAX)
+        );
     }
 
     #[test]
@@ -6181,12 +6183,14 @@ mod tests {
         let mut restored = Device::from_persistent_state(config.clone(), &encoded).unwrap();
         assert_eq!(restored.state_epoch(), 1);
         assert_eq!(restored.active_session_count(), 0);
-        assert!(restored
-            .object(ObjectKey {
-                object_type: ObjectType::Opaque,
-                id: 42,
-            })
-            .is_some());
+        assert!(
+            restored
+                .object(ObjectKey {
+                    object_type: ObjectType::Opaque,
+                    id: 42,
+                })
+                .is_some()
+        );
         assert_eq!(restored.audit.entries.len(), 1);
         assert_eq!(
             restored.options.command_audit[&(CommandCode::GetPseudoRandom as u8)],
@@ -6392,10 +6396,12 @@ mod tests {
             ],
         )
         .unwrap();
-        assert!(device
-            .execute_inner(admin, &enable_authentication_audit)
-            .data
-            .is_empty());
+        assert!(
+            device
+                .execute_inner(admin, &enable_authentication_audit)
+                .data
+                .is_empty()
+        );
 
         let mut create_data = 1_u16.to_be_bytes().to_vec();
         create_data.extend_from_slice(&[0; CHALLENGE_LENGTH]);

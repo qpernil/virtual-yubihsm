@@ -4,8 +4,8 @@ use software_key_core::secure_channel::scp03_kdf as shared_scp03_kdf;
 use software_key_core::{
     secure_channel::{pad_iso7816, unpad_iso7816},
     software_symmetric::{
-        aes_cmac, decrypt_aes_cbc, encrypt_aes_block, encrypt_aes_cbc, SoftwareSymmetricError,
-        AES_BLOCK_SIZE,
+        AES_BLOCK_SIZE, SoftwareSymmetricError, aes_cmac, decrypt_aes_cbc, encrypt_aes_block,
+        encrypt_aes_cbc,
     },
 };
 

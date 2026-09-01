@@ -175,7 +175,7 @@ impl Channel<'_> {
                 let base = libc::CMSG_LEN(0) as usize;
                 let ancillary_length = (*ancillary).cmsg_len as usize;
                 if ancillary_length < base
-                    || (ancillary_length - base) % std::mem::size_of::<libc::c_int>() != 0
+                    || !(ancillary_length - base).is_multiple_of(std::mem::size_of::<libc::c_int>())
                 {
                     return invalid("malformed SCM_RIGHTS payload");
                 }
