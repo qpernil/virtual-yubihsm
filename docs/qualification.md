@@ -27,7 +27,9 @@ the same transport kind.
 
 `smoke` is read-only and needs no Authentication Key. It checks malformed and
 unknown frame errors, plain Echo, device identity, the device authentication
-public key, and rejection of a session-only command sent in the clear. This is
+public key, and rejection of a session-only command sent in the clear. A
+malformed frame may be rejected explicitly by the connector boundary or by the
+device with `WrongLength`; the suite distinguishes these two layers. This is
 the default connector profile and is safe when the target's provisioning is
 unknown.
 

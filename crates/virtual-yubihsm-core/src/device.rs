@@ -37,7 +37,10 @@ use spki::{
     SubjectPublicKeyInfoOwned,
 };
 use std::{collections::BTreeMap, io::Cursor};
-use std::{str::FromStr, time::Duration};
+use std::{
+    str::FromStr,
+    time::{Duration, Instant},
+};
 use subtle::ConstantTimeEq;
 use x509_cert::{
     builder::{Builder, CertificateBuilder, profile::BuilderProfile},
@@ -54,6 +57,7 @@ use zeroize::Zeroizing;
 
 const MAX_OBJECTS: usize = 256;
 const MAX_SESSIONS: u8 = 16;
+const SESSION_INACTIVITY_TIMEOUT: Duration = Duration::from_secs(30);
 const DEFAULT_AUTHENTICATION_ALGORITHM: u8 = AUTHENTICATION_ALGORITHM_AES128_YUBICO;
 const OPAQUE_DATA_ALGORITHM: u8 = 30;
 const PERSISTENT_STATE_SCHEMA: &str = "virtual-yubihsm-state";
@@ -418,6 +422,7 @@ impl Device {
         F: FnMut(SessionAuthorization, &Frame) -> Option<Frame>,
         O: FnMut(SessionAuthorization, &Frame, &Frame),
     {
+        self.expire_inactive_sessions(Instant::now());
         let result = match CommandCode::from_byte(request.command) {
             Some(
                 CommandCode::Echo | CommandCode::GetDeviceInfo | CommandCode::GetDevicePublicKey,
@@ -429,7 +434,7 @@ impl Device {
             Some(CommandCode::SessionMessage) => {
                 self.session_message_with(&request, handler, observer)
             }
-            Some(_) => Err(DeviceError::InvalidSession),
+            Some(_) => Err(DeviceError::InvalidCommand),
             None => Err(DeviceError::InvalidCommand),
         };
         result.unwrap_or_else(Frame::error)
@@ -479,13 +484,7 @@ impl Device {
     pub fn execute_plain(&self, request: &Frame) -> Frame {
         let result = self
             .execute_plain_or_authenticated(request)
-            .unwrap_or_else(|| {
-                if CommandCode::from_byte(request.command).is_some() {
-                    Err(DeviceError::InvalidSession)
-                } else {
-                    Err(DeviceError::InvalidCommand)
-                }
-            });
+            .unwrap_or(Err(DeviceError::InvalidCommand));
         match result {
             Ok(data) => Frame::response(request.command, data),
             Err(error) => Frame::error(error),
@@ -538,6 +537,7 @@ impl Device {
                             secure,
                             expected_host_cryptogram: Some(expected_host_cryptogram),
                             authenticated: false,
+                            last_activity: Instant::now(),
                         },
                     );
                     let mut response = Vec::with_capacity(1 + CHALLENGE_LENGTH + 8);
@@ -564,6 +564,7 @@ impl Device {
                             secure,
                             expected_host_cryptogram: None,
                             authenticated: true,
+                            last_activity: Instant::now(),
                         },
                     );
                     let mut response = Vec::with_capacity(1 + P256_PUBLIC_KEY_LENGTH + 16);
@@ -612,6 +613,7 @@ impl Device {
                 .ok_or(DeviceError::AuthenticationFailed)?;
             entry.secure.authenticate_symmetric(request, &expected)?;
             entry.authenticated = true;
+            entry.last_activity = Instant::now();
             self.sessions.insert(sid, entry);
             self.record_unlogged_authentication_if_full();
             Ok(Frame::response(
@@ -658,6 +660,7 @@ impl Device {
             return Err(DeviceError::InvalidSession);
         }
         let inner = entry.secure.decrypt_request(request)?;
+        entry.last_activity = Instant::now();
         let authorization_error = CommandCode::from_byte(inner.command)
             .and_then(CommandCode::required_session_capability)
             .and_then(|required| entry.authorization.require_capability(required).err());
@@ -771,6 +774,12 @@ impl Device {
 
     pub fn active_session_count(&self) -> usize {
         self.sessions.len()
+    }
+
+    fn expire_inactive_sessions(&mut self, now: Instant) {
+        self.sessions.retain(|_, session| {
+            now.saturating_duration_since(session.last_activity) < SESSION_INACTIVITY_TIMEOUT
+        });
     }
 
     /// Invalidate every volatile secure session without changing objects.
@@ -4871,8 +4880,11 @@ mod tests {
         let message_mac = cmac(&s_mac, &message_mac_input).unwrap();
         message_payload.extend_from_slice(&message_mac[..8]);
         let message = Frame::new(CommandCode::SessionMessage as u8, message_payload).unwrap();
+        let prior_activity = Instant::now().checked_sub(Duration::from_secs(15)).unwrap();
+        device.sessions.get_mut(&sid).unwrap().last_activity = prior_activity;
         let response = Frame::parse(&device.handle_encoded(&message.encode())).unwrap();
         assert_eq!(response.command, CommandCode::SessionMessage as u8 | 0x80);
+        assert!(device.sessions.get(&sid).unwrap().last_activity > prior_activity);
 
         let response_payload_length = response.data.len() - 8;
         let response_without_mac = &response.encode()[..3 + response_payload_length];
@@ -4888,6 +4900,48 @@ mod tests {
         let inner_response = Frame::parse(&unpad(clear).unwrap()).unwrap();
         assert_eq!(inner_response.command, CommandCode::Echo as u8 | 0x80);
         assert_eq!(inner_response.data, echo_payload);
+        assert_eq!(device.active_session_count(), 1);
+
+        device.sessions.get_mut(&sid).unwrap().last_activity = Instant::now()
+            .checked_sub(SESSION_INACTIVITY_TIMEOUT + Duration::from_millis(1))
+            .unwrap();
+        assert_eq!(
+            Frame::parse(&device.handle_encoded(&message.encode())).unwrap(),
+            Frame::error(DeviceError::InvalidSession)
+        );
+        assert_eq!(device.active_session_count(), 0);
+    }
+
+    #[test]
+    fn expired_sessions_are_reclaimed_before_allocating_a_new_session() {
+        let mut device = Device::factory_default(DeviceConfig::default());
+        let create = |challenge: u8| {
+            let mut data = 1_u16.to_be_bytes().to_vec();
+            data.extend_from_slice(&[challenge; CHALLENGE_LENGTH]);
+            Frame::new(CommandCode::CreateSession as u8, data).unwrap()
+        };
+
+        for expected_sid in 0..MAX_SESSIONS {
+            let response =
+                Frame::parse(&device.handle_encoded(&create(expected_sid).encode())).unwrap();
+            assert_eq!(response.command, CommandCode::CreateSession as u8 | 0x80);
+            assert_eq!(response.data[0], expected_sid);
+        }
+        assert_eq!(device.active_session_count(), usize::from(MAX_SESSIONS));
+        assert_eq!(
+            Frame::parse(&device.handle_encoded(&create(0xff).encode())).unwrap(),
+            Frame::error(DeviceError::SessionsFull)
+        );
+
+        let expired_at = Instant::now()
+            .checked_sub(SESSION_INACTIVITY_TIMEOUT + Duration::from_millis(1))
+            .unwrap();
+        for session in device.sessions.values_mut() {
+            session.last_activity = expired_at;
+        }
+        let response = Frame::parse(&device.handle_encoded(&create(0xfe).encode())).unwrap();
+        assert_eq!(response.command, CommandCode::CreateSession as u8 | 0x80);
+        assert_eq!(response.data[0], 0);
         assert_eq!(device.active_session_count(), 1);
     }
 

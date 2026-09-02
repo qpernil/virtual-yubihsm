@@ -10,6 +10,7 @@ use software_key_core::{
     software_key_agreement::derive_with_signing_key,
     software_signing::{EcCurve, KeyKind, SoftwarePublicKey, SoftwareSigningKey},
 };
+use std::time::Instant;
 use subtle::ConstantTimeEq;
 use zeroize::Zeroizing;
 
@@ -44,6 +45,7 @@ pub(crate) struct SessionEntry {
     pub(crate) secure: SecureSession,
     pub(crate) expected_host_cryptogram: Option<[u8; MAC_LENGTH]>,
     pub(crate) authenticated: bool,
+    pub(crate) last_activity: Instant,
 }
 
 #[derive(Debug)]
