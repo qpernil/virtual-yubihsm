@@ -266,12 +266,16 @@ can be audited, while decrypted commands are audited individually.
 [`profiles/virtual-yubihsm.toml`](profiles/virtual-yubihsm.toml) is the
 installation template for the 240x240 ST7789 color display;
 [`profiles/virtual-yubihsm-sh1106-spi.toml`](profiles/virtual-yubihsm-sh1106-spi.toml)
-selects the 128x64 SH1106 monochrome OLED. Replace the worker command and
-account in the chosen profile with deployment-specific absolute values. The
-worker includes both native asset sets and selects one with `--display`; it
-performs no image conversion at runtime. The profiles' named display and KEY3
-resources intentionally match the corresponding `virtual-yubikey` profiles so
-either worker can use the same wiring.
+selects the 128x64 SH1106 monochrome OLED over SPI, and
+[`profiles/virtual-yubihsm-sh1106-i2c.toml`](profiles/virtual-yubihsm-sh1106-i2c.toml)
+drives the same image over `/dev/i2c-1`. The I2C profile works with an
+I2C-native SH1106 or the Pi 3B `virtual-display --display=sh1106` SDL target;
+the target's GPIO26 output controls USB eject/reinsertion. Replace the worker
+command and account in the chosen profile with deployment-specific absolute
+values. The worker includes both native asset sets and selects one with
+`--display`; it performs no image conversion at runtime. The profiles' named
+display and KEY3 resources intentionally match the corresponding
+`virtual-yubikey` profiles so either worker can use the same wiring.
 
 ## Development
 

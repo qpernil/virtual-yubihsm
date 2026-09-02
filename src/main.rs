@@ -23,6 +23,7 @@ static STOP_REQUESTED: AtomicBool = AtomicBool::new(false);
 pub(crate) enum DisplayKind {
     St7789Spi,
     Sh1106Spi,
+    Sh1106I2c,
 }
 
 impl DisplayKind {
@@ -30,9 +31,10 @@ impl DisplayKind {
         match value {
             "st7789-spi" => Ok(Self::St7789Spi),
             "sh1106-spi" => Ok(Self::Sh1106Spi),
+            "sh1106-i2c" => Ok(Self::Sh1106I2c),
             _ => Err(io::Error::new(
                 io::ErrorKind::InvalidInput,
-                format!("invalid display {value:?}; use st7789-spi or sh1106-spi"),
+                format!("invalid display {value:?}; use st7789-spi, sh1106-spi, or sh1106-i2c"),
             )),
         }
     }
@@ -90,7 +92,7 @@ fn parse_arguments(arguments: impl IntoIterator<Item = String>) -> io::Result<Op
                     "Usage: virtual-yubihsm-worker [--serial DECIMAL] [--display BACKEND] [--persistence MODE]\n\n\
                      Unprivileged YubiHSM 2 FunctionFS worker for usb-gadget-supervisor.\n\
                      Persistent state is stored in STATE_DIRECTORY.\n\
-                     BACKEND is st7789-spi (default) or sh1106-spi.\n\
+                     BACKEND is st7789-spi (default), sh1106-spi, or sh1106-i2c.\n\
                      MODE is batched (default, 500 ms) or immediate."
                 );
                 return Ok(None);
@@ -172,6 +174,7 @@ mod tests {
     use super::*;
 
     const OLED_PROFILE: &str = include_str!("../profiles/virtual-yubihsm-sh1106-spi.toml");
+    const I2C_PROFILE: &str = include_str!("../profiles/virtual-yubihsm-sh1106-i2c.toml");
 
     #[test]
     fn parses_serial_and_rejects_unknown_arguments() {
@@ -196,6 +199,15 @@ mod tests {
                 persistence: PersistenceMode::Batched(Duration::from_millis(500)),
             })
         );
+
+        assert_eq!(
+            parse_arguments(["--display=sh1106-i2c".to_owned()]).unwrap(),
+            Some(Options {
+                serial: 12_345_678,
+                display: DisplayKind::Sh1106I2c,
+                persistence: PersistenceMode::Batched(Duration::from_millis(500)),
+            })
+        );
     }
 
     #[test]
@@ -214,5 +226,14 @@ mod tests {
     fn oled_profile_selects_sh1106_and_its_two_control_lines() {
         assert!(OLED_PROFILE.contains("--display=sh1106-spi"));
         assert!(OLED_PROFILE.contains("offsets = [24, 25]"));
+    }
+
+    #[test]
+    fn i2c_profile_selects_sh1106_and_remote_reconnect() {
+        assert!(I2C_PROFILE.contains("--display=sh1106-i2c"));
+        assert!(I2C_PROFILE.contains("name = \"display-i2c\""));
+        assert!(I2C_PROFILE.contains("path = \"/dev/i2c-1\""));
+        assert!(I2C_PROFILE.contains("offsets = [25]"));
+        assert!(I2C_PROFILE.contains("offsets = [26]"));
     }
 }
