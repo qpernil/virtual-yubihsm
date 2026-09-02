@@ -1,4 +1,6 @@
-use std::{env, sync::Arc};
+use std::env;
+#[cfg(any(feature = "native-hsmauth", feature = "platform-credential"))]
+use std::sync::Arc;
 use yubihsm_qualification::Credentials;
 
 pub fn connector_credentials(authentication_key_id: u16) -> Result<Credentials, String> {

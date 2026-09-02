@@ -79,7 +79,7 @@ pub(crate) fn run_worker(
     let device = persistence.handle();
     let personality = crate::usb_identity::personality(serial).to_cbor()?;
     let display = crate::display::Controller::start(
-        resources.display_spi,
+        resources.display_bus,
         resources.display_control,
         display_kind,
     )?;
@@ -202,19 +202,19 @@ pub(crate) fn run_worker(
 }
 
 struct InitialResources {
-    display_spi: File,
+    display_bus: File,
     display_control: File,
     reconnect_button: File,
 }
 
 impl InitialResources {
     fn parse(resources: Vec<(String, File)>) -> io::Result<Self> {
-        let mut display_spi = None;
+        let mut display_bus = None;
         let mut display_control = None;
         let mut reconnect_button = None;
         for (name, file) in resources {
             let target = match name.as_str() {
-                "display-spi" => &mut display_spi,
+                "display-spi" | "display-i2c" => &mut display_bus,
                 "display-control" => &mut display_control,
                 "reconnect-button" => &mut reconnect_button,
                 _ => return invalid(format!("unexpected initial resource {name}")),
@@ -224,7 +224,8 @@ impl InitialResources {
             }
         }
         Ok(Self {
-            display_spi: display_spi.ok_or_else(|| data_error("missing display-spi resource"))?,
+            display_bus: display_bus
+                .ok_or_else(|| data_error("missing display-spi or display-i2c resource"))?,
             display_control: display_control
                 .ok_or_else(|| data_error("missing display-control resource"))?,
             reconnect_button: reconnect_button

@@ -313,6 +313,7 @@ impl Hardware {
             let backend = match self.kind {
                 crate::DisplayKind::St7789Spi => Backend::St7789Spi,
                 crate::DisplayKind::Sh1106Spi => Backend::Sh1106Spi,
+                crate::DisplayKind::Sh1106I2c => Backend::Sh1106I2c,
             };
             match Display::from_raw_fds(
                 backend,
@@ -334,6 +335,8 @@ impl Hardware {
             (crate::DisplayKind::St7789Spi, true) => LED_ON_FRAME,
             (crate::DisplayKind::Sh1106Spi, false) => OLED_LED_OFF_FRAME,
             (crate::DisplayKind::Sh1106Spi, true) => OLED_LED_ON_FRAME,
+            (crate::DisplayKind::Sh1106I2c, false) => OLED_LED_OFF_FRAME,
+            (crate::DisplayKind::Sh1106I2c, true) => OLED_LED_ON_FRAME,
         };
         if let Err(error) = self.display.as_mut().unwrap().write_native_frame(frame) {
             self.report_error("frame write", &error);
