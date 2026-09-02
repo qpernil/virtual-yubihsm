@@ -1,8 +1,8 @@
 # Object sizes reported by YubiHSM 2
 
 This table records the `length` returned by `GetObjectInfo` on a physical
-YubiHSM 2 running firmware 2.5.0. The measurements were made on 2026-08-31.
-These values are object metadata; they are not protocol input lengths.
+YubiHSM 2. These values are object metadata; they are not protocol input
+lengths.
 
 In the formulas below, `n` is the RSA modulus length in bytes, `c` is an
 elliptic-curve coordinate length in bytes, `k` is the stored key material

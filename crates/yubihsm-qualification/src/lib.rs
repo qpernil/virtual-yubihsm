@@ -26,6 +26,7 @@ use std::{
     fmt,
     io::{Read, Write},
     net::TcpStream,
+    sync::Arc,
     time::Duration,
 };
 use virtual_yubihsm_core::{
@@ -322,24 +323,75 @@ pub enum Profile {
 }
 
 #[derive(Clone)]
+enum CredentialMaterial {
+    Symmetric(Zeroizing<[u8; 32]>),
+    Asymmetric(Arc<dyn AsymmetricCredentialProvider>),
+}
+
+#[derive(Clone)]
 pub struct Credentials {
     pub authentication_key_id: u16,
-    static_keys: Zeroizing<[u8; 32]>,
+    material: CredentialMaterial,
 }
 
 impl Credentials {
     pub fn from_password(authentication_key_id: u16, password: &[u8]) -> Self {
         Self {
             authentication_key_id,
-            static_keys: yubico_password_kdf(password),
+            material: CredentialMaterial::Symmetric(yubico_password_kdf(password)),
         }
     }
 
     pub fn from_static_keys(authentication_key_id: u16, static_keys: [u8; 32]) -> Self {
         Self {
             authentication_key_id,
-            static_keys: Zeroizing::new(static_keys),
+            material: CredentialMaterial::Symmetric(Zeroizing::new(static_keys)),
         }
+    }
+
+    pub fn from_asymmetric(
+        authentication_key_id: u16,
+        provider: Arc<dyn AsymmetricCredentialProvider>,
+    ) -> Self {
+        Self {
+            authentication_key_id,
+            material: CredentialMaterial::Asymmetric(provider),
+        }
+    }
+}
+
+/// One external asymmetric credential, such as YubiHSM Auth or a platform key.
+pub trait AsymmetricCredentialProvider: Send + Sync {
+    fn begin(&self) -> CaseResult<Box<dyn AsymmetricCredentialAttempt>>;
+    fn description(&self) -> String;
+}
+
+/// Per-session state retained between Create Session and key derivation.
+pub trait AsymmetricCredentialAttempt: Send {
+    fn host_public_key(&self) -> &[u8];
+
+    fn derive_session_keys(
+        &mut self,
+        context: &[u8],
+        device_public_key: &[u8],
+        receipt: &[u8],
+    ) -> CaseResult<AsymmetricSessionKeys>;
+}
+
+pub struct AsymmetricSessionKeys {
+    /// Present when the caller must verify the receipt. Hardware credential
+    /// providers may omit it after verifying the receipt internally.
+    pub receipt: Option<Zeroizing<[u8; AES_BLOCK_SIZE]>>,
+    pub encryption: Zeroizing<[u8; AES_BLOCK_SIZE]>,
+    pub mac: Zeroizing<[u8; AES_BLOCK_SIZE]>,
+    pub response_mac: Zeroizing<[u8; AES_BLOCK_SIZE]>,
+}
+
+impl fmt::Debug for AsymmetricSessionKeys {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("AsymmetricSessionKeys")
+            .finish_non_exhaustive()
     }
 }
 
@@ -358,6 +410,7 @@ pub struct Report {
     pub profile: Profile,
     pub identity: DeviceIdentity,
     pub passed: Vec<&'static str>,
+    pub unsupported: Vec<&'static str>,
 }
 
 #[derive(Debug)]
@@ -387,7 +440,13 @@ impl fmt::Display for QualificationError {
 
 impl Error for QualificationError {}
 
-type CaseResult<T = ()> = Result<T, String>;
+pub type CaseResult<T = ()> = Result<T, String>;
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct CleanupReport {
+    pub removed: usize,
+    pub remaining: usize,
+}
 
 pub fn run(
     transport: &mut dyn FrameTransport,
@@ -396,6 +455,7 @@ pub fn run(
 ) -> Result<Report, QualificationError> {
     let target = transport.description();
     let mut passed = Vec::new();
+    let mut unsupported = Vec::new();
 
     run_case(&mut passed, "malformed and unknown frames", || {
         match transport.exchange(&[CommandCode::Echo as u8, 0, 1]) {
@@ -471,7 +531,7 @@ pub fn run(
     }
     if profile == Profile::Extensions {
         let credentials = credentials.unwrap();
-        run_extensions(transport, credentials, &mut passed)?;
+        run_extensions(transport, credentials, &mut passed, &mut unsupported)?;
     }
     if profile == Profile::Ephemeral {
         let credentials = credentials.unwrap();
@@ -483,6 +543,118 @@ pub fn run(
         profile,
         identity,
         passed,
+        unsupported,
+    })
+}
+
+/// Replace Authentication Key 1 with the intentionally narrow public
+/// discovery credential used by pkcs11rs. This is a provisioning operation:
+/// the supplied administrator must remain valid if creation fails after the
+/// old key is deleted.
+pub fn replace_public_discovery_credential(
+    transport: &mut dyn FrameTransport,
+    administrator: &Credentials,
+) -> CaseResult {
+    const DISCOVERY_ID: u16 = 1;
+    const DISCOVERY_CAPABILITIES: [u8; 8] = [0x02, 0, 0, 0, 0, 0, 0, 0x01];
+
+    let mut session = SymmetricSession::open(transport, administrator)?;
+    let response = session.command(
+        transport,
+        Frame::new(
+            CommandCode::DeleteObject as u8,
+            object_key(DISCOVERY_ID, ObjectType::AuthenticationKey),
+        )
+        .unwrap(),
+    )?;
+    expect_response(&response, CommandCode::DeleteObject)?;
+
+    let static_keys = yubico_password_kdf(b"password");
+    let response = session.command(
+        transport,
+        put_named_authentication_key(
+            DISCOVERY_ID,
+            "pkcs11rs public discovery",
+            u16::MAX,
+            CapabilitySet::from_bytes(DISCOVERY_CAPABILITIES),
+            CapabilitySet::NONE,
+            &static_keys,
+        ),
+    )?;
+    ensure(
+        expect_response(&response, CommandCode::PutAuthenticationKey)?
+            == DISCOVERY_ID.to_be_bytes(),
+        "Put Authentication Key returned a different object ID",
+    )?;
+    session.close(transport)?;
+
+    let discovery = Credentials::from_password(DISCOVERY_ID, b"password");
+    let mut session = SymmetricSession::open(transport, &discovery)?;
+    let objects = list_objects(transport, &mut session)?;
+    for (id, object_type) in [
+        (1, ObjectType::AuthenticationKey),
+        (0x1001, ObjectType::AuthenticationKey),
+        (0x1002, ObjectType::AuthenticationKey),
+        (0x1003, ObjectType::AuthenticationKey),
+    ] {
+        ensure(
+            objects.contains(&(id, object_type)),
+            format!("discovery did not list {object_type:?} {id:04x}"),
+        )?;
+    }
+    let response = session.command(
+        transport,
+        Frame::new(CommandCode::GetPseudoRandom as u8, 1_u16.to_be_bytes()).unwrap(),
+    )?;
+    expect_device_error(&response, DeviceError::InsufficientPermissions)?;
+    session.close(transport)
+}
+
+/// Remove objects left by an interrupted qualification run.
+///
+/// Qualification-owned objects are identified by their reserved label prefix,
+/// so this operation does not depend on the randomly selected object IDs.
+pub fn cleanup_qualification_objects(
+    transport: &mut dyn FrameTransport,
+    administrator: &Credentials,
+) -> CaseResult<CleanupReport> {
+    let mut session = SymmetricSession::open(transport, administrator)?;
+    let objects = list_objects(transport, &mut session)?;
+    let object_count = objects.len();
+    let mut removed = 0;
+
+    for (id, object_type) in objects {
+        let response = session.command(
+            transport,
+            Frame::new(
+                CommandCode::GetObjectInfo as u8,
+                object_key(id, object_type),
+            )
+            .unwrap(),
+        )?;
+        let data = expect_response(&response, CommandCode::GetObjectInfo)?;
+        ensure(
+            data.len() == 66,
+            format!(
+                "object info for {object_type:?} {id:04x} is {} bytes",
+                data.len()
+            ),
+        )?;
+        let label = &data[18..58];
+        let label = &label[..label
+            .iter()
+            .position(|byte| *byte == 0)
+            .unwrap_or(label.len())];
+        if label.starts_with(b"qualification") {
+            delete_object(transport, &mut session, id, object_type)?;
+            removed += 1;
+        }
+    }
+
+    session.close(transport)?;
+    Ok(CleanupReport {
+        removed,
+        remaining: object_count - removed,
     })
 }
 
@@ -491,7 +663,7 @@ fn run_managed(
     credentials: &Credentials,
     passed: &mut Vec<&'static str>,
 ) -> Result<(), QualificationError> {
-    run_case(passed, "symmetric authenticated session", || {
+    run_case(passed, "authenticated secure session", || {
         let mut session = SymmetricSession::open(transport, credentials)?;
         let echo = Frame::new(CommandCode::Echo as u8, b"encrypted echo".to_vec()).unwrap();
         let response = session.command(transport, echo)?;
@@ -1138,13 +1310,18 @@ fn run_extensions(
     transport: &mut dyn FrameTransport,
     credentials: &Credentials,
     passed: &mut Vec<&'static str>,
+    unsupported: &mut Vec<&'static str>,
 ) -> Result<(), QualificationError> {
     run_case(passed, "X25519 key agreement", || {
         x25519_scenario(transport, credentials)
     })?;
-    run_case(passed, "prefixed ECDH KDF", || {
-        prefixed_ecdh_kdf_scenario(transport, credentials)
-    })
+    match prefixed_ecdh_kdf_scenario(transport, credentials)
+        .map_err(|error| QualificationError::new("prefixed ECDH KDF", error))?
+    {
+        true => passed.push("prefixed ECDH KDF"),
+        false => unsupported.push("prefixed ECDH KDF"),
+    }
+    Ok(())
 }
 
 fn x25519_scenario(transport: &mut dyn FrameTransport, credentials: &Credentials) -> CaseResult {
@@ -1183,7 +1360,7 @@ fn x25519_scenario(transport: &mut dyn FrameTransport, credentials: &Credentials
 fn prefixed_ecdh_kdf_scenario(
     transport: &mut dyn FrameTransport,
     credentials: &Credentials,
-) -> CaseResult {
+) -> CaseResult<bool> {
     let mut session = SymmetricSession::open(transport, credentials)?;
     let objects = list_objects(transport, &mut session)?;
     let id = unused_id(&objects, ObjectType::AsymmetricKey, 0x79a0)?;
@@ -1197,60 +1374,75 @@ fn prefixed_ecdh_kdf_scenario(
         ),
     )?;
     expect_response(&response, CommandCode::GenerateAsymmetricKey)?;
-    let public = get_public_key(transport, &mut session, id, ObjectType::AsymmetricKey)?;
-    ensure(
-        public.len() == 65 && public[0] == Algorithm::EcP256 as u8,
-        "prefixed ECDH key returned an invalid public key",
-    )?;
-    let peer = p256::SecretKey::from_slice(&[0x44; 32])
-        .map_err(|error| format!("invalid prefixed-ECDH peer key: {error}"))?;
-    let peer_public = peer.public_key().to_sec1_point(false);
-    let device_public = p256::PublicKey::from_sec1_bytes(&[&[0x04], &public[1..]].concat())
-        .map_err(|error| format!("invalid prefixed-ECDH device public key: {error}"))?;
-    let raw_secret = diffie_hellman(peer.to_nonzero_scalar(), device_public.as_affine());
-    let prefix = [0x41; 32];
-    let shared_info = [0x3c, 0x88, 0x10];
-    let mut kdf_input = Vec::with_capacity(prefix.len() + raw_secret.raw_secret_bytes().len());
-    kdf_input.extend_from_slice(&prefix);
-    kdf_input.extend_from_slice(raw_secret.raw_secret_bytes());
-    let expected = x963_kdf_sha256(&kdf_input, &shared_info, 64)
-        .map_err(|error| format!("independent prefixed-ECDH KDF failed: {error:?}"))?;
-    let mut request = id.to_be_bytes().to_vec();
-    request.push(3);
-    request.extend_from_slice(&64_u16.to_be_bytes());
-    for length in [
-        peer_public.as_bytes().len(),
-        prefix.len(),
-        shared_info.len(),
-    ] {
-        request.extend_from_slice(
-            &u16::try_from(length)
-                .map_err(|_| "prefixed-ECDH input length overflow".to_owned())?
-                .to_be_bytes(),
-        );
+    let outcome = (|| {
+        let public = get_public_key(transport, &mut session, id, ObjectType::AsymmetricKey)?;
+        ensure(
+            public.len() == 65 && public[0] == Algorithm::EcP256 as u8,
+            "prefixed ECDH key returned an invalid public key",
+        )?;
+        let peer = p256::SecretKey::from_slice(&[0x44; 32])
+            .map_err(|error| format!("invalid prefixed-ECDH peer key: {error}"))?;
+        let peer_public = peer.public_key().to_sec1_point(false);
+        let device_public = p256::PublicKey::from_sec1_bytes(&[&[0x04], &public[1..]].concat())
+            .map_err(|error| format!("invalid prefixed-ECDH device public key: {error}"))?;
+        let raw_secret = diffie_hellman(peer.to_nonzero_scalar(), device_public.as_affine());
+        let prefix = [0x41; 32];
+        let shared_info = [0x3c, 0x88, 0x10];
+        let mut kdf_input = Vec::with_capacity(prefix.len() + raw_secret.raw_secret_bytes().len());
+        kdf_input.extend_from_slice(&prefix);
+        kdf_input.extend_from_slice(raw_secret.raw_secret_bytes());
+        let expected = x963_kdf_sha256(&kdf_input, &shared_info, 64)
+            .map_err(|error| format!("independent prefixed-ECDH KDF failed: {error:?}"))?;
+        let mut request = id.to_be_bytes().to_vec();
+        request.push(3);
+        request.extend_from_slice(&64_u16.to_be_bytes());
+        for length in [
+            peer_public.as_bytes().len(),
+            prefix.len(),
+            shared_info.len(),
+        ] {
+            request.extend_from_slice(
+                &u16::try_from(length)
+                    .map_err(|_| "prefixed-ECDH input length overflow".to_owned())?
+                    .to_be_bytes(),
+            );
+        }
+        request.extend_from_slice(peer_public.as_bytes());
+        request.extend_from_slice(&prefix);
+        request.extend_from_slice(&shared_info);
+        let response = session.command(
+            transport,
+            Frame::new(CommandCode::DeriveEcdhKdf as u8, request).unwrap(),
+        )?;
+        if response.command == ERROR_COMMAND && response.data == [DeviceError::InvalidCommand as u8]
+        {
+            return Ok(false);
+        }
+        ensure(
+            expect_response(&response, CommandCode::DeriveEcdhKdf)? == expected.as_slice(),
+            "prefixed ECDH returned a different KDF result",
+        )?;
+        let response = session.command(
+            transport,
+            Frame::new(
+                CommandCode::DeriveEcdh as u8,
+                [id.to_be_bytes().as_slice(), peer_public.as_bytes()].concat(),
+            )
+            .unwrap(),
+        )?;
+        expect_device_error(&response, DeviceError::InsufficientPermissions)?;
+        Ok(true)
+    })();
+    let cleanup = delete_object(transport, &mut session, id, ObjectType::AsymmetricKey);
+    let close = session.close(transport);
+    match outcome {
+        Err(error) => Err(error),
+        Ok(supported) => {
+            cleanup?;
+            close?;
+            Ok(supported)
+        }
     }
-    request.extend_from_slice(peer_public.as_bytes());
-    request.extend_from_slice(&prefix);
-    request.extend_from_slice(&shared_info);
-    let response = session.command(
-        transport,
-        Frame::new(CommandCode::DeriveEcdhKdf as u8, request).unwrap(),
-    )?;
-    ensure(
-        expect_response(&response, CommandCode::DeriveEcdhKdf)? == expected.as_slice(),
-        "prefixed ECDH returned a different KDF result",
-    )?;
-    let response = session.command(
-        transport,
-        Frame::new(
-            CommandCode::DeriveEcdh as u8,
-            [id.to_be_bytes().as_slice(), peer_public.as_bytes()].concat(),
-        )
-        .unwrap(),
-    )?;
-    expect_device_error(&response, DeviceError::InsufficientPermissions)?;
-    delete_object(transport, &mut session, id, ObjectType::AsymmetricKey)?;
-    session.close(transport)
 }
 
 fn hmac_scenario(transport: &mut dyn FrameTransport, credentials: &Credentials) -> CaseResult {
@@ -1781,7 +1973,7 @@ fn negative_command_scenario(
             DeviceError::WrongLength,
         ),
         (CommandCode::GetOption, vec![], DeviceError::WrongLength),
-        (CommandCode::ListObjects, vec![1], DeviceError::WrongLength),
+        (CommandCode::ListObjects, vec![1], DeviceError::InvalidData),
         (
             CommandCode::GetObjectInfo,
             vec![0, 1],
@@ -1789,7 +1981,8 @@ fn negative_command_scenario(
         ),
     ] {
         let response = session.command(transport, Frame::new(command as u8, data).unwrap())?;
-        expect_device_error(&response, expected)?;
+        expect_device_error(&response, expected)
+            .map_err(|error| format!("{command:?}: {error}"))?;
     }
     session.close(transport)
 }
@@ -2009,8 +2202,25 @@ struct SymmetricSession {
 
 impl SymmetricSession {
     fn open(transport: &mut dyn FrameTransport, credentials: &Credentials) -> CaseResult<Self> {
+        match &credentials.material {
+            CredentialMaterial::Symmetric(static_keys) => {
+                Self::open_symmetric(transport, credentials.authentication_key_id, static_keys)
+            }
+            CredentialMaterial::Asymmetric(provider) => Self::open_asymmetric(
+                transport,
+                credentials.authentication_key_id,
+                provider.as_ref(),
+            ),
+        }
+    }
+
+    fn open_symmetric(
+        transport: &mut dyn FrameTransport,
+        authentication_key_id: u16,
+        static_keys: &[u8; 32],
+    ) -> CaseResult<Self> {
         let host_challenge = [0x51, 0x75, 0x61, 0x6c, 0x69, 0x66, 0x79, 0x21];
-        let mut create_data = credentials.authentication_key_id.to_be_bytes().to_vec();
+        let mut create_data = authentication_key_id.to_be_bytes().to_vec();
         create_data.extend_from_slice(&host_challenge);
         let response = exchange_frame(
             transport,
@@ -2025,11 +2235,11 @@ impl SymmetricSession {
         let mut context = [0; CHALLENGE_LENGTH * 2];
         context[..CHALLENGE_LENGTH].copy_from_slice(&host_challenge);
         context[CHALLENGE_LENGTH..].copy_from_slice(&create[1..9]);
-        let s_enc = scp03_key(&credentials.static_keys[..16], 0x04, &context)
+        let s_enc = scp03_key(&static_keys[..16], 0x04, &context)
             .map_err(|error| format!("S-ENC derivation failed: {error:?}"))?;
-        let s_mac = scp03_key(&credentials.static_keys[16..], 0x06, &context)
+        let s_mac = scp03_key(&static_keys[16..], 0x06, &context)
             .map_err(|error| format!("S-MAC derivation failed: {error:?}"))?;
-        let s_rmac = scp03_key(&credentials.static_keys[16..], 0x07, &context)
+        let s_rmac = scp03_key(&static_keys[16..], 0x07, &context)
             .map_err(|error| format!("S-RMAC derivation failed: {error:?}"))?;
         let card_cryptogram = scp03_cryptogram(&s_mac, 0x00, &context)
             .map_err(|error| format!("card cryptogram derivation failed: {error:?}"))?;
@@ -2062,6 +2272,80 @@ impl SymmetricSession {
             s_rmac,
             counter,
             command_mac,
+        })
+    }
+
+    fn open_asymmetric(
+        transport: &mut dyn FrameTransport,
+        authentication_key_id: u16,
+        provider: &dyn AsymmetricCredentialProvider,
+    ) -> CaseResult<Self> {
+        let mut attempt = provider.begin()?;
+        let host_public_key = attempt.host_public_key().to_vec();
+        ensure(
+            host_public_key.len() == 65 && host_public_key[0] == 0x04,
+            format!(
+                "{} returned an invalid P-256 host public key",
+                provider.description()
+            ),
+        )?;
+        let mut create_data = authentication_key_id.to_be_bytes().to_vec();
+        create_data.extend_from_slice(&host_public_key);
+        let response = exchange_frame(
+            transport,
+            Frame::new(CommandCode::CreateSession as u8, create_data).unwrap(),
+        )?;
+        let create = expect_response(&response, CommandCode::CreateSession)?;
+        ensure(
+            create.len() == 82,
+            format!("asymmetric Create Session returned {} bytes", create.len()),
+        )?;
+        let sid = create[0];
+        let device_ephemeral = &create[1..66];
+        p256::PublicKey::from_sec1_bytes(device_ephemeral)
+            .map_err(|error| format!("invalid device ephemeral public key: {error}"))?;
+        let receipt: [u8; AES_BLOCK_SIZE] = create[66..].try_into().unwrap();
+
+        let response = exchange_frame(
+            transport,
+            Frame::new(CommandCode::GetDevicePublicKey as u8, Vec::new()).unwrap(),
+        )?;
+        let device_public = expect_response(&response, CommandCode::GetDevicePublicKey)?;
+        ensure(
+            device_public.len() == 65,
+            format!(
+                "Get Device Public Key returned {} bytes",
+                device_public.len()
+            ),
+        )?;
+        let mut device_public_key = vec![0x04];
+        device_public_key.extend_from_slice(&device_public[1..]);
+        p256::PublicKey::from_sec1_bytes(&device_public_key)
+            .map_err(|error| format!("invalid device static public key: {error}"))?;
+
+        let mut context = host_public_key.clone();
+        context.extend_from_slice(device_ephemeral);
+        let keys = attempt.derive_session_keys(&context, &device_public_key, &receipt)?;
+        if let Some(receipt_key) = &keys.receipt {
+            let mut receipt_input = device_ephemeral.to_vec();
+            receipt_input.extend_from_slice(&host_public_key);
+            let expected_receipt = aes_cmac(receipt_key.as_ref(), &receipt_input)
+                .map_err(|error| format!("asymmetric session receipt failed: {error:?}"))?;
+            ensure(
+                expected_receipt == receipt,
+                "asymmetric session receipt did not verify",
+            )?;
+        }
+
+        let mut counter = [0; AES_BLOCK_SIZE];
+        counter[AES_BLOCK_SIZE - 1] = 1;
+        Ok(Self {
+            sid,
+            s_enc: *keys.encryption,
+            s_mac: *keys.mac,
+            s_rmac: *keys.response_mac,
+            counter,
+            command_mac: receipt,
         })
     }
 
@@ -2356,8 +2640,26 @@ fn put_authentication_key(
     delegated_capabilities: CapabilitySet,
     static_keys: &[u8; 32],
 ) -> Frame {
+    put_named_authentication_key(
+        id,
+        "qualification auth",
+        domains,
+        capabilities,
+        delegated_capabilities,
+        static_keys,
+    )
+}
+
+fn put_named_authentication_key(
+    id: u16,
+    label: &str,
+    domains: u16,
+    capabilities: CapabilitySet,
+    delegated_capabilities: CapabilitySet,
+    static_keys: &[u8; 32],
+) -> Frame {
     let mut data = id.to_be_bytes().to_vec();
-    data.extend_from_slice(b"qualification auth");
+    data.extend_from_slice(label.as_bytes());
     data.resize(42, 0);
     data.extend_from_slice(&domains.to_be_bytes());
     data.extend_from_slice(&capabilities.to_bytes());
