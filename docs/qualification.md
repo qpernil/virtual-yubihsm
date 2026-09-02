@@ -4,8 +4,10 @@
 device and reference hardware. A scenario sends and receives complete encoded
 YubiHSM frames through `FrameTransport`; it does not call decrypted command
 handlers or inspect device objects. The secure-session client independently
-constructs and verifies the SCP03-compatible wire exchange using the shared,
-protocol-neutral crypto primitives from `software-key-core`.
+constructs and verifies the SCP03-compatible wire exchange. Symmetric
+authentication derives its static keys locally. Asymmetric authentication
+delegates the static private-key operation to a credential provider and retains
+only the resulting per-session keys.
 
 ## Target matrix
 
@@ -76,8 +78,9 @@ published vectors rather than values produced by the device implementation.
 
 `extensions` adds X25519 agreement against an independently implemented peer
 and prefixed ECDH with an independently calculated X9.63 KDF result. It includes
-the complete `managed` profile first, but keeps additions outside the standard
-command set visibly separate.
+the complete `managed` profile first, keeps project additions visibly separate,
+and reports an unavailable addition as `UNSUPPORTED` rather than weakening the
+common qualification result.
 
 `ephemeral` adds persistent audit configuration and audit-log assertions. It
 proves that Create Session and Authenticate Session can be audited while the
@@ -112,6 +115,36 @@ cargo run -p yubihsm-qualification -- \
   connector http://127.0.0.1:12345 12345678 managed
 ```
 
+The native YubiHSM Auth adapter keeps the Authentication Key material inside
+the YubiKey and obtains only the session keys:
+
+```sh
+YUBIHSM_QUALIFICATION_HSMAUTH_LABEL='credential-label' \
+YUBIHSM_QUALIFICATION_HSMAUTH_PASSWORD='credential-password' \
+YUBIHSM_QUALIFICATION_AUTH_KEY_ID=4098 \
+cargo run -p yubihsm-qualification --features native-hsmauth -- \
+  connector http://127.0.0.1:12345 12345678 managed
+```
+
+With the `platform-credential` feature, an asymmetric platform credential can
+be selected through `YUBIHSM_QUALIFICATION_PLATFORM_CREDENTIAL`. Its static
+P-256 private key remains in the platform key store while the provider performs
+the prefixed X9.63 derivation. Platforms that protect Keychain access with code
+signing must run the qualification executable from an appropriately entitled
+host; an unsigned `cargo run` process intentionally cannot see that key.
+
+If a process is interrupted, remove only objects carrying the qualification
+label prefix before rerunning:
+
+```sh
+cargo run -p yubihsm-qualification --all-features -- \
+  cleanup http://127.0.0.1:12345 12345678
+```
+
+`provision-discovery` replaces Authentication Key 1 with the deliberately
+restricted public discovery credential. Both provisioning and cleanup use the
+same credential-source environment variables as the managed profile.
+
 Use `extensions` instead of `managed` to include the additional command and
 algorithm checks.
 
@@ -134,10 +167,11 @@ For example, a USB disconnect test should interrupt a normal command exchange,
 wait for the connector to rediscover the target, and then rerun the common
 read-only or managed scenario set.
 
-X25519 and the prefixed-ECDH KDF command belong to the explicit extension
-profile. Target observations should be captured as explicit expected data or a
-narrowly documented target exception, never as a branch in the virtual
-implementation itself.
+X25519 and prefixed ECDH belong to the explicit extension profile. Project
+extension behavior is documented from the virtual implementation's public
+contract. Qualification output may state that an extension is unavailable on
+a target, but hardware-specific experimental commands and firmware details are
+not recorded.
 
 ## Ownership of tests
 

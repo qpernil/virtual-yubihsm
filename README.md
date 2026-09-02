@@ -292,7 +292,8 @@ cargo run -p yubihsm-qualification -- \
 ```
 
 See [YubiHSM qualification](docs/qualification.md) for the target matrix,
-managed profile, safety boundaries, and extension rules.
+YubiHSM Auth and platform credential adapters, managed cleanup, safety
+boundaries, and extension rules.
 
 The factory Authentication Key is object ID 1, all capabilities, all delegated
 capabilities and all domains. Its compatibility password is `password`; change

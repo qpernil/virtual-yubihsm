@@ -1528,7 +1528,10 @@ impl Device {
     }
 
     fn list_objects(&self, authorization: SessionAuthorization, filters: &[u8]) -> Result<Vec<u8>> {
-        let filters = ObjectFilters::parse(filters)?;
+        let filters = ObjectFilters::parse(filters).map_err(|error| match error {
+            DeviceError::WrongLength => DeviceError::InvalidData,
+            error => error,
+        })?;
         let mut output = Vec::new();
         for object in self.objects.values() {
             if authorization.can_see(&object.info) && filters.matches(&object.info) {
