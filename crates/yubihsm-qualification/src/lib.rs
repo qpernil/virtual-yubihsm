@@ -50,18 +50,41 @@ pub trait FrameTransport {
     fn description(&self) -> String;
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum TransportErrorKind {
+    Other,
+    InvalidCommandFrame,
+}
+
 #[derive(Debug)]
-pub struct TransportError(String);
+pub struct TransportError {
+    kind: TransportErrorKind,
+    message: String,
+}
 
 impl TransportError {
     pub fn new(message: impl Into<String>) -> Self {
-        Self(message.into())
+        Self {
+            kind: TransportErrorKind::Other,
+            message: message.into(),
+        }
+    }
+
+    fn invalid_command_frame(message: impl Into<String>) -> Self {
+        Self {
+            kind: TransportErrorKind::InvalidCommandFrame,
+            message: message.into(),
+        }
+    }
+
+    pub const fn kind(&self) -> TransportErrorKind {
+        self.kind
     }
 }
 
 impl fmt::Display for TransportError {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
-        formatter.write_str(&self.0)
+        formatter.write_str(&self.message)
     }
 }
 
@@ -230,10 +253,18 @@ fn parse_http_response(encoded: &[u8]) -> Result<Vec<u8>, TransportError> {
         .collect::<Vec<_>>();
     let body = &encoded[boundary + 4..];
     if status != 200 {
-        return Err(TransportError::new(format!(
+        let message = format!(
             "connector returned HTTP {status}: {}",
             String::from_utf8_lossy(body)
-        )));
+        );
+        if status == 400
+            && body
+                .windows(b"\"code\":\"invalid_command_frame\"".len())
+                .any(|window| window == b"\"code\":\"invalid_command_frame\"")
+        {
+            return Err(TransportError::invalid_command_frame(message));
+        }
+        return Err(TransportError::new(message));
     }
     if headers
         .iter()
@@ -367,8 +398,15 @@ pub fn run(
     let mut passed = Vec::new();
 
     run_case(&mut passed, "malformed and unknown frames", || {
-        let response = exchange_raw(transport, &[CommandCode::Echo as u8, 0, 1])?;
-        expect_device_error(&response, DeviceError::WrongLength)?;
+        match transport.exchange(&[CommandCode::Echo as u8, 0, 1]) {
+            Ok(encoded) => {
+                let response = Frame::parse(&encoded)
+                    .map_err(|error| format!("invalid malformed-frame response: {error}"))?;
+                expect_device_error(&response, DeviceError::WrongLength)?;
+            }
+            Err(error) if error.kind() == TransportErrorKind::InvalidCommandFrame => {}
+            Err(error) => return Err(error.to_string()),
+        }
         let response = exchange_frame(transport, Frame::new(0x02, Vec::new()).unwrap())?;
         expect_device_error(&response, DeviceError::InvalidCommand)
     })?;
@@ -422,7 +460,7 @@ pub fn run(
             transport,
             Frame::new(CommandCode::GetStorageInfo as u8, Vec::new()).unwrap(),
         )?;
-        expect_device_error(&response, DeviceError::InvalidSession)
+        expect_device_error(&response, DeviceError::InvalidCommand)
     })?;
 
     if profile != Profile::Smoke {

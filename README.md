@@ -79,6 +79,8 @@ deletion.
 - symmetric SCP03-compatible handshake and encrypted message exchange;
 - asymmetric P-256 ECDH authentication with receipt and the common encrypted
   message exchange;
+- 16 concurrent secure sessions with the physical device's 30-second
+  inactivity timeout; every valid session command refreshes its deadline;
 - public-key retrieval for asymmetric P-256 Authentication Keys, a deliberate
   virtual extension over firmware that rejects `GET PUBLIC KEY` for that object
   type;
