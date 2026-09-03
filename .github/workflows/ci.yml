@@ -17,9 +17,16 @@ jobs:
 
       - name: Check out first-party dependencies
         run: |
+          git clone --depth 1 https://github.com/qpernil/pkcs11rs.git ../pkcs11rs
           git clone --depth 1 https://github.com/qpernil/software-key-core.git ../software-key-core
           git clone --depth 1 https://github.com/qpernil/usb-gadget-supervisor.git ../usb-gadget-supervisor
           git clone --depth 1 https://github.com/qpernil/display-backends.git ../display-backends
+          git clone --depth 1 https://github.com/qpernil/virtual-yubikey.git ../virtual-yubikey
+
+      - name: Install native dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y libpcsclite-dev pkg-config
 
       - name: Run tests
         run: cargo test --locked --workspace --all-features
@@ -39,12 +46,19 @@ jobs:
 
       - name: Check out first-party dependencies
         run: |
+          git clone --depth 1 https://github.com/qpernil/pkcs11rs.git ../pkcs11rs
           git clone --depth 1 https://github.com/qpernil/software-key-core.git ../software-key-core
           git clone --depth 1 https://github.com/qpernil/usb-gadget-supervisor.git ../usb-gadget-supervisor
           git clone --depth 1 https://github.com/qpernil/display-backends.git ../display-backends
+          git clone --depth 1 https://github.com/qpernil/virtual-yubikey.git ../virtual-yubikey
 
       - name: Install Rust 1.94
         uses: dtolnay/rust-toolchain@1.94.0
+
+      - name: Install native dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y libpcsclite-dev pkg-config
 
       - name: Check minimum supported Rust version
         run: cargo check --locked --workspace --all-features
