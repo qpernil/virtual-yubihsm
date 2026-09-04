@@ -48,12 +48,12 @@ rejects the entire image if any key is invalid, before accepting commands.
 Private runtime keys and temporary serialized buffers carry zeroization-on-drop
 guarantees.
 
-The proposed direct, in-process integration of this core as a built-in device
-inside `yubihsmrs-connector` is specified in the
-[built-in connector design](docs/yubihsmrs-connector-integration-design.md).
-The virtual `derive-ecdh-kdf` command and its proposed
-`CKM_PKCS11RS_PREFIXED_ECDH_DERIVE` mapping are specified in the
-[prefixed ECDH derivation design](docs/prefixed-ecdh-derive.md).
+The core also runs directly inside `pkcs11rs-connector` as an embedded virtual
+device, using the same state ownership and persistence rules as the USB worker.
+See the [built-in connector integration](docs/pkcs11rs-connector-integration.md).
+The virtual `derive-ecdh-kdf` command maps to
+`CKM_PKCS11RS_PREFIXED_ECDH_DERIVE` as documented in
+[prefixed ECDH derivation](docs/prefixed-ecdh-derive.md).
 
 An authenticated session receives exactly the Authentication Key object's:
 

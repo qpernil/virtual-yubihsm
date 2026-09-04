@@ -33,11 +33,11 @@ This is ANSI X9.63 applied to the composite secret `P || Z`. The prefix and
 shared data occupy different positions: `P` precedes the HSM-confined secret,
 while `S` follows the X9.63 counter. There is no additional append field.
 
-A real hash-based KDF is mandatory. Neither the wire command nor the proposed
-PKCS#11 mechanism accepts a null KDF. Empty prefix and shared-data values are
+A real hash-based KDF is mandatory. Neither the wire command nor the PKCS#11
+mechanism accepts a null KDF. Empty prefix and shared-data values are
 valid, but the result remains `KDF(Z)` and never becomes raw ECDH output.
 
-## Proposed PKCS#11 interface
+## PKCS#11 interface
 
 The provider-facing parameter structure is:
 
@@ -80,7 +80,7 @@ The provider normalizes `pPublicData` in the same way as ordinary ECDH before
 encoding the HSM command. For short-Weierstrass curves the command receives a
 SEC1 public point; for X25519 it receives the raw 32-byte public value.
 
-The proposed key-capability mapping is:
+The key-capability mapping is:
 
 - an asymmetric key restricted to
   `CKM_PKCS11RS_PREFIXED_ECDH_DERIVE` receives `derive-ecdh-kdf` but not
