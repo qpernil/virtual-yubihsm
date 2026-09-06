@@ -78,7 +78,8 @@ pairs.
 
 The provider normalizes `pPublicData` in the same way as ordinary ECDH before
 encoding the HSM command. For short-Weierstrass curves the command receives a
-SEC1 public point; for X25519 it receives the raw 32-byte public value.
+SEC1 public point; for X25519 and X448 it receives the raw 32-byte or 56-byte
+public value, respectively.
 
 The key-capability mapping is:
 

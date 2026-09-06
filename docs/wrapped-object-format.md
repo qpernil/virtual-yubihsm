@@ -46,8 +46,9 @@ unsigned variant number:
 | 5 | `[5, point]` | P-256 authentication public keys (`x || y`) |
 | 6 | `[6, nonce_id, key]` | OTP AEAD keys |
 
-Private RSA, Weierstrass EC, Ed25519, and X25519 keys use canonical bare
-PKCS #8 DER. X25519 follows RFC 8410. The decoder verifies that the PKCS #8
+Private RSA, Weierstrass EC, Ed25519, Ed448, X25519, and X448 keys use canonical
+bare PKCS #8 DER. The Edwards and Montgomery keys follow RFC 8410. The decoder
+verifies that the PKCS #8
 algorithm and parameters agree with the YubiHSM algorithm in the outer record.
 RSA keys must have the expected modulus size and public exponent 65537.
 

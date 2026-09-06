@@ -36,13 +36,13 @@ dependency of other consumers.
 
 The in-memory object store keeps private asymmetric keys in their typed
 runtime form. Generation and import parse once; RSA CRT precomputation,
-Ed25519 expansion, EC validation, and X25519 construction are therefore not
+Ed25519/Ed448 expansion, EC validation, and X25519/X448 construction are therefore not
 repeated by each command. Signing and agreement borrow the stored key directly.
 The static P-256 device identity follows the same rule.
 
 Runtime objects are deliberately distinct from persistence and wrapped-object
 DTOs. A snapshot converts typed keys to the established compact material
-(RSA `p || q`, EC scalar, Ed25519 seed, or X25519 scalar), while wrapped
+(RSA `p || q`, EC scalar, Ed25519/Ed448 seed, or X25519/X448 scalar), while wrapped
 asymmetric objects use PKCS#8. Restore decodes every DTO into a typed key and
 rejects the entire image if any key is invalid, before accepting commands.
 Private runtime keys and temporary serialized buffers carry zeroization-on-drop
@@ -51,6 +51,8 @@ guarantees.
 The core also runs directly inside `pkcs11rs-connector` as an embedded virtual
 device, using the same state ownership and persistence rules as the USB worker.
 See the [built-in connector integration](docs/pkcs11rs-connector-integration.md).
+The deliberate differences from physical firmware are catalogued in
+[virtual extensions](docs/virtual-extensions.md).
 The virtual `derive-ecdh-kdf` command maps to
 `CKM_PKCS11RS_PREFIXED_ECDH_DERIVE` as documented in
 [prefixed ECDH derivation](docs/prefixed-ecdh-derive.md).
@@ -91,8 +93,10 @@ deletion.
   and PSS signing, and PKCS #1 v1.5 and OAEP decryption;
 - P-224/P-256/P-384/P-521, secp256k1, Brainpool P-256/P-384/P-512 and
   Ed25519 import/generation, public projection, ECDSA, EdDSA and raw ECDH;
-- X25519 key import/generation, public projection and contributory key
-  agreement as the first virtual extension algorithm;
+- X25519 and X448 key import/generation, public projection and contributory key
+  agreement as virtual extension algorithms;
+- Ed448 key import/generation, public projection, and EdDSA signing as a
+  virtual extension algorithm;
 - atomic prefixed ECDH plus mandatory X9.63 derivation under a separate
   `derive-ecdh-kdf` capability, allowing a static authentication key to derive
   session-specific material without exposing its reusable raw ECDH secret;
@@ -100,7 +104,8 @@ deletion.
 - AES-128/192/256 symmetric keys and ECB/CBC commands;
 - AES-CCM wrap keys, authenticated arbitrary-data wrapping, policy-preserving
   wrapped-object export/import, RSA-OAEP plus AES-KWP hybrid wrapping, and the
-  PKCS#8 key-only RSA wrap/import format;
+  PKCS#8 key-only RSA wrap/import format, plus direct PKCS #1 v1.5 wrapping of
+  symmetric key material as a virtual extension;
 - Yubico OTP AES-128/192/256 AEAD keys, credential creation/randomization,
   rewrapping and OTP decryption with private-ID and CRC validation;
 - generated-key attestation certificates signed by the built-in P-256 device

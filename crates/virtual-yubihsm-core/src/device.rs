@@ -295,7 +295,13 @@ impl Default for DeviceConfig {
             log_capacity: 62,
             algorithms: Algorithm::OFFICIAL
                 .into_iter()
-                .chain([Algorithm::X25519, Algorithm::EcdhKdf])
+                .chain([
+                    Algorithm::X25519,
+                    Algorithm::EcdhKdf,
+                    Algorithm::RsaPkcs1Wrap,
+                    Algorithm::X448,
+                    Algorithm::Ed448,
+                ])
                 .map(|algorithm| algorithm as u8)
                 .collect(),
             part_number: *b"78CLUFX5000P\0",
@@ -1729,8 +1735,11 @@ impl Device {
                 ObjectMaterial::Public(public) => output.extend_from_slice(public),
                 _ => return Err(DeviceError::InvalidData),
             }
-        } else if object.info.algorithm == Algorithm::X25519 as u8 {
-            output.extend_from_slice(&x25519_key(object)?.public_key());
+        } else if matches!(
+            Algorithm::from_byte(object.info.algorithm),
+            Some(Algorithm::X25519 | Algorithm::X448)
+        ) {
+            output.extend_from_slice(&montgomery_key(object)?.public_key());
         } else {
             match signing_key(object)?.public_key() {
                 SoftwarePublicKey::Ec { uncompressed, .. } => {
@@ -1742,8 +1751,8 @@ impl Device {
                 } => output.extend_from_slice(&public_key),
                 SoftwarePublicKey::Edwards {
                     curve: EdwardsCurve::Ed448,
-                    ..
-                } => return Err(DeviceError::InvalidData),
+                    public_key,
+                } => output.extend_from_slice(&public_key),
                 SoftwarePublicKey::Rsa { modulus, .. } => output.extend_from_slice(&modulus),
                 SoftwarePublicKey::MlDsa { public_key, .. } => {
                     output.extend_from_slice(&public_key)
@@ -1842,8 +1851,10 @@ impl Device {
         let profile = AttestationProfile {
             subject,
             issuer,
-            key_agreement: matches!(algorithm, Algorithm::Ecdh | Algorithm::X25519)
-                || algorithm.is_weierstrass_key(),
+            key_agreement: matches!(
+                algorithm,
+                Algorithm::Ecdh | Algorithm::X25519 | Algorithm::X448
+            ) || algorithm.is_weierstrass_key(),
             key_encipherment: algorithm.is_rsa_key(),
             template_extensions,
             metadata_extensions: attestation_metadata_extensions(&self.config, &target_info)?,
@@ -1905,7 +1916,7 @@ impl Device {
         let id = u16::from_be_bytes(data[..2].try_into().unwrap());
         let object = self.asymmetric_object(authorization, id)?;
         let (algorithm, _) = asymmetric_key_algorithm(object.info.algorithm)?;
-        if matches!(algorithm, SignatureScheme::Ed25519) {
+        if matches!(algorithm, SignatureScheme::Ed25519 | SignatureScheme::Ed448) {
             return Err(DeviceError::InvalidData);
         }
         let curve = algorithm.ec_curve().ok_or(DeviceError::InvalidData)?;
@@ -1921,11 +1932,13 @@ impl Device {
         }
         let id = u16::from_be_bytes(data[..2].try_into().unwrap());
         let object = self.asymmetric_object(authorization, id)?;
-        if object.info.algorithm != 46 {
-            return Err(DeviceError::InvalidData);
-        }
+        let scheme = match Algorithm::from_byte(object.info.algorithm) {
+            Some(Algorithm::Ed25519) => SignatureScheme::Ed25519,
+            Some(Algorithm::Ed448) => SignatureScheme::Ed448,
+            _ => return Err(DeviceError::InvalidData),
+        };
         signing_key(object)?
-            .sign_message(SignatureScheme::Ed25519, &data[2..])
+            .sign_message(scheme, &data[2..])
             .map(|signature| signature.into_bytes())
             .map_err(|_| DeviceError::InvalidData)
     }
@@ -2378,15 +2391,44 @@ impl Device {
         if data.len() < 8 {
             return Err(DeviceError::WrongLength);
         }
-        let label_length = rsa_oaep_hash(data[6])?.output_length();
-        if data.len() != 8 + label_length {
-            return Err(DeviceError::WrongLength);
-        }
         let wrap_id = u16::from_be_bytes(data[..2].try_into().unwrap());
         let target_key = ObjectKey {
             object_type: ObjectType::from_byte(data[2]).ok_or(DeviceError::InvalidData)?,
             id: u16::from_be_bytes(data[3..5].try_into().unwrap()),
         };
+        let wrap_key = self.rsa_public_wrap_key(authorization, wrap_id)?;
+        let target = self
+            .objects
+            .get(&target_key)
+            .ok_or(DeviceError::ObjectNotFound)?;
+        let direct_pkcs1 = data[5..8] == [0, 0, 0];
+        if direct_pkcs1 {
+            self.require_algorithm_enabled(Algorithm::RsaPkcs1Wrap as u8)?;
+            if data.len() != 8 {
+                return Err(DeviceError::WrongLength);
+            }
+            if !key_material_only || target_key.object_type != ObjectType::SymmetricKey {
+                return Err(DeviceError::InvalidData);
+            }
+            let ObjectMaterial::Secret(plaintext) = &target.material else {
+                return Err(DeviceError::InvalidData);
+            };
+            let public = match &wrap_key.material {
+                ObjectMaterial::Public(modulus) => SoftwarePublicKey::Rsa {
+                    modulus: modulus.clone(),
+                    exponent: vec![1, 0, 1],
+                },
+                _ => return Err(DeviceError::InvalidData),
+            };
+            return public
+                .encrypt_rsa_pkcs1v15(plaintext)
+                .map_err(|_| DeviceError::InvalidData);
+        }
+
+        let label_length = rsa_oaep_hash(data[6])?.output_length();
+        if data.len() != 8 + label_length {
+            return Err(DeviceError::WrongLength);
+        }
         if key_material_only
             && !matches!(
                 target_key.object_type,
@@ -2397,11 +2439,6 @@ impl Device {
         }
         let aes_length = rsa_wrap_aes_length(data[5])?;
         let mgf_hash = rsa_mgf_hash(data[7])?;
-        let wrap_key = self.rsa_public_wrap_key(authorization, wrap_id)?;
-        let target = self
-            .objects
-            .get(&target_key)
-            .ok_or(DeviceError::ObjectNotFound)?;
         let plaintext = if key_material_only {
             match target_key.object_type {
                 ObjectType::AsymmetricKey => asymmetric_pkcs8(target)?,
@@ -2480,23 +2517,38 @@ impl Device {
         }
         let algorithm = Algorithm::from_byte(data[55]).ok_or(DeviceError::InvalidData)?;
         self.require_algorithm_enabled(algorithm as u8)?;
-        let label_digest_length = rsa_oaep_hash(data[56])?.output_length();
-        let mgf_hash = rsa_mgf_hash(data[57])?;
         let wrap_id = u16::from_be_bytes(data[..2].try_into().unwrap());
+        let direct_pkcs1 = data[56..58] == [0, 0];
         let (material, logical_length) = {
             let wrap_key = self.rsa_private_wrap_key(authorization, wrap_id)?;
             let modulus_length = rsa_modulus_length(wrap_key)?;
-            if data.len() <= HEADER_LENGTH + modulus_length + label_digest_length {
-                return Err(DeviceError::WrongLength);
-            }
-            let wrapped_end = data.len() - label_digest_length;
-            let plaintext = rsa_aes_unwrap(
-                signing_key(wrap_key)?,
-                &data[HEADER_LENGTH..wrapped_end],
-                modulus_length,
-                &data[wrapped_end..],
-                mgf_hash,
-            )?;
+            let plaintext = if direct_pkcs1 {
+                self.require_algorithm_enabled(Algorithm::RsaPkcs1Wrap as u8)?;
+                if object_type != ObjectType::SymmetricKey {
+                    return Err(DeviceError::InvalidData);
+                }
+                if data.len() != HEADER_LENGTH + modulus_length {
+                    return Err(DeviceError::WrongLength);
+                }
+                signing_key(wrap_key)?
+                    .decrypt_rsa_pkcs1v15(&data[HEADER_LENGTH..])
+                    .map_err(|_| DeviceError::InvalidData)?
+                    .to_vec()
+            } else {
+                let label_digest_length = rsa_oaep_hash(data[56])?.output_length();
+                let mgf_hash = rsa_mgf_hash(data[57])?;
+                if data.len() <= HEADER_LENGTH + modulus_length + label_digest_length {
+                    return Err(DeviceError::WrongLength);
+                }
+                let wrapped_end = data.len() - label_digest_length;
+                rsa_aes_unwrap(
+                    signing_key(wrap_key)?,
+                    &data[HEADER_LENGTH..wrapped_end],
+                    modulus_length,
+                    &data[wrapped_end..],
+                    mgf_hash,
+                )?
+            };
             import_rsa_wrapped_key_material(object_type, algorithm, &plaintext)?
         };
         let id = self.resolve_id(
@@ -3056,6 +3108,7 @@ fn asymmetric_key_algorithm(algorithm: u8) -> Result<(SignatureScheme, usize)> {
         17 => Ok((SignatureScheme::EcdsaBrainpoolP384Sha384, 48)),
         18 => Ok((SignatureScheme::EcdsaBrainpoolP512Sha512, 64)),
         46 => Ok((SignatureScheme::Ed25519, 32)),
+        60 => Ok((SignatureScheme::Ed448, 57)),
         _ => Err(DeviceError::InvalidData),
     }
 }
@@ -3071,15 +3124,19 @@ fn asymmetric_key_material(
     if generate && !supplied.is_empty() {
         return Err(DeviceError::WrongLength);
     }
-    if algorithm == Algorithm::X25519 {
+    if matches!(algorithm, Algorithm::X25519 | Algorithm::X448) {
+        let curve = if algorithm == Algorithm::X25519 {
+            MontgomeryCurve::X25519
+        } else {
+            MontgomeryCurve::X448
+        };
         let key = if generate {
-            SoftwareMontgomeryKey::generate(MontgomeryCurve::X25519)
-                .map_err(|_| DeviceError::StorageFailed)?
+            SoftwareMontgomeryKey::generate(curve).map_err(|_| DeviceError::StorageFailed)?
         } else {
             if supplied.len() != expected_length {
                 return Err(DeviceError::WrongLength);
             }
-            SoftwareMontgomeryKey::from_serialized(MontgomeryCurve::X25519, supplied)
+            SoftwareMontgomeryKey::from_serialized(curve, supplied)
                 .map_err(|_| DeviceError::InvalidData)?
         };
         return Ok(ObjectMaterial::MontgomeryKey(key));
@@ -3127,6 +3184,7 @@ fn asymmetric_key_kind(algorithm: Algorithm) -> Result<KeyKind> {
         Algorithm::EcBrainpoolP384 => KeyKind::Ec(EcCurve::BrainpoolP384),
         Algorithm::EcBrainpoolP512 => KeyKind::Ec(EcCurve::BrainpoolP512),
         Algorithm::Ed25519 => KeyKind::Edwards(EdwardsCurve::Ed25519),
+        Algorithm::Ed448 => KeyKind::Edwards(EdwardsCurve::Ed448),
         Algorithm::Rsa2048 => KeyKind::Rsa { modulus_bits: 2048 },
         Algorithm::Rsa3072 => KeyKind::Rsa { modulus_bits: 3072 },
         Algorithm::Rsa4096 => KeyKind::Rsa { modulus_bits: 4096 },
@@ -3171,7 +3229,7 @@ fn signing_key(object: &ObjectRecord) -> Result<&SoftwareSigningKey> {
         return Err(DeviceError::InvalidData);
     };
     let algorithm = Algorithm::from_byte(object.info.algorithm).ok_or(DeviceError::InvalidData)?;
-    if algorithm == Algorithm::X25519
+    if matches!(algorithm, Algorithm::X25519 | Algorithm::X448)
         || algorithm.is_rsa_key() != matches!(key, SoftwareSigningKey::Rsa(_))
     {
         return Err(DeviceError::InvalidData);
@@ -3187,14 +3245,16 @@ fn rsa_modulus_length(object: &ObjectRecord) -> Result<usize> {
 }
 
 fn object_subject_public_key_info(object: &ObjectRecord) -> Result<SubjectPublicKeyInfoOwned> {
-    if object.info.algorithm == Algorithm::X25519 as u8 {
+    if let Some((curve, oid)) = montgomery_algorithm(object.info.algorithm) {
         return Ok(SubjectPublicKeyInfoOwned {
             algorithm: AlgorithmIdentifierOwned {
-                oid: ObjectIdentifier::new_unwrap("1.3.101.110"),
+                oid,
                 parameters: None,
             },
-            subject_public_key: BitString::from_bytes(&x25519_key(object)?.public_key())
-                .map_err(|_| DeviceError::InvalidData)?,
+            subject_public_key: BitString::from_bytes(
+                &montgomery_key_for_curve(object, curve)?.public_key(),
+            )
+            .map_err(|_| DeviceError::InvalidData)?,
         });
     }
     match signing_key(object)?.public_key() {
@@ -3215,8 +3275,15 @@ fn object_subject_public_key_info(object: &ObjectRecord) -> Result<SubjectPublic
         }),
         SoftwarePublicKey::Edwards {
             curve: EdwardsCurve::Ed448,
-            ..
-        } => Err(DeviceError::InvalidData),
+            public_key,
+        } => Ok(SubjectPublicKeyInfoOwned {
+            algorithm: AlgorithmIdentifierOwned {
+                oid: ObjectIdentifier::new_unwrap("1.3.101.113"),
+                parameters: None,
+            },
+            subject_public_key: BitString::from_bytes(&public_key)
+                .map_err(|_| DeviceError::InvalidData)?,
+        }),
         SoftwarePublicKey::Rsa { modulus, exponent } => {
             let public = RsaPublicKey::new(
                 BigUint::from_bytes_be(&modulus),
@@ -3293,14 +3360,33 @@ fn rsa_key(object: &ObjectRecord) -> Result<&SoftwareSigningKey> {
     signing_key(object)
 }
 
-fn x25519_key(object: &ObjectRecord) -> Result<&SoftwareMontgomeryKey> {
-    if object.info.algorithm != Algorithm::X25519 as u8 {
-        return Err(DeviceError::InvalidData);
+fn montgomery_algorithm(algorithm: u8) -> Option<(MontgomeryCurve, ObjectIdentifier)> {
+    match Algorithm::from_byte(algorithm) {
+        Some(Algorithm::X25519) => Some((
+            MontgomeryCurve::X25519,
+            ObjectIdentifier::new_unwrap("1.3.101.110"),
+        )),
+        Some(Algorithm::X448) => Some((
+            MontgomeryCurve::X448,
+            ObjectIdentifier::new_unwrap("1.3.101.111"),
+        )),
+        _ => None,
     }
+}
+
+fn montgomery_key(object: &ObjectRecord) -> Result<&SoftwareMontgomeryKey> {
+    let (curve, _) = montgomery_algorithm(object.info.algorithm).ok_or(DeviceError::InvalidData)?;
+    montgomery_key_for_curve(object, curve)
+}
+
+fn montgomery_key_for_curve(
+    object: &ObjectRecord,
+    curve: MontgomeryCurve,
+) -> Result<&SoftwareMontgomeryKey> {
     let ObjectMaterial::MontgomeryKey(key) = &object.material else {
         return Err(DeviceError::InvalidData);
     };
-    if key.curve() != MontgomeryCurve::X25519 {
+    if key.curve() != curve {
         return Err(DeviceError::InvalidData);
     }
     Ok(key)
@@ -3366,10 +3452,12 @@ struct Rfc8410PrivateKeyInfo {
     private_key: OctetString,
 }
 
-fn x25519_pkcs8(secret: &[u8]) -> Result<Vec<u8>> {
-    let secret: [u8; 32] = secret.try_into().map_err(|_| DeviceError::InvalidData)?;
-    SoftwareMontgomeryKey::from_serialized(MontgomeryCurve::X25519, &secret)
-        .map_err(|_| DeviceError::InvalidData)?;
+fn montgomery_pkcs8(
+    curve: MontgomeryCurve,
+    oid: ObjectIdentifier,
+    secret: &[u8],
+) -> Result<Vec<u8>> {
+    SoftwareMontgomeryKey::from_serialized(curve, secret).map_err(|_| DeviceError::InvalidData)?;
     let inner = OctetString::new(secret.to_vec())
         .map_err(|_| DeviceError::InvalidData)?
         .to_der()
@@ -3377,7 +3465,7 @@ fn x25519_pkcs8(secret: &[u8]) -> Result<Vec<u8>> {
     Rfc8410PrivateKeyInfo {
         version: 0,
         private_key_algorithm: AlgorithmIdentifierOwned {
-            oid: ObjectIdentifier::new_unwrap("1.3.101.110"),
+            oid,
             parameters: None,
         },
         private_key: OctetString::new(inner).map_err(|_| DeviceError::InvalidData)?,
@@ -3386,10 +3474,14 @@ fn x25519_pkcs8(secret: &[u8]) -> Result<Vec<u8>> {
     .map_err(|_| DeviceError::InvalidData)
 }
 
-fn x25519_from_pkcs8(encoded: &[u8]) -> Result<Vec<u8>> {
+fn montgomery_from_pkcs8(
+    curve: MontgomeryCurve,
+    oid: ObjectIdentifier,
+    encoded: &[u8],
+) -> Result<Vec<u8>> {
     let info = Rfc8410PrivateKeyInfo::from_der(encoded).map_err(|_| DeviceError::InvalidData)?;
     if info.version != 0
-        || info.private_key_algorithm.oid != ObjectIdentifier::new_unwrap("1.3.101.110")
+        || info.private_key_algorithm.oid != oid
         || info.private_key_algorithm.parameters.is_some()
     {
         return Err(DeviceError::InvalidData);
@@ -3398,14 +3490,17 @@ fn x25519_from_pkcs8(encoded: &[u8]) -> Result<Vec<u8>> {
         .map_err(|_| DeviceError::InvalidData)?
         .as_bytes()
         .to_vec();
-    SoftwareMontgomeryKey::from_serialized(MontgomeryCurve::X25519, &secret)
-        .map_err(|_| DeviceError::InvalidData)?;
+    SoftwareMontgomeryKey::from_serialized(curve, &secret).map_err(|_| DeviceError::InvalidData)?;
     Ok(secret)
 }
 
 fn asymmetric_pkcs8(object: &ObjectRecord) -> Result<Vec<u8>> {
-    if object.info.algorithm == Algorithm::X25519 as u8 {
-        return x25519_pkcs8(&x25519_key(object)?.serialized());
+    if let Some((curve, oid)) = montgomery_algorithm(object.info.algorithm) {
+        return montgomery_pkcs8(
+            curve,
+            oid,
+            &montgomery_key_for_curve(object, curve)?.serialized(),
+        );
     }
     signing_key(object)?
         .to_pkcs8_der()
@@ -3414,9 +3509,9 @@ fn asymmetric_pkcs8(object: &ObjectRecord) -> Result<Vec<u8>> {
 }
 
 fn asymmetric_material_from_pkcs8(algorithm: Algorithm, encoded: &[u8]) -> Result<ObjectMaterial> {
-    if algorithm == Algorithm::X25519 {
-        let serialized = x25519_from_pkcs8(encoded)?;
-        return SoftwareMontgomeryKey::from_serialized(MontgomeryCurve::X25519, &serialized)
+    if let Some((curve, oid)) = montgomery_algorithm(algorithm as u8) {
+        let serialized = montgomery_from_pkcs8(curve, oid, encoded)?;
+        return SoftwareMontgomeryKey::from_serialized(curve, &serialized)
             .map(ObjectMaterial::MontgomeryKey)
             .map_err(|_| DeviceError::InvalidData);
     }
@@ -3459,7 +3554,7 @@ fn validate_wrapped_object(object: &ObjectRecord) -> Result<()> {
             .is_ok_and(|parsed| &parsed == authentication)
         }
         (ObjectType::AsymmetricKey, ObjectMaterial::SigningKey(value)) => {
-            algorithm != Algorithm::X25519
+            !matches!(algorithm, Algorithm::X25519 | Algorithm::X448)
                 && algorithm.asymmetric_key_length()
                     == Some(value.private_value().map_or_else(
                         || algorithm.asymmetric_key_length().unwrap_or_default(),
@@ -3467,7 +3562,7 @@ fn validate_wrapped_object(object: &ObjectRecord) -> Result<()> {
                     ))
         }
         (ObjectType::AsymmetricKey, ObjectMaterial::MontgomeryKey(_)) => {
-            algorithm == Algorithm::X25519
+            matches!(algorithm, Algorithm::X25519 | Algorithm::X448)
         }
         (ObjectType::WrapKey, ObjectMaterial::SigningKey(value)) if algorithm.is_rsa_key() => {
             matches!(value, SoftwareSigningKey::Rsa(_))
@@ -3846,8 +3941,8 @@ fn calculate_hmac(object: &ObjectRecord, data: &[u8]) -> Result<Vec<u8>> {
 }
 
 fn raw_ecdh_secret(object: &ObjectRecord, peer_public: &[u8]) -> Result<Zeroizing<Vec<u8>>> {
-    if object.info.algorithm == Algorithm::X25519 as u8 {
-        x25519_key(object)?
+    if montgomery_algorithm(object.info.algorithm).is_some() {
+        montgomery_key(object)?
             .derive(peer_public)
             .map_err(|_| DeviceError::InvalidData)
     } else {
@@ -4008,6 +4103,7 @@ fn fips_disallowed_algorithm(algorithm: u8) -> bool {
                 | Algorithm::EcdsaSha1
                 | Algorithm::EcK256
                 | Algorithm::RsaPkcs1Decrypt
+                | Algorithm::RsaPkcs1Wrap
         )
     )
 }
@@ -5149,10 +5245,143 @@ mod tests {
     }
 
     #[test]
+    fn direct_pkcs1_variant_wraps_and_imports_symmetric_key_material() {
+        const WRAP_ID: u16 = 200;
+        const SOURCE_ID: u16 = 201;
+        const IMPORTED_ID: u16 = 202;
+        const SECRET: [u8; 16] = [0x5a; 16];
+
+        fn record(
+            id: u16,
+            object_type: ObjectType,
+            algorithm: Algorithm,
+            capabilities: CapabilitySet,
+            delegated_capabilities: CapabilitySet,
+            material: ObjectMaterial,
+        ) -> ObjectRecord {
+            let mut record = ObjectRecord {
+                info: ObjectInfo {
+                    capabilities,
+                    id,
+                    length: 0,
+                    domains: 1,
+                    object_type,
+                    algorithm: algorithm as u8,
+                    sequence: 0,
+                    origin: 2,
+                    label: Vec::new(),
+                    delegated_capabilities,
+                },
+                material,
+            };
+            record.normalize_info_length().unwrap();
+            record
+        }
+
+        let mut device = Device::factory_default(DeviceConfig::default());
+        let admin = device.session_authorization(1).unwrap();
+        let private = asymmetric_key_material(Algorithm::Rsa2048, true, &[]).unwrap();
+        let ObjectMaterial::SigningKey(signing) = &private else {
+            panic!("generated RSA wrap key has the wrong material type");
+        };
+        let SoftwarePublicKey::Rsa { modulus, .. } = signing.public_key() else {
+            panic!("generated RSA wrap key has the wrong public-key type");
+        };
+        device
+            .provision_object(record(
+                WRAP_ID,
+                ObjectType::WrapKey,
+                Algorithm::Rsa2048,
+                CapabilitySet::from_capabilities([Capability::ImportWrapped]),
+                CapabilitySet::NONE,
+                private,
+            ))
+            .unwrap();
+        device
+            .provision_object(record(
+                WRAP_ID,
+                ObjectType::PublicWrapKey,
+                Algorithm::Rsa2048,
+                CapabilitySet::from_capabilities([Capability::ExportWrapped]),
+                CapabilitySet::from_capabilities([Capability::ExportableUnderWrap]),
+                ObjectMaterial::Public(modulus),
+            ))
+            .unwrap();
+        device
+            .provision_object(record(
+                SOURCE_ID,
+                ObjectType::SymmetricKey,
+                Algorithm::Aes128,
+                CapabilitySet::from_capabilities([Capability::ExportableUnderWrap]),
+                CapabilitySet::NONE,
+                ObjectMaterial::Secret(SECRET.to_vec()),
+            ))
+            .unwrap();
+
+        let get = Frame::new(
+            CommandCode::GetRsaWrappedKey as u8,
+            [
+                WRAP_ID.to_be_bytes().as_slice(),
+                &[ObjectType::SymmetricKey as u8],
+                SOURCE_ID.to_be_bytes().as_slice(),
+                &[0, 0, 0],
+            ]
+            .concat(),
+        )
+        .unwrap();
+        let wrapped = device.execute_inner(admin, &get);
+        assert_eq!(wrapped.command, CommandCode::GetRsaWrappedKey as u8 | 0x80);
+        assert_eq!(wrapped.data.len(), 256);
+        assert_eq!(
+            signing_key(
+                device
+                    .object(ObjectKey {
+                        object_type: ObjectType::WrapKey,
+                        id: WRAP_ID,
+                    })
+                    .unwrap()
+            )
+            .unwrap()
+            .decrypt_rsa_pkcs1v15(&wrapped.data)
+            .unwrap()
+            .as_slice(),
+            SECRET
+        );
+
+        let mut put_data = Vec::new();
+        put_data.extend_from_slice(&WRAP_ID.to_be_bytes());
+        put_data.push(ObjectType::SymmetricKey as u8);
+        put_data.extend_from_slice(&IMPORTED_ID.to_be_bytes());
+        put_data.resize(45, 0);
+        put_data.extend_from_slice(&1_u16.to_be_bytes());
+        put_data.extend_from_slice(&CapabilitySet::NONE.to_bytes());
+        put_data.push(Algorithm::Aes128 as u8);
+        put_data.extend_from_slice(&[0, 0]);
+        put_data.extend_from_slice(&wrapped.data);
+        let put = Frame::new(CommandCode::PutRsaWrappedKey as u8, put_data).unwrap();
+        assert_eq!(
+            device.execute_inner(admin, &put).data,
+            [ObjectType::SymmetricKey as u8, 0, IMPORTED_ID as u8]
+        );
+        assert_eq!(
+            device
+                .object(ObjectKey {
+                    object_type: ObjectType::SymmetricKey,
+                    id: IMPORTED_ID,
+                })
+                .unwrap()
+                .material,
+            ObjectMaterial::Secret(SECRET.to_vec())
+        );
+    }
+
+    #[test]
     fn wrapped_object_cbor_v1_round_trips_every_material_representation() {
         let ec_secret = asymmetric_key_material(Algorithm::EcP256, true, &[]).unwrap();
         let ed25519_secret = asymmetric_key_material(Algorithm::Ed25519, true, &[]).unwrap();
         let x25519_secret = asymmetric_key_material(Algorithm::X25519, true, &[]).unwrap();
+        let ed448_secret = asymmetric_key_material(Algorithm::Ed448, true, &[]).unwrap();
+        let x448_secret = asymmetric_key_material(Algorithm::X448, true, &[]).unwrap();
         let rsa_secret = asymmetric_key_material(Algorithm::Rsa2048, true, &[]).unwrap();
         let rsa_record =
             wrapped_test_record(109, ObjectType::WrapKey, Algorithm::Rsa2048, rsa_secret);
@@ -5247,6 +5476,13 @@ mod tests {
                 Algorithm::X25519,
                 x25519_secret,
             ),
+            wrapped_test_record(
+                113,
+                ObjectType::AsymmetricKey,
+                Algorithm::Ed448,
+                ed448_secret,
+            ),
+            wrapped_test_record(114, ObjectType::AsymmetricKey, Algorithm::X448, x448_secret),
         ];
 
         for record in records {

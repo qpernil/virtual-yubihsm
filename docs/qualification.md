@@ -76,8 +76,12 @@ Expected signatures and shared secrets are verified by the independent client
 side using public keys returned over the protocol. AES and HMAC use fixed
 published vectors rather than values produced by the device implementation.
 
-`extensions` adds X25519 agreement against an independently implemented peer
-and prefixed ECDH with an independently calculated X9.63 KDF result. It includes
+`extensions` covers the additions catalogued in
+[virtual extensions](virtual-extensions.md), including X25519 agreement against
+an independently implemented peer, X448 agreement, Ed448 signing, and prefixed
+ECDH with an independently calculated X9.63 KDF result. It also round-trips a
+symmetric key through the direct PKCS #1 wrapping extension and proves the
+imported key by comparing an AES operation with the source key. It includes
 the complete `managed` profile first, keeps project additions visibly separate,
 and reports an unavailable addition as `UNSUPPORTED` rather than weakening the
 common qualification result.
@@ -167,11 +171,11 @@ For example, a USB disconnect test should interrupt a normal command exchange,
 wait for the connector to rediscover the target, and then rerun the common
 read-only or managed scenario set.
 
-X25519 and prefixed ECDH belong to the explicit extension profile. Project
-extension behavior is documented from the virtual implementation's public
-contract. Qualification output may state that an extension is unavailable on
-a target, but hardware-specific experimental commands and firmware details are
-not recorded.
+X25519, X448, Ed448, prefixed ECDH, and direct PKCS #1 secret-key wrapping
+belong to the explicit extension profile. Project extension behavior is
+documented from the virtual implementation's public contract. Qualification
+output may state that an extension is unavailable on a target, but
+hardware-specific experimental commands and firmware details are not recorded.
 
 ## Ownership of tests
 
