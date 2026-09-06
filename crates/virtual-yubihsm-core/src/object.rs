@@ -386,8 +386,13 @@ impl ObjectRecord {
 
 fn typed_private_material(info: &ObjectInfo, encoded: &[u8]) -> Result<ObjectMaterial> {
     let algorithm = Algorithm::from_byte(info.algorithm).ok_or(DeviceError::InvalidData)?;
-    if algorithm == Algorithm::X25519 {
-        return SoftwareMontgomeryKey::from_serialized(MontgomeryCurve::X25519, encoded)
+    if matches!(algorithm, Algorithm::X25519 | Algorithm::X448) {
+        let curve = if algorithm == Algorithm::X25519 {
+            MontgomeryCurve::X25519
+        } else {
+            MontgomeryCurve::X448
+        };
+        return SoftwareMontgomeryKey::from_serialized(curve, encoded)
             .map(ObjectMaterial::MontgomeryKey)
             .map_err(|_| DeviceError::InvalidData);
     }
@@ -418,6 +423,7 @@ fn key_kind(algorithm: Algorithm) -> Result<KeyKind> {
         Algorithm::EcBrainpoolP384 => KeyKind::Ec(EcCurve::BrainpoolP384),
         Algorithm::EcBrainpoolP512 => KeyKind::Ec(EcCurve::BrainpoolP512),
         Algorithm::Ed25519 => KeyKind::Edwards(EdwardsCurve::Ed25519),
+        Algorithm::Ed448 => KeyKind::Edwards(EdwardsCurve::Ed448),
         Algorithm::Rsa2048 => KeyKind::Rsa { modulus_bits: 2048 },
         Algorithm::Rsa3072 => KeyKind::Rsa { modulus_bits: 3072 },
         Algorithm::Rsa4096 => KeyKind::Rsa { modulus_bits: 4096 },

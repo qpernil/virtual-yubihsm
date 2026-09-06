@@ -1,7 +1,7 @@
 /// Algorithm identifiers from the YubiHSM 2 protocol.
 ///
-/// The published registry ends at `AesKwp`. `X25519` and `EcdhKdf` are
-/// project-supported additions.
+/// The published registry ends at `AesKwp`. The following values are
+/// project-supported extension discovery markers.
 #[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
 #[repr(u8)]
 pub enum Algorithm {
@@ -63,6 +63,10 @@ pub enum Algorithm {
     X25519 = 56,
     /// Support for the virtual `DeriveEcdhKdf` command.
     EcdhKdf = 57,
+    /// Support for direct PKCS #1 v1.5 wrapping of symmetric key material.
+    RsaPkcs1Wrap = 58,
+    X448 = 59,
+    Ed448 = 60,
 }
 
 impl Algorithm {
@@ -125,10 +129,10 @@ impl Algorithm {
     ];
 
     pub const fn from_byte(value: u8) -> Option<Self> {
-        if value == 0 || value > Self::EcdhKdf as u8 {
+        if value == 0 || value > Self::Ed448 as u8 {
             return None;
         }
-        // SAFETY: every value in the inclusive range 1..=57 is represented.
+        // SAFETY: every value in the inclusive range 1..=60 is represented.
         Some(unsafe { core::mem::transmute::<u8, Self>(value) })
     }
 
@@ -161,6 +165,8 @@ impl Algorithm {
             Self::EcP256 | Self::EcK256 | Self::EcBrainpoolP256 | Self::Ed25519 | Self::X25519 => {
                 Some(32)
             }
+            Self::X448 => Some(56),
+            Self::Ed448 => Some(57),
             Self::EcP384 | Self::EcBrainpoolP384 => Some(48),
             Self::EcP521 => Some(66),
             Self::EcBrainpoolP512 => Some(64),
@@ -182,6 +188,8 @@ impl Algorithm {
             Self::EcBrainpoolP512 => Some(192),
             Self::Ed25519 => Some(128),
             Self::X25519 => Some(64),
+            Self::X448 => Some(112),
+            Self::Ed448 => Some(228),
             _ => None,
         }
     }
@@ -219,7 +227,10 @@ mod tests {
         assert_eq!(Algorithm::X25519 as u8, 56);
         assert_eq!(Algorithm::from_byte(56), Some(Algorithm::X25519));
         assert_eq!(Algorithm::from_byte(57), Some(Algorithm::EcdhKdf));
-        assert_eq!(Algorithm::from_byte(58), None);
+        assert_eq!(Algorithm::from_byte(58), Some(Algorithm::RsaPkcs1Wrap));
+        assert_eq!(Algorithm::from_byte(59), Some(Algorithm::X448));
+        assert_eq!(Algorithm::from_byte(60), Some(Algorithm::Ed448));
+        assert_eq!(Algorithm::from_byte(61), None);
     }
 
     #[test]
@@ -235,6 +246,8 @@ mod tests {
             (Algorithm::EcBrainpoolP512, 64, 192),
             (Algorithm::Ed25519, 32, 128),
             (Algorithm::X25519, 32, 64),
+            (Algorithm::X448, 56, 112),
+            (Algorithm::Ed448, 57, 228),
         ] {
             assert_eq!(algorithm.asymmetric_key_length(), Some(material_length));
             assert_eq!(algorithm.asymmetric_object_length(), Some(object_length));

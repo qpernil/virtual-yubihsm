@@ -531,7 +531,13 @@ pub fn run(
     }
     if profile == Profile::Extensions {
         let credentials = credentials.unwrap();
-        run_extensions(transport, credentials, &mut passed, &mut unsupported)?;
+        run_extensions(
+            transport,
+            credentials,
+            &identity.algorithms,
+            &mut passed,
+            &mut unsupported,
+        )?;
     }
     if profile == Profile::Ephemeral {
         let credentials = credentials.unwrap();
@@ -1309,11 +1315,18 @@ fn ed25519_and_ecdh_scenario(
 fn run_extensions(
     transport: &mut dyn FrameTransport,
     credentials: &Credentials,
+    algorithms: &[u8],
     passed: &mut Vec<&'static str>,
     unsupported: &mut Vec<&'static str>,
 ) -> Result<(), QualificationError> {
     run_case(passed, "X25519 key agreement", || {
         x25519_scenario(transport, credentials)
+    })?;
+    run_case(passed, "X448 key agreement", || {
+        x448_scenario(transport, credentials)
+    })?;
+    run_case(passed, "Ed448 signing", || {
+        ed448_scenario(transport, credentials)
     })?;
     match prefixed_ecdh_kdf_scenario(transport, credentials)
         .map_err(|error| QualificationError::new("prefixed ECDH KDF", error))?
@@ -1321,7 +1334,141 @@ fn run_extensions(
         true => passed.push("prefixed ECDH KDF"),
         false => unsupported.push("prefixed ECDH KDF"),
     }
+    if algorithms.contains(&(Algorithm::RsaPkcs1Wrap as u8)) {
+        run_case(passed, "direct PKCS #1 secret-key wrapping", || {
+            rsa_pkcs1_wrapping_scenario(transport, credentials)
+        })?;
+    } else {
+        unsupported.push("direct PKCS #1 secret-key wrapping");
+    }
     Ok(())
+}
+
+fn rsa_pkcs1_wrapping_scenario(
+    transport: &mut dyn FrameTransport,
+    credentials: &Credentials,
+) -> CaseResult {
+    let mut session = SymmetricSession::open(transport, credentials)?;
+    let mut objects = list_objects(transport, &mut session)?;
+    let private_wrap_id = unused_id(&objects, ObjectType::WrapKey, 0x7960)?;
+    objects.insert((private_wrap_id, ObjectType::WrapKey));
+    let public_wrap_id = unused_id(&objects, ObjectType::PublicWrapKey, 0x7961)?;
+    objects.insert((public_wrap_id, ObjectType::PublicWrapKey));
+    let source_id = unused_id(&objects, ObjectType::SymmetricKey, 0x7962)?;
+    objects.insert((source_id, ObjectType::SymmetricKey));
+    let imported_id = unused_id(&objects, ObjectType::SymmetricKey, 0x7963)?;
+    let key_capabilities =
+        CapabilitySet::from_capabilities([Capability::EncryptEcb, Capability::ExportableUnderWrap]);
+
+    let response = session.command(
+        transport,
+        generate_wrap_key(
+            private_wrap_id,
+            Algorithm::Rsa2048,
+            CapabilitySet::from_capabilities([Capability::ImportWrapped]),
+            key_capabilities,
+            "direct private wrap",
+        ),
+    )?;
+    expect_response(&response, CommandCode::GenerateWrapKey)?;
+    let private_public = get_public_key(
+        transport,
+        &mut session,
+        private_wrap_id,
+        ObjectType::WrapKey,
+    )?;
+    let response = session.command(
+        transport,
+        put_public_wrap_key(
+            public_wrap_id,
+            Algorithm::Rsa2048,
+            CapabilitySet::from_capabilities([Capability::ExportWrapped]),
+            key_capabilities,
+            &private_public[1..],
+        ),
+    )?;
+    expect_response(&response, CommandCode::PutPublicWrapKey)?;
+    let response = session.command(
+        transport,
+        put_secret_key(
+            CommandCode::PutSymmetricKey,
+            source_id,
+            key_capabilities,
+            Algorithm::Aes128,
+            &[0x5a; 16],
+            "direct source",
+        ),
+    )?;
+    expect_response(&response, CommandCode::PutSymmetricKey)?;
+
+    let response = session.command(
+        transport,
+        Frame::new(
+            CommandCode::GetRsaWrappedKey as u8,
+            [
+                public_wrap_id.to_be_bytes().as_slice(),
+                &[ObjectType::SymmetricKey as u8],
+                source_id.to_be_bytes().as_slice(),
+                &[0, 0, 0],
+            ]
+            .concat(),
+        )
+        .unwrap(),
+    )?;
+    let wrapped = expect_response(&response, CommandCode::GetRsaWrappedKey)?.to_vec();
+    ensure(
+        wrapped.len() == 256,
+        "direct RSA-wrapped key is not 256 bytes",
+    )?;
+
+    let mut put = private_wrap_id.to_be_bytes().to_vec();
+    put.push(ObjectType::SymmetricKey as u8);
+    put.extend_from_slice(&imported_id.to_be_bytes());
+    put.extend_from_slice(b"direct imported");
+    put.resize(45, 0);
+    put.extend_from_slice(&1_u16.to_be_bytes());
+    put.extend_from_slice(&key_capabilities.to_bytes());
+    put.extend_from_slice(&[Algorithm::Aes128 as u8, 0, 0]);
+    put.extend_from_slice(&wrapped);
+    let response = session.command(
+        transport,
+        Frame::new(CommandCode::PutRsaWrappedKey as u8, put).unwrap(),
+    )?;
+    ensure(
+        expect_response(&response, CommandCode::PutRsaWrappedKey)?
+            == [
+                ObjectType::SymmetricKey as u8,
+                imported_id.to_be_bytes()[0],
+                imported_id.to_be_bytes()[1],
+            ],
+        "direct PKCS #1 import returned a different object identity",
+    )?;
+
+    let plaintext = [0x33; 16];
+    let encrypt = |id: u16| {
+        Frame::new(
+            CommandCode::EncryptEcb as u8,
+            [id.to_be_bytes().as_slice(), plaintext.as_slice()].concat(),
+        )
+        .unwrap()
+    };
+    let source = session.command(transport, encrypt(source_id))?;
+    let imported = session.command(transport, encrypt(imported_id))?;
+    ensure(
+        expect_response(&source, CommandCode::EncryptEcb)?
+            == expect_response(&imported, CommandCode::EncryptEcb)?,
+        "direct RSA-wrapped symmetric key changed",
+    )?;
+
+    for (id, object_type) in [
+        (source_id, ObjectType::SymmetricKey),
+        (imported_id, ObjectType::SymmetricKey),
+        (public_wrap_id, ObjectType::PublicWrapKey),
+        (private_wrap_id, ObjectType::WrapKey),
+    ] {
+        delete_object(transport, &mut session, id, object_type)?;
+    }
+    session.close(transport)
 }
 
 fn x25519_scenario(transport: &mut dyn FrameTransport, credentials: &Credentials) -> CaseResult {
@@ -1345,7 +1492,7 @@ fn x25519_scenario(transport: &mut dyn FrameTransport, credentials: &Credentials
     )?;
     let peer = SoftwareMontgomeryKey::from_serialized(MontgomeryCurve::X25519, &[0x33; 32])
         .map_err(|error| format!("invalid X25519 qualification peer: {error:?}"))?;
-    let device_secret = derive_x25519(transport, &mut session, id, &peer.public_key())?;
+    let device_secret = derive_montgomery(transport, &mut session, id, &peer.public_key())?;
     let peer_secret = peer
         .derive(&public[1..])
         .map_err(|error| format!("independent X25519 derivation failed: {error:?}"))?;
@@ -1353,6 +1500,82 @@ fn x25519_scenario(transport: &mut dyn FrameTransport, credentials: &Credentials
         device_secret == *peer_secret && device_secret.len() == 32,
         "X25519 device and independent peer derived different secrets",
     )?;
+    delete_object(transport, &mut session, id, ObjectType::AsymmetricKey)?;
+    session.close(transport)
+}
+
+fn x448_scenario(transport: &mut dyn FrameTransport, credentials: &Credentials) -> CaseResult {
+    let mut session = SymmetricSession::open(transport, credentials)?;
+    let objects = list_objects(transport, &mut session)?;
+    let id = unused_id(&objects, ObjectType::AsymmetricKey, 0x7981)?;
+    let response = session.command(
+        transport,
+        generate_asymmetric_key(
+            id,
+            CapabilitySet::from_capabilities([Capability::DeriveEcdh]),
+            Algorithm::X448,
+            "qualification x448",
+        ),
+    )?;
+    expect_response(&response, CommandCode::GenerateAsymmetricKey)?;
+    let public = get_public_key(transport, &mut session, id, ObjectType::AsymmetricKey)?;
+    ensure(
+        public.len() == 57 && public[0] == Algorithm::X448 as u8,
+        "X448 returned an invalid public key",
+    )?;
+    let peer = SoftwareMontgomeryKey::from_serialized(MontgomeryCurve::X448, &[0x33; 56])
+        .map_err(|error| format!("invalid X448 qualification peer: {error:?}"))?;
+    let device_secret = derive_montgomery(transport, &mut session, id, &peer.public_key())?;
+    let peer_secret = peer
+        .derive(&public[1..])
+        .map_err(|error| format!("independent X448 derivation failed: {error:?}"))?;
+    ensure(
+        device_secret == *peer_secret && device_secret.len() == 56,
+        "X448 device and independent peer derived different secrets",
+    )?;
+    delete_object(transport, &mut session, id, ObjectType::AsymmetricKey)?;
+    session.close(transport)
+}
+
+fn ed448_scenario(transport: &mut dyn FrameTransport, credentials: &Credentials) -> CaseResult {
+    let mut session = SymmetricSession::open(transport, credentials)?;
+    let objects = list_objects(transport, &mut session)?;
+    let id = unused_id(&objects, ObjectType::AsymmetricKey, 0x7982)?;
+    let response = session.command(
+        transport,
+        generate_asymmetric_key(
+            id,
+            CapabilitySet::from_capabilities([Capability::SignEddsa]),
+            Algorithm::Ed448,
+            "qualification ed448",
+        ),
+    )?;
+    expect_response(&response, CommandCode::GenerateAsymmetricKey)?;
+    let public = get_public_key(transport, &mut session, id, ObjectType::AsymmetricKey)?;
+    ensure(
+        public.len() == 58 && public[0] == Algorithm::Ed448 as u8,
+        "Ed448 returned an invalid public key",
+    )?;
+    let verifier = SoftwarePublicKey::Edwards {
+        curve: EdwardsCurve::Ed448,
+        public_key: public[1..].to_vec(),
+    };
+    let message = b"YubiHSM Ed448 qualification message";
+    let response = session.command(
+        transport,
+        Frame::new(
+            CommandCode::SignEddsa as u8,
+            [id.to_be_bytes().as_slice(), message].concat(),
+        )
+        .unwrap(),
+    )?;
+    verifier
+        .verify_message(
+            SignatureScheme::Ed448,
+            message,
+            expect_response(&response, CommandCode::SignEddsa)?,
+        )
+        .map_err(|error| format!("Ed448 signature did not verify: {error:?}"))?;
     delete_object(transport, &mut session, id, ObjectType::AsymmetricKey)?;
     session.close(transport)
 }
@@ -2553,7 +2776,7 @@ fn derive_ecdh(
     expect_response(&response, CommandCode::DeriveEcdh).map(<[u8]>::to_vec)
 }
 
-fn derive_x25519(
+fn derive_montgomery(
     transport: &mut dyn FrameTransport,
     session: &mut SymmetricSession,
     id: u16,
@@ -2724,7 +2947,7 @@ mod tests {
         let mut transport = InProcessTransport::factory_default();
         let credentials = Credentials::from_password(1, b"password");
         let report = run(&mut transport, Profile::Extensions, Some(&credentials)).unwrap();
-        assert_eq!(report.passed.len(), 22);
+        assert_eq!(report.passed.len(), 25);
         assert_eq!(transport.device().active_session_count(), 0);
     }
 
