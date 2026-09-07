@@ -15,13 +15,15 @@ only the resulting per-session keys.
 | --- | --- | --- |
 | Fresh `virtual-yubihsm-core` | `InProcessTransport` | Protocol core, sessions, authorization, objects, audit semantics. |
 | Connector-hosted virtual HSM | `ConnectorHttpTransport` | Core plus actor, registry, persistence boundary, and HTTP command route. |
+| Experimental I2C virtual HSM | `ConnectorHttpTransport` through a connector built with `experimental-i2c` | Core plus connector I2C transport, target-driver framing, persistence boundary, and READY GPIO handshake. |
 | USB-gadget virtual HSM | `ConnectorHttpTransport` through a connector that claimed the gadget | FunctionFS framing, USB lifecycle, connector USB transport, and the core. |
 | Physical YubiHSM | `ConnectorHttpTransport` through a connector that claimed the HSM | Reference behavior over the same public command path. |
 
-The last three deliberately share one adapter. Their difference is the device
-claimed by the connector, not the frame contract. Connector status should be
+Connector-backed targets share one adapter. Their difference is the device
+served by the connector, not the frame contract. Connector status should be
 recorded beside a qualification run so an embedded target (`kind: embedded`)
-cannot be mistaken for a USB target (`kind: usb`). For USB targets, record the
+cannot be mistaken for a USB target (`kind: usb`) or an experimental I2C
+target (`kind: i2c`). For USB targets, record the
 physical setup separately: a virtual gadget and a real HSM intentionally have
 the same transport kind.
 
@@ -108,6 +110,10 @@ Run read-only checks against any connector target:
 cargo run -p yubihsm-qualification -- \
   connector http://127.0.0.1:12345 12345678 smoke
 ```
+
+For experimental I2C targets, configure the Linux connector with its
+`experimental-i2c` build feature and `--i2c-yubihsm`, then use the same
+`connector` qualification command. See [I2C setup](i2c.md#qualification-through-the-connector).
 
 For a dedicated target whose symmetric Authentication Key is derived from a
 password, keep the password out of the process arguments:

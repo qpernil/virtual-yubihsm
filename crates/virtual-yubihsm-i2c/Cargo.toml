@@ -1,0 +1,17 @@
+[package]
+name = "virtual-yubihsm-i2c"
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.94"
+description = "Unprivileged I2C target frontend for virtual-yubihsm-core"
+license = "MIT OR Apache-2.0"
+publish = false
+
+[dependencies]
+libc = "0.2.189"
+usb-gadget-worker = { path = "../../../usb-gadget-supervisor/crates/usb-gadget-worker" }
+virtual-yubihsm-core = { path = "../virtual-yubihsm-core" }
+
+[[bin]]
+name = "virtual-yubihsm-i2c"
+path = "src/main.rs"

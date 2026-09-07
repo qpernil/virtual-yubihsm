@@ -1,0 +1,43 @@
+[Unit]
+Description=Virtual YubiHSM I2C target
+Documentation=https://github.com/qpernil/virtual-yubihsm/blob/main/docs/i2c.md
+Requires=dev-bsc\x2dtarget0.device
+After=dev-bsc\x2dtarget0.device
+
+[Service]
+Type=simple
+User=virtual-yubihsm
+Group=virtual-yubihsm
+Environment=YUBIHSM_PERSISTENCE=batched
+EnvironmentFile=/etc/virtual-yubihsm-i2c
+ExecStart=/usr/local/sbin/virtual-yubihsm-i2c --serial ${YUBIHSM_SERIAL} --state-directory /var/lib/virtual-yubihsm-i2c --persistence ${YUBIHSM_PERSISTENCE}
+StateDirectory=virtual-yubihsm-i2c
+StateDirectoryMode=0700
+UMask=0077
+Restart=on-failure
+RestartSec=1s
+
+CapabilityBoundingSet=
+DevicePolicy=closed
+DeviceAllow=/dev/bsc-target0 rw
+IPAddressDeny=any
+LockPersonality=true
+MemoryDenyWriteExecute=true
+NoNewPrivileges=true
+PrivateDevices=false
+PrivateTmp=true
+ProtectClock=true
+ProtectControlGroups=true
+ProtectHome=true
+ProtectHostname=true
+ProtectKernelLogs=true
+ProtectKernelModules=true
+ProtectKernelTunables=true
+ProtectSystem=strict
+RestrictAddressFamilies=AF_UNIX
+RestrictNamespaces=true
+RestrictRealtime=true
+SystemCallArchitectures=native
+
+[Install]
+WantedBy=multi-user.target

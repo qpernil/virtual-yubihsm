@@ -1,0 +1,17 @@
+schema = 1
+mode = "device"
+name = "virtual-yubihsm-i2c"
+
+[worker]
+command = "/absolute/path/to/virtual-yubihsm/target/release/virtual-yubihsm-i2c"
+arguments = ["--inherited-device", "--serial", "24000001", "--state-directory", "/var/lib/virtual-yubihsm-i2c"]
+run_as = "per"
+state_directory = "/var/lib/virtual-yubihsm-i2c"
+runtime_directory = "/run/virtual-yubihsm-i2c"
+
+[[resources]]
+type = "character-device"
+name = "target"
+path = "/dev/bsc-target0"
+access = "read-write"
+fd = 3
