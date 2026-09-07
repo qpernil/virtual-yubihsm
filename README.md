@@ -53,9 +53,15 @@ device, using the same state ownership and persistence rules as the USB worker.
 See the [built-in connector integration](docs/pkcs11rs-connector-integration.md).
 The deliberate differences from physical firmware are catalogued in
 [virtual extensions](docs/virtual-extensions.md).
+The [object-info length contract](docs/object-info-lengths.md) records the
+compatibility rules for reported object sizes.
 The virtual `derive-ecdh-kdf` command maps to
 `CKM_PKCS11RS_PREFIXED_ECDH_DERIVE` as documented in
 [prefixed ECDH derivation](docs/prefixed-ecdh-derive.md).
+
+The [experimental I2C transport](docs/i2c.md) exposes the same core through the Raspberry Pi
+BSC target driver. It requires an active-low READY GPIO and supports staged header/payload reads, unprivileged target
+operation, and a network-less systemd deployment.
 
 An authenticated session receives exactly the Authentication Key object's:
 

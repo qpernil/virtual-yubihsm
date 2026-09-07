@@ -1,0 +1,2 @@
+# Give the unprivileged virtual YubiHSM service access to the loaded target.
+KERNEL=="bsc-target0", GROUP="virtual-yubihsm", MODE="0660"

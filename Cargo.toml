@@ -9,6 +9,7 @@ publish = false
 
 [workspace]
 members = [
+    "crates/virtual-yubihsm-i2c",
     "crates/virtual-yubihsm-core",
     "crates/yubihsm-qualification",
 ]
