@@ -79,6 +79,56 @@ exception: it requires the type-specific delete capability on the session and a
 shared domain, but does not require the target object to authorize its own
 deletion.
 
+## Planned: native key derivation for SCP03/SCP11
+
+The [cross-repository plan](https://github.com/qpernil/pkcs11rs/blob/master/docs/scp-key-provider/README.md)
+uses this device to protect long-term credentials and agreement inputs during
+client-side SCP derivation. The client reads the final channel working keys
+once, then performs encryption, decryption, and MAC locally. There is no
+message-crypto placement option or per-message provider round trip.
+
+The actor is the SCP client in pkcs11rs; its derivation provider is independent
+of the target receiving protected commands. The target performs its own end of
+secure messaging. YubiHSM has no DEK: key imports travel inside the channel.
+The [operation matrix](https://github.com/qpernil/pkcs11rs/blob/master/docs/scp-key-provider/operation-matrix.md)
+records the YubiHSM and separate GlobalPlatform card profiles.
+
+The client implements symmetric/asymmetric derivation through the ergonomic
+`Pkcs11Auth` Rust session API, sharing handlers with the public C exports.
+Preparation supplies either a temporary software slot for direct credentials
+or a view of an existing PKCS #11 slot with its backend, objects, and authorization
+shared. The derivation code uses the same session API in both cases, followed
+by local working-key storage and crypto. Configured provider selection and the
+[named credential resolver](https://github.com/qpernil/pkcs11rs/blob/master/docs/scp-key-provider/credential-lookup.md)
+remain planned. The generic credential profile is a 32-byte secret containing
+ENC/MAC, or a P-256 private key. Physical YubiHSM symmetric credentials need
+separate AES ENC/MAC objects because protected generic-secret splitting is not
+a native operation; counter KDF can use native AES keys without exporting them.
+
+Native support needs protected persistent storage, bounded volatile objects,
+and generic agreement, composition, extraction, and KDF commands. Reuse shared
+software-key-core primitives with explicit capability/domain checks and atomic
+creation. Long-term credentials and raw ECDH results remain non-exportable;
+final outputs must explicitly permit value reads from creation. SCP11 hash
+outputs must permit readable extraction under the PKCS #11 inheritance rules.
+Do not weaken existing objects when a source policy denies this workflow.
+The existing prefixed-ECDH command returns KDF bytes and alone does not provide
+the generic chainable object contract.
+
+Define native session ownership, authorization, lookup ambiguity, capacity,
+expiration, identifiers, and cleanup for the complete derivation graph. Avoid
+NVM writes for temporary objects. Native traces must demonstrate protected
+agreement and derivation followed by policy-permitted working-key reads.
+After those reads, provider removal cannot revoke the client's working bytes;
+the target channel owns their lifetime and zeroizes them on close or failure.
+
+Completion requires software/native derivation to produce interoperable
+channels, with tests for policy denial, bad receipts, partial failure, stale
+handles, cleanup, and no provider calls during message processing. Native
+commands and configured provider selection are future work. A virtual device exercises a
+real protocol/authorization boundary without claiming physical tamper resistance.
+See [protected-key composition](docs/prefixed-ecdh-derive.md#future-true-key-derivation).
+
 ## Supported protocol
 
 - wire frame parsing and documented device errors;
