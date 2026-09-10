@@ -100,10 +100,12 @@ or a view of an existing PKCS #11 slot with its backend, objects, and authorizat
 shared. The derivation code uses the same session API in both cases, followed
 by local working-key storage and crypto. Configured provider selection and the
 [named credential resolver](https://github.com/qpernil/pkcs11rs/blob/master/docs/scp-key-provider/credential-lookup.md)
-remain planned. The generic credential profile is a 32-byte secret containing
-ENC/MAC, or a P-256 private key. Physical YubiHSM symmetric credentials need
-separate AES ENC/MAC objects because protected generic-secret splitting is not
-a native operation; counter KDF can use native AES keys without exporting them.
+remain planned. A symmetric credential consists of two protected AES-128
+objects labelled `<name>.enc` and `<name>.mac`; an asymmetric credential is a
+P-256 private key. The same AES-pair binding is used for software and native
+sources. Counter KDF operates directly on each AES handle, including physical
+YubiHSM keys, without exporting or splitting long-term values. The prepared-session
+pair resolver uses the short label suffixes to distinguish roles.
 
 Native support needs protected persistent storage, bounded volatile objects,
 and generic agreement, composition, extraction, and KDF commands. Reuse shared
