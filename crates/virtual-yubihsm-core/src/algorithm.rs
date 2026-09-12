@@ -67,6 +67,8 @@ pub enum Algorithm {
     RsaPkcs1Wrap = 58,
     X448 = 59,
     Ed448 = 60,
+    /// Support for volatile objects and protected derivation graphs.
+    SessionKeyDerivation = 61,
 }
 
 impl Algorithm {
@@ -129,10 +131,10 @@ impl Algorithm {
     ];
 
     pub const fn from_byte(value: u8) -> Option<Self> {
-        if value == 0 || value > Self::Ed448 as u8 {
+        if value == 0 || value > Self::SessionKeyDerivation as u8 {
             return None;
         }
-        // SAFETY: every value in the inclusive range 1..=60 is represented.
+        // SAFETY: every value in the inclusive range 1..=61 is represented.
         Some(unsafe { core::mem::transmute::<u8, Self>(value) })
     }
 
@@ -230,7 +232,11 @@ mod tests {
         assert_eq!(Algorithm::from_byte(58), Some(Algorithm::RsaPkcs1Wrap));
         assert_eq!(Algorithm::from_byte(59), Some(Algorithm::X448));
         assert_eq!(Algorithm::from_byte(60), Some(Algorithm::Ed448));
-        assert_eq!(Algorithm::from_byte(61), None);
+        assert_eq!(
+            Algorithm::from_byte(61),
+            Some(Algorithm::SessionKeyDerivation)
+        );
+        assert_eq!(Algorithm::from_byte(62), None);
     }
 
     #[test]

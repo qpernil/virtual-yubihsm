@@ -65,6 +65,8 @@ pub enum Capability {
     /// This is a virtual-device extension and is intentionally distinct from
     /// `DeriveEcdh`, which returns the raw ECDH result.
     DeriveEcdhKdf = 0x38,
+    /// Create, use, read, and destroy volatile protected objects.
+    DeriveSessionKey = 0x39,
 }
 
 /// The protocol's big-endian eight-byte capability bitmap.

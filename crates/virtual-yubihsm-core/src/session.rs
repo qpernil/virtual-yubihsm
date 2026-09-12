@@ -46,6 +46,7 @@ pub(crate) struct SessionEntry {
     pub(crate) expected_host_cryptogram: Option<[u8; MAC_LENGTH]>,
     pub(crate) authenticated: bool,
     pub(crate) last_activity: Instant,
+    pub(crate) objects: crate::session_object::SessionObjects,
 }
 
 #[derive(Debug)]

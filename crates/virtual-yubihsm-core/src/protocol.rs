@@ -68,6 +68,14 @@ pub enum CommandCode {
     ImportRsaWrapped = 0x77,
     /// Virtual-device extension for atomic prefixed ECDH key derivation.
     DeriveEcdhKdf = 0x78,
+    /// Virtual-device extension for protected volatile-object derivation.
+    DeriveSessionObject = 0x79,
+    /// Virtual-device extension for policy-controlled volatile-object reads.
+    ReadSessionObject = 0x7a,
+    /// Virtual-device extension for volatile-object verification.
+    VerifySessionObject = 0x7b,
+    /// Virtual-device extension for explicit volatile-object destruction.
+    DeleteSessionObject = 0x7c,
 }
 
 impl CommandCode {
@@ -138,6 +146,10 @@ impl CommandCode {
             0x76 => ExportRsaWrapped,
             0x77 => ImportRsaWrapped,
             0x78 => DeriveEcdhKdf,
+            0x79 => DeriveSessionObject,
+            0x7a => ReadSessionObject,
+            0x7b => VerifySessionObject,
+            0x7c => DeleteSessionObject,
             _ => return None,
         })
     }
@@ -166,6 +178,9 @@ impl CommandCode {
             SignEcdsa => Some(Capability::SignEcdsa),
             DeriveEcdh => Some(Capability::DeriveEcdh),
             DeriveEcdhKdf => Some(Capability::DeriveEcdhKdf),
+            DeriveSessionObject | ReadSessionObject | VerifySessionObject | DeleteSessionObject => {
+                Some(Capability::DeriveSessionKey)
+            }
             DecryptOaep => Some(Capability::DecryptOaep),
             GenerateHmacKey => Some(Capability::GenerateHmacKey),
             GenerateWrapKey => Some(Capability::GenerateWrapKey),
