@@ -88,6 +88,14 @@ the complete `managed` profile first, keeps project additions visibly separate,
 and reports an unavailable addition as `UNSUPPORTED` rather than weakening the
 common qualification result.
 
+Protected volatile derivation has device-core coverage for session isolation,
+right-truncated ECDH, capability enforcement, counter KDF, CMAC verification,
+algorithm disablement, deletion, and cleanup. pkcs11rs adds a public C API graph
+covering native placement, cross-PKCS-session visibility, protected values,
+software materialization of readable outputs, secure-session recreation, stale
+handles, and owner-session cleanup. The command-line `extensions` profile does
+not yet run that multi-operation graph against an external device transport.
+
 `ephemeral` adds persistent audit configuration and audit-log assertions. It
 proves that Create Session and Authenticate Session can be audited while the
 Session Message meta-command cannot. Because audit entries cannot be removed

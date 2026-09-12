@@ -8,6 +8,9 @@ use crate::{
         P256_PUBLIC_KEY_LENGTH, SecureSession, SessionEntry, random_secret_key,
         secure_response_data_fits, secure_response_fits,
     },
+    session_object::{
+        FLAG_DERIVE, FLAG_READABLE, FLAG_VERIFY, SessionObject, SessionObjectKind, SessionObjects,
+    },
 };
 use ciborium::Value as CborValue;
 use const_oid::ObjectIdentifier;
@@ -19,6 +22,7 @@ use rsa::{BigUint, RsaPublicKey, pkcs8::EncodePublicKey as EncodeRsaPublicKey};
 use serde::{Deserialize, Serialize};
 use signature::{Keypair, Signer};
 use software_key_core::{
+    counter_kdf::{CounterKdfField, IntegerFormat, LengthMethod, cmac_counter_kdf},
     digest::{HashAlgorithm, x963_kdf},
     rsa_signing::RsaHashAlgorithm,
     secure_channel::yubico_password_kdf,
@@ -27,9 +31,9 @@ use software_key_core::{
         EcCurve, EdwardsCurve, KeyKind, SignatureScheme, SoftwarePublicKey, SoftwareSigningKey,
     },
     software_symmetric::{
-        AES_BLOCK_SIZE, AES_CCM_NONCE_SIZE, AES_CCM_TAG_SIZE, decrypt_aes_cbc, decrypt_aes_ccm,
-        decrypt_aes_ecb, decrypt_yubico_otp_aead, encrypt_aes_cbc, encrypt_aes_ccm,
-        encrypt_aes_ecb, encrypt_yubico_otp_aead, unwrap_aes_kwp, wrap_aes_kwp,
+        AES_BLOCK_SIZE, AES_CCM_NONCE_SIZE, AES_CCM_TAG_SIZE, aes_cmac, decrypt_aes_cbc,
+        decrypt_aes_ccm, decrypt_aes_ecb, decrypt_yubico_otp_aead, encrypt_aes_cbc,
+        encrypt_aes_ccm, encrypt_aes_ecb, encrypt_yubico_otp_aead, unwrap_aes_kwp, wrap_aes_kwp,
     },
 };
 use spki::{
@@ -301,6 +305,7 @@ impl Default for DeviceConfig {
                     Algorithm::RsaPkcs1Wrap,
                     Algorithm::X448,
                     Algorithm::Ed448,
+                    Algorithm::SessionKeyDerivation,
                 ])
                 .map(|algorithm| algorithm as u8)
                 .collect(),
@@ -544,6 +549,7 @@ impl Device {
                             expected_host_cryptogram: Some(expected_host_cryptogram),
                             authenticated: false,
                             last_activity: Instant::now(),
+                            objects: SessionObjects::default(),
                         },
                     );
                     let mut response = Vec::with_capacity(1 + CHALLENGE_LENGTH + 8);
@@ -571,6 +577,7 @@ impl Device {
                             expected_host_cryptogram: None,
                             authenticated: true,
                             last_activity: Instant::now(),
+                            objects: SessionObjects::default(),
                         },
                     );
                     let mut response = Vec::with_capacity(1 + P256_PUBLIC_KEY_LENGTH + 16);
@@ -675,8 +682,9 @@ impl Device {
             None => handler(entry.authorization, &inner),
         };
         let handled_externally = handled_response.is_some();
-        let response =
-            handled_response.unwrap_or_else(|| self.execute_inner(entry.authorization, &inner));
+        let response = handled_response.unwrap_or_else(|| {
+            self.execute_inner_with_session(entry.authorization, &inner, Some(&mut entry.objects))
+        });
         let response = if secure_response_fits(&response) {
             response
         } else {
@@ -714,6 +722,15 @@ impl Device {
     /// Execute an already decrypted session command under a snapshotted
     /// Authentication Key authorization context.
     pub fn execute_inner(&mut self, authorization: SessionAuthorization, request: &Frame) -> Frame {
+        self.execute_inner_with_session(authorization, request, None)
+    }
+
+    fn execute_inner_with_session(
+        &mut self,
+        authorization: SessionAuthorization,
+        request: &Frame,
+        objects: Option<&mut SessionObjects>,
+    ) -> Frame {
         let command = CommandCode::from_byte(request.command);
         let should_audit = command.is_some_and(|command| self.should_audit(command));
         if command.is_some_and(|command| {
@@ -729,7 +746,7 @@ impl Device {
         }
 
         let result = self
-            .execute_inner_result(authorization, request)
+            .execute_inner_result(authorization, request, objects)
             .and_then(|data| {
                 if secure_response_data_fits(data.len()) {
                     Ok(data)
@@ -912,6 +929,7 @@ impl Device {
         &mut self,
         authorization: SessionAuthorization,
         request: &Frame,
+        session_objects: Option<&mut SessionObjects>,
     ) -> Result<Vec<u8>> {
         if let Some(result) = self.execute_plain_or_authenticated(request) {
             return result;
@@ -967,6 +985,23 @@ impl Device {
             CommandCode::SignEddsa => self.sign_eddsa(authorization, &request.data),
             CommandCode::DeriveEcdh => self.derive_ecdh(authorization, &request.data),
             CommandCode::DeriveEcdhKdf => self.derive_ecdh_kdf(authorization, &request.data),
+            CommandCode::DeriveSessionObject => self.derive_session_object(
+                authorization,
+                session_objects.ok_or(DeviceError::InvalidSession)?,
+                &request.data,
+            ),
+            CommandCode::ReadSessionObject => self.read_session_object(
+                session_objects.ok_or(DeviceError::InvalidSession)?,
+                &request.data,
+            ),
+            CommandCode::VerifySessionObject => self.verify_session_object(
+                session_objects.ok_or(DeviceError::InvalidSession)?,
+                &request.data,
+            ),
+            CommandCode::DeleteSessionObject => self.delete_session_object(
+                session_objects.ok_or(DeviceError::InvalidSession)?,
+                &request.data,
+            ),
             CommandCode::DecryptPkcs1 => self.decrypt_pkcs1(authorization, &request.data),
             CommandCode::DecryptOaep => self.decrypt_oaep(authorization, &request.data),
             CommandCode::PutHmacKey => self.put_hmac_key(authorization, &request.data, false),
@@ -1454,12 +1489,14 @@ impl Device {
     }
 
     fn algorithm_enabled(&self, algorithm: u8) -> bool {
-        self.options
-            .algorithm_toggle
-            .get(&algorithm)
-            .copied()
-            .unwrap_or(OPTION_ON)
-            != OPTION_OFF
+        self.config.algorithms.contains(&algorithm)
+            && self
+                .options
+                .algorithm_toggle
+                .get(&algorithm)
+                .copied()
+                .unwrap_or(OPTION_ON)
+                != OPTION_OFF
             && !(self.options.fips_mode != OPTION_OFF && fips_disallowed_algorithm(algorithm))
     }
 
@@ -2009,6 +2046,230 @@ impl Device {
         x963_kdf(hash, &prefixed, shared_info, output_length)
             .map(|output| output.to_vec())
             .map_err(|_| DeviceError::InvalidData)
+    }
+
+    fn derive_session_object(
+        &self,
+        authorization: SessionAuthorization,
+        objects: &mut SessionObjects,
+        data: &[u8],
+    ) -> Result<Vec<u8>> {
+        self.require_algorithm_enabled(Algorithm::SessionKeyDerivation as u8)?;
+        let (&operation, rest) = data.split_first().ok_or(DeviceError::WrongLength)?;
+        let (&flags, rest) = rest.split_first().ok_or(DeviceError::WrongLength)?;
+        if flags & !(FLAG_READABLE | FLAG_DERIVE | FLAG_VERIFY) != 0 {
+            return Err(DeviceError::InvalidData);
+        }
+
+        if operation == SESSION_DERIVE_GENERATE_P256 {
+            if !rest.is_empty() || flags & FLAG_DERIVE == 0 {
+                return Err(DeviceError::InvalidData);
+            }
+            let key = SoftwareSigningKey::generate_for_kind(KeyKind::Ec(EcCurve::P256))
+                .map_err(|_| DeviceError::StorageFailed)?;
+            let object = SessionObject::p256_private(flags, key).ok_or(DeviceError::InvalidData)?;
+            let public = object.public_key().ok_or(DeviceError::StorageFailed)?;
+            let handle = objects.insert(object).ok_or(DeviceError::StorageFailed)?;
+            let mut response = Vec::with_capacity(8 + public.len());
+            response.extend_from_slice(&handle.to_be_bytes());
+            response.extend_from_slice(&public);
+            return Ok(response);
+        }
+
+        if rest.len() < 3 {
+            return Err(DeviceError::WrongLength);
+        }
+        let kind = SessionObjectKind::from_byte(rest[0]).ok_or(DeviceError::InvalidData)?;
+        if kind == SessionObjectKind::P256Private {
+            return Err(DeviceError::InvalidData);
+        }
+        let output_length = usize::from(u16::from_be_bytes([rest[1], rest[2]]));
+        if output_length == 0 || output_length > 1024 {
+            return Err(DeviceError::WrongLength);
+        }
+        let rest = &rest[3..];
+        let value = match operation {
+            SESSION_DERIVE_ECDH => {
+                let mut offset = 0;
+                let source = parse_session_source(rest, &mut offset)?;
+                if rest.len() < offset + 2 {
+                    return Err(DeviceError::WrongLength);
+                }
+                let public_length = usize::from(parse_u16_at(rest, offset)?);
+                offset += 2;
+                if rest.len() != offset.saturating_add(public_length) {
+                    return Err(DeviceError::WrongLength);
+                }
+                let key = match source {
+                    SessionSource::PersistentAsymmetric(id) => {
+                        let object = self.asymmetric_object(authorization, id)?;
+                        authorization.authorize_use(
+                            &object.info,
+                            Capability::DeriveEcdh,
+                            Capability::DeriveEcdh,
+                        )?;
+                        signing_key(object)?
+                    }
+                    SessionSource::Volatile(handle) => {
+                        let object = objects.get(handle).ok_or(DeviceError::ObjectNotFound)?;
+                        if object.flags & FLAG_DERIVE == 0 {
+                            return Err(DeviceError::InsufficientPermissions);
+                        }
+                        object.p256_key().ok_or(DeviceError::InvalidData)?
+                    }
+                    SessionSource::PersistentSymmetric(_) => {
+                        return Err(DeviceError::InvalidData);
+                    }
+                };
+                let value = derive_with_signing_key(key, &rest[offset..])
+                    .map_err(|_| DeviceError::InvalidData)?;
+                if output_length > value.len() {
+                    return Err(DeviceError::WrongLength);
+                }
+                let offset = value.len() - output_length;
+                Zeroizing::new(value[offset..].to_vec())
+            }
+            SESSION_DERIVE_APPEND_KEY => {
+                if rest.len() != 16 {
+                    return Err(DeviceError::WrongLength);
+                }
+                let left = session_derivation_secret(objects, parse_u64_at(rest, 0)?)?;
+                let right = session_derivation_secret(objects, parse_u64_at(rest, 8)?)?;
+                let available = left
+                    .len()
+                    .checked_add(right.len())
+                    .ok_or(DeviceError::WrongLength)?;
+                if output_length > available {
+                    return Err(DeviceError::WrongLength);
+                }
+                let mut value = Zeroizing::new(Vec::with_capacity(output_length));
+                value.extend(left.iter().chain(right.iter()).take(output_length).copied());
+                value
+            }
+            SESSION_DERIVE_APPEND_DATA => {
+                if rest.len() < 8 {
+                    return Err(DeviceError::WrongLength);
+                }
+                let base = session_derivation_secret(objects, parse_u64_at(rest, 0)?)?;
+                let available = base
+                    .len()
+                    .checked_add(rest.len() - 8)
+                    .ok_or(DeviceError::WrongLength)?;
+                if output_length > available {
+                    return Err(DeviceError::WrongLength);
+                }
+                let mut value = Zeroizing::new(Vec::with_capacity(output_length));
+                value.extend(base.iter().chain(&rest[8..]).take(output_length).copied());
+                value
+            }
+            SESSION_DERIVE_EXTRACT => {
+                if rest.len() != 10 {
+                    return Err(DeviceError::WrongLength);
+                }
+                let base = session_derivation_secret(objects, parse_u64_at(rest, 0)?)?;
+                let offset = usize::from(parse_u16_at(rest, 8)?);
+                if offset >= base.len() * 8 {
+                    return Err(DeviceError::InvalidData);
+                }
+                if output_length > base.len() {
+                    return Err(DeviceError::WrongLength);
+                }
+                let mut value = Zeroizing::new(Vec::with_capacity(output_length));
+                for index in 0..output_length {
+                    let bit = (offset + index * 8) % (base.len() * 8);
+                    let byte_index = bit / 8;
+                    let shift = bit % 8;
+                    value.push(if shift == 0 {
+                        base[byte_index]
+                    } else {
+                        (base[byte_index] << shift)
+                            | (base[(byte_index + 1) % base.len()] >> (8 - shift))
+                    });
+                }
+                value
+            }
+            SESSION_DERIVE_SHA256 => {
+                if rest.len() != 8 || output_length > 32 {
+                    return Err(DeviceError::WrongLength);
+                }
+                let base = session_derivation_secret(objects, parse_u64_at(rest, 0)?)?;
+                let digest = HashAlgorithm::Sha256.digest(&base);
+                Zeroizing::new(digest[..output_length].to_vec())
+            }
+            SESSION_DERIVE_COUNTER => {
+                let mut offset = 0;
+                let source = parse_session_source(rest, &mut offset)?;
+                let key = match source {
+                    SessionSource::PersistentSymmetric(id) => {
+                        let object = self.symmetric_object(authorization, id)?;
+                        authorization.authorize_use(
+                            &object.info,
+                            Capability::EncryptEcb,
+                            Capability::EncryptEcb,
+                        )?;
+                        Zeroizing::new(object_secret(object)?.to_vec())
+                    }
+                    SessionSource::Volatile(handle) => session_derivation_secret(objects, handle)?,
+                    SessionSource::PersistentAsymmetric(_) => {
+                        return Err(DeviceError::InvalidData);
+                    }
+                };
+                let fields = parse_counter_fields(rest, &mut offset)?;
+                if offset != rest.len() {
+                    return Err(DeviceError::WrongLength);
+                }
+                cmac_counter_kdf(&key, &fields, output_length)
+                    .map_err(|_| DeviceError::InvalidData)?
+            }
+            _ => return Err(DeviceError::InvalidData),
+        };
+        let object = SessionObject::secret(kind, flags, value).ok_or(DeviceError::InvalidData)?;
+        let handle = objects.insert(object).ok_or(DeviceError::StorageFailed)?;
+        Ok(handle.to_be_bytes().to_vec())
+    }
+
+    fn read_session_object(&self, objects: &SessionObjects, data: &[u8]) -> Result<Vec<u8>> {
+        self.require_algorithm_enabled(Algorithm::SessionKeyDerivation as u8)?;
+        let handle = parse_u64(data)?;
+        let object = objects.get(handle).ok_or(DeviceError::ObjectNotFound)?;
+        if object.flags & FLAG_READABLE == 0 {
+            return Err(DeviceError::InsufficientPermissions);
+        }
+        object
+            .secret_value()
+            .map(Vec::from)
+            .ok_or(DeviceError::InvalidData)
+    }
+
+    fn verify_session_object(&self, objects: &SessionObjects, data: &[u8]) -> Result<Vec<u8>> {
+        self.require_algorithm_enabled(Algorithm::SessionKeyDerivation as u8)?;
+        if data.len() < 10 {
+            return Err(DeviceError::WrongLength);
+        }
+        let object = objects
+            .get(parse_u64(&data[..8])?)
+            .ok_or(DeviceError::ObjectNotFound)?;
+        if object.kind != SessionObjectKind::Aes || object.flags & FLAG_VERIFY == 0 {
+            return Err(DeviceError::InsufficientPermissions);
+        }
+        let key = object.secret_value().ok_or(DeviceError::InvalidData)?;
+        let signature_length = usize::from(data[8]);
+        if !(1..=AES_BLOCK_SIZE).contains(&signature_length) || data.len() < 9 + signature_length {
+            return Err(DeviceError::WrongLength);
+        }
+        let signature = &data[9..9 + signature_length];
+        let expected =
+            aes_cmac(key, &data[9 + signature_length..]).map_err(|_| DeviceError::InvalidData)?;
+        Ok(vec![u8::from(bool::from(
+            expected[..signature_length].ct_eq(signature),
+        ))])
+    }
+
+    fn delete_session_object(&self, objects: &mut SessionObjects, data: &[u8]) -> Result<Vec<u8>> {
+        self.require_algorithm_enabled(Algorithm::SessionKeyDerivation as u8)?;
+        let handle = parse_u64(data)?;
+        objects.remove(handle).ok_or(DeviceError::ObjectNotFound)?;
+        Ok(Vec::new())
     }
 
     fn decrypt_pkcs1(&self, authorization: SessionAuthorization, data: &[u8]) -> Result<Vec<u8>> {
@@ -3966,6 +4227,124 @@ fn ecdh_kdf_hash(value: u8) -> Result<HashAlgorithm> {
     }
 }
 
+const SESSION_DERIVE_GENERATE_P256: u8 = 1;
+const SESSION_DERIVE_ECDH: u8 = 2;
+const SESSION_DERIVE_APPEND_KEY: u8 = 3;
+const SESSION_DERIVE_APPEND_DATA: u8 = 4;
+const SESSION_DERIVE_EXTRACT: u8 = 5;
+const SESSION_DERIVE_SHA256: u8 = 6;
+const SESSION_DERIVE_COUNTER: u8 = 7;
+
+#[derive(Clone, Copy)]
+enum SessionSource {
+    Volatile(u64),
+    PersistentAsymmetric(u16),
+    PersistentSymmetric(u16),
+}
+
+fn parse_session_source(data: &[u8], offset: &mut usize) -> Result<SessionSource> {
+    let source_type = *data.get(*offset).ok_or(DeviceError::WrongLength)?;
+    *offset += 1;
+    Ok(match source_type {
+        0 => {
+            let handle = parse_u64_at(data, *offset)?;
+            *offset += 8;
+            SessionSource::Volatile(handle)
+        }
+        1 => {
+            let id = parse_u16_at(data, *offset)?;
+            *offset += 2;
+            SessionSource::PersistentAsymmetric(id)
+        }
+        2 => {
+            let id = parse_u16_at(data, *offset)?;
+            *offset += 2;
+            SessionSource::PersistentSymmetric(id)
+        }
+        _ => return Err(DeviceError::InvalidData),
+    })
+}
+
+fn session_derivation_secret(objects: &SessionObjects, handle: u64) -> Result<Zeroizing<Vec<u8>>> {
+    let object = objects.get(handle).ok_or(DeviceError::ObjectNotFound)?;
+    if object.flags & FLAG_DERIVE == 0 {
+        return Err(DeviceError::InsufficientPermissions);
+    }
+    object
+        .secret_value()
+        .map(|value| Zeroizing::new(value.to_vec()))
+        .ok_or(DeviceError::InvalidData)
+}
+
+fn parse_counter_fields<'a>(
+    data: &'a [u8],
+    offset: &mut usize,
+) -> Result<Vec<CounterKdfField<'a>>> {
+    let count = usize::from(*data.get(*offset).ok_or(DeviceError::WrongLength)?);
+    *offset += 1;
+    if !(1..=64).contains(&count) {
+        return Err(DeviceError::InvalidData);
+    }
+    let mut fields = Vec::with_capacity(count);
+    for _ in 0..count {
+        let kind = *data.get(*offset).ok_or(DeviceError::WrongLength)?;
+        *offset += 1;
+        match kind {
+            0 => {
+                let length = usize::from(parse_u16_at(data, *offset)?);
+                *offset += 2;
+                if length == 0 || data.len() < offset.saturating_add(length) {
+                    return Err(DeviceError::WrongLength);
+                }
+                fields.push(CounterKdfField::Bytes(&data[*offset..*offset + length]));
+                *offset += length;
+            }
+            1 | 2 => {
+                let width = *data.get(*offset).ok_or(DeviceError::WrongLength)?;
+                let little_endian = match data.get(*offset + 1) {
+                    Some(0) => false,
+                    Some(1) => true,
+                    Some(_) => return Err(DeviceError::InvalidData),
+                    None => return Err(DeviceError::WrongLength),
+                };
+                *offset += 2;
+                let format = IntegerFormat {
+                    width_bits: width,
+                    little_endian,
+                };
+                if kind == 1 {
+                    fields.push(CounterKdfField::Counter(format));
+                } else {
+                    let method = match data.get(*offset) {
+                        Some(0) => LengthMethod::Key,
+                        Some(1) => LengthMethod::Segments,
+                        Some(_) => return Err(DeviceError::InvalidData),
+                        None => return Err(DeviceError::WrongLength),
+                    };
+                    *offset += 1;
+                    fields.push(CounterKdfField::Length(format, method));
+                }
+            }
+            _ => return Err(DeviceError::InvalidData),
+        }
+    }
+    Ok(fields)
+}
+
+fn parse_u64(data: &[u8]) -> Result<u64> {
+    data.try_into()
+        .map(u64::from_be_bytes)
+        .map_err(|_| DeviceError::WrongLength)
+}
+
+fn parse_u64_at(data: &[u8], offset: usize) -> Result<u64> {
+    data.get(offset..offset + 8)
+        .ok_or(DeviceError::WrongLength)?
+        .try_into()
+        .map(u64::from_be_bytes)
+        .map_err(|_| DeviceError::WrongLength)
+}
+
 fn parse_u16(data: &[u8]) -> Result<u16> {
     data.try_into()
         .map(u16::from_be_bytes)
@@ -4330,6 +4709,226 @@ mod tests {
         data.push(algorithm as u8);
         data.extend_from_slice(key);
         Frame::new(CommandCode::PutSymmetricKey as u8, data).unwrap()
+    }
+
+    fn session_derive_request(
+        operation: u8,
+        flags: u8,
+        kind: SessionObjectKind,
+        output_length: u16,
+        tail: &[u8],
+    ) -> Frame {
+        let mut data = vec![operation, flags, kind as u8];
+        data.extend_from_slice(&output_length.to_be_bytes());
+        data.extend_from_slice(tail);
+        Frame::new(CommandCode::DeriveSessionObject as u8, data).unwrap()
+    }
+
+    fn session_object_handle(response: &Frame) -> u64 {
+        assert_eq!(
+            response.command,
+            CommandCode::DeriveSessionObject as u8 | 0x80
+        );
+        u64::from_be_bytes(response.data[..8].try_into().unwrap())
+    }
+
+    fn read_session_object(
+        device: &mut Device,
+        authorization: SessionAuthorization,
+        objects: &mut SessionObjects,
+        handle: u64,
+    ) -> Frame {
+        let request = Frame::new(
+            CommandCode::ReadSessionObject as u8,
+            handle.to_be_bytes().to_vec(),
+        )
+        .unwrap();
+        device.execute_inner_with_session(authorization, &request, Some(objects))
+    }
+
+    #[test]
+    fn volatile_ecdh_objects_are_scoped_protected_and_right_truncated() {
+        let mut device = Device::factory_default(DeviceConfig::default());
+        let authorization = device.session_authorization(1).unwrap();
+        let mut objects = SessionObjects::default();
+
+        let generate = Frame::new(
+            CommandCode::DeriveSessionObject as u8,
+            vec![SESSION_DERIVE_GENERATE_P256, FLAG_DERIVE],
+        )
+        .unwrap();
+        let generated =
+            device.execute_inner_with_session(authorization, &generate, Some(&mut objects));
+        assert_eq!(generated.data.len(), 8 + 65);
+        let private_handle = session_object_handle(&generated);
+        let generated_public = p256::PublicKey::from_sec1_bytes(&generated.data[8..]).unwrap();
+
+        let peer = p256::SecretKey::from_slice(&[0x42; 32]).unwrap();
+        let peer_public = peer.public_key().to_sec1_point(false);
+        let expected = diffie_hellman(peer.to_nonzero_scalar(), generated_public.as_affine());
+        let expected = &expected.raw_secret_bytes()[16..];
+        let mut tail = vec![0];
+        tail.extend_from_slice(&private_handle.to_be_bytes());
+        tail.extend_from_slice(&(peer_public.as_bytes().len() as u16).to_be_bytes());
+        tail.extend_from_slice(peer_public.as_bytes());
+        let derive = session_derive_request(
+            SESSION_DERIVE_ECDH,
+            FLAG_READABLE | FLAG_DERIVE,
+            SessionObjectKind::GenericSecret,
+            16,
+            &tail,
+        );
+        let derived = device.execute_inner_with_session(authorization, &derive, Some(&mut objects));
+        let secret_handle = session_object_handle(&derived);
+        assert_eq!(
+            read_session_object(&mut device, authorization, &mut objects, secret_handle).data,
+            expected
+        );
+
+        let mut other_session = SessionObjects::default();
+        assert_eq!(
+            read_session_object(
+                &mut device,
+                authorization,
+                &mut other_session,
+                secret_handle,
+            ),
+            Frame::error(DeviceError::ObjectNotFound)
+        );
+
+        let protected = session_derive_request(
+            SESSION_DERIVE_APPEND_DATA,
+            FLAG_DERIVE,
+            SessionObjectKind::GenericSecret,
+            16,
+            &[secret_handle.to_be_bytes().as_slice(), b"ignored"].concat(),
+        );
+        let protected =
+            device.execute_inner_with_session(authorization, &protected, Some(&mut objects));
+        let protected_handle = session_object_handle(&protected);
+        assert_eq!(objects.len(), 3);
+        assert_eq!(
+            read_session_object(&mut device, authorization, &mut objects, protected_handle,),
+            Frame::error(DeviceError::InsufficientPermissions)
+        );
+
+        let delete = Frame::new(
+            CommandCode::DeleteSessionObject as u8,
+            secret_handle.to_be_bytes().to_vec(),
+        )
+        .unwrap();
+        assert!(
+            device
+                .execute_inner_with_session(authorization, &delete, Some(&mut objects))
+                .data
+                .is_empty()
+        );
+        assert_eq!(
+            read_session_object(&mut device, authorization, &mut objects, secret_handle),
+            Frame::error(DeviceError::ObjectNotFound)
+        );
+        assert_eq!(objects.len(), 2);
+    }
+
+    #[test]
+    fn volatile_counter_kdf_and_cmac_verify_enforce_native_policy() {
+        let mut device = Device::factory_default(DeviceConfig::default());
+        let authorization = device.session_authorization(1).unwrap();
+        let aes = [0x5a; 16];
+        let capabilities = CapabilitySet::from_capabilities([Capability::EncryptEcb]);
+        assert_eq!(
+            device
+                .execute_inner(
+                    authorization,
+                    &put_symmetric_key_request(40, 1, capabilities, Algorithm::Aes128, &aes),
+                )
+                .data,
+            40_u16.to_be_bytes()
+        );
+
+        let mut tail = vec![2];
+        tail.extend_from_slice(&40_u16.to_be_bytes());
+        tail.push(3);
+        tail.extend_from_slice(&[1, 8, 0]);
+        tail.extend_from_slice(&[0, 0, 3]);
+        tail.extend_from_slice(b"SCP");
+        tail.extend_from_slice(&[2, 16, 0, 0]);
+        let derive = session_derive_request(
+            SESSION_DERIVE_COUNTER,
+            FLAG_READABLE | FLAG_VERIFY,
+            SessionObjectKind::Aes,
+            16,
+            &tail,
+        );
+        let mut objects = SessionObjects::default();
+        let response =
+            device.execute_inner_with_session(authorization, &derive, Some(&mut objects));
+        let handle = session_object_handle(&response);
+
+        let fields = [
+            CounterKdfField::Counter(IntegerFormat {
+                width_bits: 8,
+                little_endian: false,
+            }),
+            CounterKdfField::Bytes(b"SCP"),
+            CounterKdfField::Length(
+                IntegerFormat {
+                    width_bits: 16,
+                    little_endian: false,
+                },
+                LengthMethod::Key,
+            ),
+        ];
+        let expected = cmac_counter_kdf(&aes, &fields, 16).unwrap();
+        assert_eq!(
+            read_session_object(&mut device, authorization, &mut objects, handle).data,
+            expected.as_slice()
+        );
+
+        let message = b"receipt input";
+        let signature = cmac(&expected, message).unwrap();
+        let mut verify_data = handle.to_be_bytes().to_vec();
+        verify_data.push(8);
+        verify_data.extend_from_slice(&signature[..8]);
+        verify_data.extend_from_slice(message);
+        let verify = Frame::new(CommandCode::VerifySessionObject as u8, verify_data).unwrap();
+        assert_eq!(
+            device
+                .execute_inner_with_session(authorization, &verify, Some(&mut objects))
+                .data,
+            [1]
+        );
+
+        let insufficient = SessionAuthorization {
+            authentication_key_id: 2,
+            capabilities: CapabilitySet::NONE,
+            delegated_capabilities: CapabilitySet::NONE,
+            domains: 1,
+        };
+        assert_eq!(
+            device.execute_inner_with_session(insufficient, &derive, Some(&mut objects)),
+            Frame::error(DeviceError::InsufficientPermissions)
+        );
+
+        let mut config = DeviceConfig::default();
+        config
+            .algorithms
+            .retain(|algorithm| *algorithm != Algorithm::SessionKeyDerivation as u8);
+        let mut disabled = Device::factory_default(config);
+        let disabled_authorization = SessionAuthorization {
+            authentication_key_id: 1,
+            capabilities: CapabilitySet::from_capabilities([Capability::DeriveSessionKey]),
+            delegated_capabilities: CapabilitySet::NONE,
+            domains: u16::MAX,
+        };
+        assert_eq!(
+            disabled.execute_inner_with_session(
+                disabled_authorization,
+                &derive,
+                Some(&mut SessionObjects::default()),
+            ),
+            Frame::error(DeviceError::InvalidData)
+        );
     }
 
     #[test]

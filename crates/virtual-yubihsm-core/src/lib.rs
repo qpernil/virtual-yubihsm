@@ -14,6 +14,7 @@ mod object;
 mod protocol;
 mod secure_channel_crypto;
 mod session;
+mod session_object;
 
 pub use algorithm::Algorithm;
 pub use authorization::SessionAuthorization;

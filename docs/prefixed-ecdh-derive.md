@@ -233,45 +233,34 @@ the source HSM. A compromised connector holding the exported session keys can
 still control the current session; avoiding that would require moving secure
 messaging itself behind the HSM boundary.
 
-## Future true key derivation
+## Native protected key derivation
 
 The [SCP03/SCP11 key-provider plan](https://github.com/qpernil/pkcs11rs/blob/master/docs/scp-key-provider/README.md)
-aims to use one protocol implementation with software or native key operations.
-The native goal protects long-term credentials and raw agreements during
-derivation. Final working keys are read once for local message encryption and
-MAC, without a placement option. The existing command returns KDF bytes;
-generic protected, chainable device outputs remain future work.
+uses one protocol implementation with software or native key operations.
+Algorithm 61 and the `derive-session-key` capability implement generic protected,
+chainable device outputs alongside this one-shot prefixed mechanism. The native
+command family covers volatile P-256 generation and ECDH, key/data
+concatenation, bit extraction, SHA-256, SP 800-108 counter KDF, AES-CMAC
+verification, policy-controlled reads, and explicit deletion.
 
-Add an atomic derivation contract: a protected base object, mechanism parameters,
-and an output template produce another protected object and return its identifier.
-Generic-secret intermediates and extraction into AES keys should support the
-required agreement, composition, and KDF operations without an SCP-specific
-object model. Choose the initial mechanisms from the supported SCP03/SCP11
-operation matrix and reuse software-key-core implementations.
+The volatile store is bounded to 64 objects per authenticated secure session.
+Objects have random nonzero 64-bit handles, are not persisted, and disappear
+with their owning session. Output flags independently permit reading, further
+derivation, and AES-CMAC verification. Persistent P-256 and AES objects serve as
+long-term sources under their normal capabilities and domain policy. Each
+derived output is created atomically, and source policy cannot be weakened.
 
-Prefer bounded volatile objects for both intermediate and working session keys.
-For the four-key construction above, derive the 64-byte KDF output and extract
-receipt, S-ENC, S-MAC, and S-RMAC keys without NVM writes. Final output policy
-must permit local working-key reads, while long-term credentials and raw ECDH
-results remain protected. Concatenation/extraction cannot weaken source policy;
-SCP11 hash outputs must be created with the intended readability. Size the native session-object model for the complete operation
-graph, including final AES keys. Persistent generic-secret or AES objects remain
-appropriate for deliberate persistent outputs. A persistent temporary-key
-fallback would additionally require deletion, capacity bounds, and crash/orphan
-recovery; it is not the preferred channel-key model.
-
-Define identifiers, capabilities, domains, output-policy inheritance, audit
-behavior, and atomic failure alongside the commands. Native session objects
-must be scoped to authenticated authority and cleared on close, timeout,
-authentication replacement or failure, and invalidation. pkcs11rs must retain
-that native session while its dependent handles exist and invalidate them when
-the backing session is lost. Exact command and object encodings remain to be
-specified and qualified in both repositories.
+This supports the complete four-key construction without NVM writes: a
+protected 64-byte KDF output can feed receipt, S-ENC, S-MAC, and S-RMAC objects.
+Only outputs created as readable can cross the device boundary. pkcs11rs keeps
+the backing secure session alive while dependent PKCS #11 handles exist and
+invalidates those handles if the secure session is lost.
 
 A PKCS #11 session object describes lifetime, not execution location. The
-current pkcs11rs common layer holds session keys in host memory, even on a
-physical-device slot. Native derivation requires explicit object placement
-and operations on device-held inputs; the common mechanism list is insufficient
-proof. Existing physical firmware needs the corresponding native primitives
-and object support. Established channels use local working keys without further
-derivation-provider calls.
+pkcs11rs common layer holds session keys in host memory on a physical-device
+slot that lacks algorithm 61. A virtual YubiHSM advertising the extension uses
+explicit device placement and commands for supported operations. A readable
+result that requests a software-only operation is materialized once into the
+common layer; a protected result is never downgraded. Existing physical firmware
+therefore remains compatible. Established channels use local working keys
+without further derivation-provider calls.
