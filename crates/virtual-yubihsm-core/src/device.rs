@@ -294,7 +294,7 @@ impl BuilderProfile for AttestationProfile {
 impl Default for DeviceConfig {
     fn default() -> Self {
         Self {
-            version: [2, 4, 1],
+            version: [2, 5, 0],
             serial: 12_345_678,
             log_capacity: 62,
             algorithms: Algorithm::OFFICIAL
@@ -851,7 +851,7 @@ impl Device {
             || state.schema != PERSISTENT_STATE_SCHEMA
             || !matches!(state.version, 1 | 2 | PERSISTENT_STATE_VERSION)
             || state.config.serial != config.serial
-            || state.audit.entries.len() > usize::from(state.config.log_capacity)
+            || state.audit.entries.len() > usize::from(config.log_capacity)
             || !valid_option_value(state.options.force_audit)
             || !valid_option_value(state.options.fips_mode)
             || state
@@ -895,7 +895,11 @@ impl Device {
             }
         }
         Ok(Self {
-            config: state.config,
+            // Device identity and capabilities belong to the running virtual
+            // firmware. Durable state supplies objects, options, and audit
+            // history, but must not pin an upgraded instance to the firmware
+            // configuration that originally created the state file.
+            config,
             objects,
             sessions: BTreeMap::new(),
             device_static_private,
@@ -6379,6 +6383,33 @@ mod tests {
             Device::from_persistent_state(foreign, &encoded).unwrap_err(),
             DeviceError::InvalidData
         );
+    }
+
+    #[test]
+    fn persistent_state_uses_the_running_firmware_configuration() {
+        let current = DeviceConfig::default();
+        let mut previous = current.clone();
+        previous.version = [2, 4, 1];
+        previous
+            .algorithms
+            .retain(|algorithm| *algorithm != Algorithm::SessionKeyDerivation as u8);
+        let encoded = Device::factory_default(previous)
+            .persistent_state()
+            .unwrap();
+
+        let restored = Device::from_persistent_state(current.clone(), &encoded).unwrap();
+        let response =
+            restored.execute_plain(&Frame::new(CommandCode::GetDeviceInfo as u8, vec![]).unwrap());
+        assert_eq!(&response.data[..3], &current.version);
+        assert!(
+            response.data[9..].contains(&(Algorithm::SessionKeyDerivation as u8)),
+            "restored device must advertise capabilities of the running firmware"
+        );
+
+        let persisted: PersistentState =
+            ciborium::from_reader(restored.persistent_state().unwrap().as_slice()).unwrap();
+        assert_eq!(persisted.config.version, current.version);
+        assert_eq!(persisted.config.algorithms, current.algorithms);
     }
 
     #[test]
