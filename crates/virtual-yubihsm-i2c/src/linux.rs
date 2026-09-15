@@ -7,16 +7,12 @@ use std::{
         unix::fs::OpenOptionsExt,
     },
     path::Path,
-    sync::{
-        Mutex, MutexGuard,
-        atomic::{AtomicBool, Ordering},
-    },
+    sync::atomic::{AtomicBool, Ordering},
     time::Duration,
 };
-use usb_gadget_worker::{
-    PersistenceMode, StateLock, StatePersistence, StatePersistenceHandle, replace_file_atomically,
+use virtual_yubihsm_core::{
+    DeviceConfig, PersistenceMode, PersistentDevice, PersistentDeviceHandle,
 };
-use virtual_yubihsm_core::{Device, DeviceConfig};
 
 const MAX_TRANSFER: usize = 8_192;
 const O_NONBLOCK: i32 = 0x800;
@@ -29,32 +25,20 @@ pub(super) fn run(options: Options) -> io::Result<()> {
     let mut target = open_target(&options)?;
     install_signal_handlers()?;
     validate_state_directory(&options.state_directory)?;
-    let state_path = options
-        .state_directory
-        .join(format!("yubihsm-{}.cbor", options.serial));
-    let _state_lock = StateLock::acquire(
-        options
-            .state_directory
-            .join(format!("yubihsm-{}.lock", options.serial)),
-    )?;
     let config = DeviceConfig {
         serial: options.serial,
         ..DeviceConfig::default()
     };
-    let hsm = load_or_create_state(config, &state_path)?;
     validate_target(&target)?;
     let persistence_mode = match options.persistence {
         Persistence::Batched => PersistenceMode::Batched(PERSISTENCE_BATCH_DELAY),
         Persistence::Immediate => PersistenceMode::Immediate,
     };
-    let persistence = StatePersistence::start(
-        hsm,
-        state_path.clone(),
-        persistence_mode,
-        encode_state,
-        || STOP_REQUESTED.store(true, Ordering::Relaxed),
-    )?;
-    let hsm = persistence.handle();
+    let runtime =
+        PersistentDevice::open(config, &options.state_directory, persistence_mode, || {
+            STOP_REQUESTED.store(true, Ordering::Relaxed)
+        })?;
+    let hsm = runtime.handle();
     eprintln!(
         "virtual-yubihsm-i2c: serving serial {} on {}; state {}",
         options.serial,
@@ -63,11 +47,11 @@ pub(super) fn run(options: Options) -> io::Result<()> {
         } else {
             options.device.display().to_string()
         },
-        state_path.display()
+        runtime.state_path().display()
     );
 
     let result = serve(&mut target, &hsm);
-    let persistence_result = persistence.shutdown();
+    let persistence_result = runtime.shutdown();
     result.and(persistence_result)
 }
 
@@ -106,7 +90,7 @@ fn open_target(options: &Options) -> io::Result<File> {
     Ok(target)
 }
 
-fn serve(target: &mut File, hsm: &StatePersistenceHandle<Device>) -> io::Result<()> {
+fn serve(target: &mut File, hsm: &PersistentDeviceHandle) -> io::Result<()> {
     let mut request = vec![0_u8; MAX_TRANSFER];
     while !STOP_REQUESTED.load(Ordering::Relaxed) {
         let length = match target.read(&mut request) {
@@ -121,23 +105,7 @@ fn serve(target: &mut File, hsm: &StatePersistenceHandle<Device>) -> io::Result<
         };
 
         let command = request.first().copied().unwrap_or_default();
-        let (response, mutation) = {
-            let mut device = lock_device(hsm.state());
-            let response = device.handle_encoded(&request[..length]);
-            let mutation = if device.take_persistent_change().map_err(|error| {
-                io::Error::other(format!("advance persistent YubiHSM state epoch: {error}"))
-            })? {
-                Some(hsm.record_mutation()?)
-            } else {
-                None
-            };
-            (response, mutation)
-        };
-        if let Some(mutation) = mutation {
-            mutation.wait()?;
-        } else {
-            hsm.check_health()?;
-        }
+        let response = hsm.execute(&request[..length])?;
         queue_response(target, &response)?;
         eprintln!(
             "virtual-yubihsm-i2c: command {command:#04x}, request {length} bytes, response {} bytes",
@@ -145,38 +113,6 @@ fn serve(target: &mut File, hsm: &StatePersistenceHandle<Device>) -> io::Result<
         );
     }
     Ok(())
-}
-
-fn load_or_create_state(config: DeviceConfig, path: &Path) -> io::Result<Device> {
-    match fs::read(path) {
-        Ok(encoded) => Device::from_persistent_state(config, &encoded).map_err(|error| {
-            io::Error::new(
-                io::ErrorKind::InvalidData,
-                format!("load persistent YubiHSM state {}: {error}", path.display()),
-            )
-        }),
-        Err(error) if error.kind() == io::ErrorKind::NotFound => {
-            let hsm = Device::factory_default(config);
-            persist(&hsm, path)?;
-            Ok(hsm)
-        }
-        Err(error) => Err(with_path(error, "read persistent YubiHSM state", path)),
-    }
-}
-
-fn persist(hsm: &Device, path: &Path) -> io::Result<()> {
-    let encoded = encode_state(hsm)?;
-    replace_file_atomically(path, &encoded)
-        .map_err(|error| with_path(error, "replace persistent YubiHSM state", path))
-}
-
-fn encode_state(hsm: &Device) -> io::Result<Vec<u8>> {
-    hsm.persistent_state()
-        .map_err(|error| io::Error::other(format!("encode persistent YubiHSM state: {error}")))
-}
-
-fn lock_device(device: &Mutex<Device>) -> MutexGuard<'_, Device> {
-    device.lock().unwrap_or_else(|error| error.into_inner())
 }
 
 fn validate_state_directory(path: &Path) -> io::Result<()> {

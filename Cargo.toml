@@ -21,7 +21,7 @@ software-key-core = { path = "../software-key-core" }
 [dependencies]
 libc = "0.2.189"
 usb-gadget-worker = { path = "../usb-gadget-supervisor/crates/usb-gadget-worker" }
-virtual-yubihsm-core = { path = "crates/virtual-yubihsm-core" }
+virtual-yubihsm-core = { path = "crates/virtual-yubihsm-core", features = ["persistent-runtime"] }
 
 [target.'cfg(target_os = "linux")'.dependencies]
 display-backends = { path = "../display-backends" }

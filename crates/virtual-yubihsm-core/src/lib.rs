@@ -3,6 +3,8 @@
 //! USB, HTTP, and process-lifecycle concerns intentionally live outside this
 //! crate. The core accepts and returns YubiHSM protocol frames and owns the
 //! device's sessions, authorization policy, objects, audit state, and options.
+//! The optional `persistent-runtime` feature adds the common durable device
+//! owner used by transport frontends while leaving transport I/O outside.
 
 mod algorithm;
 mod authorization;
@@ -11,6 +13,8 @@ mod device;
 mod error;
 mod frame;
 mod object;
+#[cfg(all(feature = "persistent-runtime", unix))]
+mod persistent_runtime;
 mod protocol;
 mod secure_channel_crypto;
 mod session;
@@ -25,4 +29,6 @@ pub use frame::Frame;
 pub use object::{
     AuthenticationKeyMaterial, ObjectInfo, ObjectKey, ObjectMaterial, ObjectRecord, ObjectType,
 };
+#[cfg(all(feature = "persistent-runtime", unix))]
+pub use persistent_runtime::{PersistenceMode, PersistentDevice, PersistentDeviceHandle};
 pub use protocol::CommandCode;
