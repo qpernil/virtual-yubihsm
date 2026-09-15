@@ -11,7 +11,7 @@ host connector
     |
     | YubiHSM frames
     v
-transport adapter (FunctionFS / HTTP / tests)
+transport adapter (FunctionFS / I2C / HTTP / tests)
     |
     v
 virtual-yubihsm-core
@@ -21,6 +21,7 @@ virtual-yubihsm-core
     |-- session authorization snapshot
     |-- object store, options, and chained audit log
     |-- versioned durable CBOR state (sessions stay volatile)
+    |-- optional shared persistent runtime for deployed frontends
     v
 software-key-core (path dependency)
 ```
@@ -48,8 +49,15 @@ rejects the entire image if any key is invalid, before accepting commands.
 Private runtime keys and temporary serialized buffers carry zeroization-on-drop
 guarantees.
 
+The default core is a synchronous in-memory device. Its optional
+`persistent-runtime` feature owns the state-file lock, restoration or factory
+bootstrap, mutation accounting, immediate or batched persistence, session
+cleanup, and final flush used by the USB, I2C, and embedded-connector
+frontends. Those frontends retain their distinct transport loops and do not
+carry independent copies of the durable device lifecycle.
+
 The core also runs directly inside `pkcs11rs-connector` as an embedded virtual
-device, using the same state ownership and persistence rules as the USB worker.
+device, using this same persistent runtime as the USB and I2C frontends.
 See the [built-in connector integration](docs/pkcs11rs-connector-integration.md).
 The deliberate differences from physical firmware are catalogued in
 [virtual extensions](docs/virtual-extensions.md).

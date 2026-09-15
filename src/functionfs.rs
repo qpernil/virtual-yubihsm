@@ -6,23 +6,21 @@ use crate::{
     worker_protocol::{Channel, Kind, Record, STATE_DIRECTORY_ENV, validate_initial_resources},
 };
 use std::{
-    env, fs,
+    env,
     fs::File,
     io::{self, Read, Write},
     os::fd::AsRawFd,
-    path::{Path, PathBuf},
+    path::PathBuf,
     sync::{
-        Arc, Mutex,
+        Arc,
         atomic::{AtomicBool, Ordering},
     },
     thread,
 };
-use usb_gadget_worker::{
-    EndpointLifecycle, PersistenceMode, StateLock, StatePersistence, StatePersistenceHandle,
-    UsbBusEvent, replace_file_atomically,
-};
+use usb_gadget_worker::{EndpointLifecycle, UsbBusEvent};
 use virtual_yubihsm_core::{
-    CommandCode, Device, DeviceConfig, DeviceError, Frame, SessionAuthorization,
+    CommandCode, DeviceConfig, DeviceError, Frame, PersistenceMode, PersistentDevice,
+    PersistentDeviceHandle, SessionAuthorization,
 };
 
 const MAX_TRANSFER: usize = u16::MAX as usize + 3;
@@ -62,21 +60,15 @@ pub(crate) fn run_worker(
     let control = Channel::from_fixed_descriptor();
     let resources = InitialResources::parse(validate_initial_resources(control.receive()?)?)?;
     let state_directory = required_path(STATE_DIRECTORY_ENV)?;
-    let state_path = state_directory.join(format!("yubihsm-{serial}.cbor"));
-    let _state_lock = StateLock::acquire(state_directory.join(format!("yubihsm-{serial}.lock")))?;
     let config = DeviceConfig {
         serial,
         ..DeviceConfig::default()
     };
-    let device = load_or_create_state(config, &state_path)?;
-    let persistence = StatePersistence::start(
-        device,
-        state_path,
-        persistence_mode,
-        encode_device_state,
-        move || stop.store(true, Ordering::Relaxed),
-    )?;
-    let device = persistence.handle();
+    let persistent_device =
+        PersistentDevice::open(config, &state_directory, persistence_mode, move || {
+            stop.store(true, Ordering::Relaxed)
+        })?;
+    let device = persistent_device.handle();
     let personality = crate::usb_identity::personality(serial).to_cbor()?;
     let display = crate::display::Controller::start(
         resources.display_bus,
@@ -127,7 +119,7 @@ pub(crate) fn run_worker(
             let endpoints = Endpoints::from_record(endpoints_record)?;
             stop.store(false, Ordering::Relaxed);
             let lifecycle = Arc::new(EndpointLifecycle::new());
-            let runtime = EndpointRuntime::start(
+            let endpoint_runtime = EndpointRuntime::start(
                 endpoints,
                 device.clone(),
                 stop,
@@ -146,7 +138,7 @@ pub(crate) fn run_worker(
                 generation,
                 &mut configure_request,
                 ControlServices {
-                    device: device.state(),
+                    device: &device,
                     display: &display,
                     buttons: &buttons,
                     stop,
@@ -155,8 +147,8 @@ pub(crate) fn run_worker(
             );
             stop.store(true, Ordering::Relaxed);
             lifecycle.stop();
-            let runtime_result = runtime.shutdown();
-            let persistence_result = persistence.flush();
+            let runtime_result = endpoint_runtime.shutdown();
+            let persistence_result = persistent_device.flush();
             let outcome = control_result?;
             runtime_result?;
             persistence_result?;
@@ -192,7 +184,7 @@ pub(crate) fn run_worker(
         }
     })();
     stop.store(true, Ordering::Relaxed);
-    let persistence_result = persistence.shutdown();
+    let persistence_result = persistent_device.shutdown();
     let button_result = buttons.shutdown();
     let display_result = display.shutdown();
     result
@@ -240,7 +232,7 @@ enum ControlOutcome {
 }
 
 struct ControlServices<'a> {
-    device: &'a Arc<Mutex<Device>>,
+    device: &'a PersistentDeviceHandle,
     display: &'a crate::display::Controller,
     buttons: &'a crate::buttons::Controller,
     stop: &'static AtomicBool,
@@ -317,10 +309,7 @@ fn serve_control(
                         event,
                         UsbBusEvent::Bind | UsbBusEvent::Unbind | UsbBusEvent::Disable
                     ) {
-                        device
-                            .lock()
-                            .map_err(|_| io::Error::other("device lock poisoned"))?
-                            .clear_sessions();
+                        device.clear_sessions()?;
                     }
                     match event {
                         UsbBusEvent::Bind => display.bind()?,
@@ -510,7 +499,7 @@ struct EndpointRuntime {
 impl EndpointRuntime {
     fn start(
         endpoints: Endpoints,
-        device: StatePersistenceHandle<Device>,
+        device: PersistentDeviceHandle,
         stop: &'static AtomicBool,
         display_activity: crate::display::Activity,
         lifecycle: Arc<EndpointLifecycle>,
@@ -530,7 +519,7 @@ impl EndpointRuntime {
 
 fn serve_endpoint(
     mut endpoints: Endpoints,
-    device: StatePersistenceHandle<Device>,
+    device: PersistentDeviceHandle,
     stop: &'static AtomicBool,
     display_activity: crate::display::Activity,
     lifecycle: Arc<EndpointLifecycle>,
@@ -548,45 +537,25 @@ fn serve_endpoint(
                     Ok(0) => {}
                     Ok(length) => {
                         let activity = display_activity.begin();
-                        let (response, mutation) = {
-                            let mut state = device
-                                .state()
-                                .lock()
-                                .map_err(|_| io::Error::other("device lock poisoned"))?;
-                            let outer_request = Frame::parse(&request[..length]);
-                            let session_id = outer_request.as_ref().ok().and_then(session_id);
-                            let response = state.handle_encoded_observing(
-                                &request[..length],
-                                |authorization, request, response| {
-                                    log_authenticated_failure(
-                                        session_id,
-                                        authorization,
-                                        request,
-                                        response,
-                                    );
-                                    if request.command == CommandCode::BlinkDevice as u8
-                                        && response.command
-                                            == (CommandCode::BlinkDevice as u8 | 0x80)
-                                    {
-                                        display_activity.identify(request.data[0]);
-                                    }
-                                },
-                            );
-                            log_outer_failure(outer_request.as_ref(), &response, length);
-                            let mutation = state
-                                .take_persistent_change()
-                                .map_err(|error| {
-                                    io::Error::other(format!(
-                                        "advance persistent YubiHSM state epoch: {error}"
-                                    ))
-                                })?
-                                .then(|| device.record_mutation())
-                                .transpose()?;
-                            (response, mutation)
-                        };
-                        if let Some(mutation) = mutation {
-                            mutation.wait()?;
-                        }
+                        let outer_request = Frame::parse(&request[..length]);
+                        let session_id = outer_request.as_ref().ok().and_then(session_id);
+                        let response = device.execute_observing(
+                            &request[..length],
+                            |authorization, request, response| {
+                                log_authenticated_failure(
+                                    session_id,
+                                    authorization,
+                                    request,
+                                    response,
+                                );
+                                if request.command == CommandCode::BlinkDevice as u8
+                                    && response.command == (CommandCode::BlinkDevice as u8 | 0x80)
+                                {
+                                    display_activity.identify(request.data[0]);
+                                }
+                            },
+                        )?;
+                        log_outer_failure(outer_request.as_ref(), &response, length);
                         write_transfer(&mut endpoints.input, &response)?;
                         drop(activity);
                     }
@@ -691,29 +660,6 @@ fn command_name(command: u8) -> String {
         .map_or_else(|| "Unknown".to_owned(), |command| format!("{command:?}"))
 }
 
-fn load_or_create_state(config: DeviceConfig, path: &Path) -> io::Result<Device> {
-    match fs::read(path) {
-        Ok(encoded) => Device::from_persistent_state(config, &encoded).map_err(|error| {
-            io::Error::new(
-                io::ErrorKind::InvalidData,
-                format!("load persistent YubiHSM state {}: {error}", path.display()),
-            )
-        }),
-        Err(error) if error.kind() == io::ErrorKind::NotFound => {
-            let device = Device::factory_default(config);
-            replace_file_atomically(path, &encode_device_state(&device)?)?;
-            Ok(device)
-        }
-        Err(error) => Err(with_context(error, "read persistent YubiHSM state")),
-    }
-}
-
-fn encode_device_state(device: &Device) -> io::Result<Vec<u8>> {
-    device
-        .persistent_state()
-        .map_err(|error| io::Error::other(format!("encode persistent YubiHSM state: {error}")))
-}
-
 fn write_transfer(file: &mut File, bytes: &[u8]) -> io::Result<()> {
     loop {
         match file.write(bytes) {
@@ -769,10 +715,6 @@ fn invalid<T>(message: impl Into<String>) -> io::Result<T> {
 
 fn data_error(message: impl Into<String>) -> io::Error {
     io::Error::new(io::ErrorKind::InvalidData, message.into())
-}
-
-fn with_context(error: io::Error, context: &str) -> io::Error {
-    io::Error::new(error.kind(), format!("{context}: {error}"))
 }
 
 #[cfg(test)]

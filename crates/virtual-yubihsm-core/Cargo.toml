@@ -7,6 +7,10 @@ description = "Transport-neutral YubiHSM 2 compatible software device core"
 license = "MIT OR Apache-2.0"
 publish = false
 
+[features]
+default = []
+persistent-runtime = ["dep:usb-gadget-worker"]
+
 [dependencies]
 ciborium = "0.2.2"
 const-oid = "0.10.2"
@@ -20,6 +24,9 @@ spki = { version = "0.8.0", features = ["alloc", "std"] }
 subtle = "2.6.1"
 x509-cert = { version = "0.3.0", default-features = false, features = ["builder", "std"] }
 zeroize = { version = "1.9.0", features = ["derive"] }
+
+[target.'cfg(unix)'.dependencies]
+usb-gadget-worker = { path = "../../../usb-gadget-supervisor/crates/usb-gadget-worker", optional = true }
 
 [dev-dependencies]
 p256 = { version = "0.14.0", features = ["ecdh", "ecdsa", "pkcs8"] }

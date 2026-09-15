@@ -7,18 +7,21 @@ the connector process. The connector calls `virtual-yubihsm-core` through its
 Rust API; embedded devices do not pass through USB, HTTP, a Unix socket, or a
 worker subprocess internally.
 
-One protocol implementation serves the USB and embedded frontends:
+One protocol implementation and one persistent runtime serve every deployed
+frontend:
 
 ```text
-USB host                                      connector client
-   |                                                |
-FunctionFS                              pkcs11rs-connector protocol
-   |                                                |
-virtual-yubihsm-worker                  embedded virtual-device actor
-   |                                                |
-   +--------------- virtual-yubihsm-core -----------+
-                            |
-                  objects, sessions and state
+USB host                 I2C controller              connector client
+   |                           |                            |
+FunctionFS                 BSC target            pkcs11rs-connector protocol
+   |                           |                            |
+USB worker                 I2C worker              embedded actor
+   |                           |                            |
+   +---------------------------+----------------------------+
+                               |
+              virtual-yubihsm-core persistent-runtime
+                               |
+                  device, sessions and durable state
 ```
 
 The USB worker remains the deployable USB-gadget frontend. An embedded instance
@@ -35,10 +38,18 @@ The core owns:
 - objects, authorization, domains and delegated capabilities;
 - the global numeric-object-ID generation mapping;
 - options, audit state and the persisted state epoch;
-- factory bootstrap, fixture provisioning and state restoration; and
+- factory bootstrap, fixture provisioning and state restoration;
 - serialization and validation of the versioned persistent image.
 
-Its embedding surface consists primarily of:
+On Unix, the optional `persistent-runtime` feature makes the core own:
+
+- exclusive state-file locking from before restore through final flush;
+- restore-or-create behavior and canonical state filenames;
+- immediate or batched atomic persistence;
+- serialized frame execution and durable mutation accounting; and
+- transport-lifecycle session clearing.
+
+The in-memory embedding surface consists primarily of:
 
 - `Device::factory_default` and `Device::from_persistent_state`;
 - `Device::handle_encoded` for complete native request and response frames;
@@ -47,8 +58,15 @@ Its embedding surface consists primarily of:
   version-1, version-2, and version-3 images; and
 - `Device::clear_sessions` for transport-local volatile state.
 
-The core remains synchronous and single-owner. It contains no HTTP, FunctionFS,
-Tokio, display, GPIO, connector-discovery, or supervisor types.
+Deployed frontends instead use `PersistentDevice` and its cloneable
+`PersistentDeviceHandle`. `PersistentDevice::open` acquires durable ownership;
+`PersistentDeviceHandle::execute` performs one complete frame with persistence
+ordering; `clear_sessions`, `flush`, and `shutdown` define the remaining
+lifecycle transitions.
+
+The device core remains synchronous and single-owner. The optional persistent
+runtime adds its persistence thread but contains no HTTP, FunctionFS, I2C,
+Tokio, display, GPIO, or connector-discovery types.
 
 ### `virtual-yubihsm-worker`
 
@@ -60,6 +78,13 @@ The worker owns:
 - conversion between USB transfers and core command calls.
 
 It contains no independent YubiHSM command implementation.
+
+### `virtual-yubihsm-i2c`
+
+The I2C binary owns the Linux BSC target descriptor, driver-ABI and READY
+validation, request/response polling, and signal handling. It uses the same
+`PersistentDevice` API as the other deployed frontends and contains no
+independent device or persistence implementation.
 
 ### `pkcs11rs-connector`
 
@@ -88,12 +113,10 @@ uncertain outcome is never replayed automatically.
 
 For each request the actor:
 
-1. acquires the instance command lock;
-2. passes one complete native frame to `Device::handle_encoded`;
-3. checks `Device::take_persistent_change` while retaining state ownership;
-4. submits a mutation to the configured immediate or batched persistence path;
-5. waits for the persistence receipt required by that mode; and
-6. releases the lock and returns the encoded response.
+1. asks `PersistentDeviceHandle::execute` to process one native frame;
+2. receives the response after the shared runtime has accounted for any
+   durable mutation and satisfied the configured persistence policy; and
+3. returns the encoded response through the connector transport.
 
 A successful mutating response is released only when the persistence
 coordinator permits it. Commands to one device are serialized, while separate
@@ -101,8 +124,9 @@ physical and virtual devices can execute concurrently.
 
 ## Persistence and ownership
 
-The connector and FunctionFS worker use the same direct-or-batched persistence
-coordinator from `usb-gadget-worker`. For each instance:
+The `virtual-yubihsm-core/persistent-runtime` feature composes the generic
+coordinator from `usb-gadget-worker` with the device state machine. The USB,
+I2C, and embedded frontends all use this API. For each instance:
 
 - the state file is `STATE_DIRECTORY/yubihsm-<serial>.cbor`;
 - a missing file triggers explicit factory bootstrap before registration;
@@ -114,11 +138,12 @@ coordinator from `usb-gadget-worker`. For each instance:
 - graceful shutdown flushes pending batched state; and
 - persistence failure makes the instance unavailable.
 
-Each frontend acquires the shared `StateLock` on
+The runtime acquires the shared `StateLock` on
 `STATE_DIRECTORY/yubihsm-<serial>.lock` before reading or creating state and
 retains it through the final flush. The stable sidecar is locked because the
-CBOR file is atomically replaced. The USB worker and connector can use the same
-device state across separate runs, but cannot own it simultaneously.
+CBOR file is atomically replaced. The USB worker, I2C target, and connector can
+use the same device state across separate runs, but cannot own it
+simultaneously.
 
 ## Configuration
 
@@ -176,10 +201,11 @@ failure, and transport lifecycle failures.
 
 The integration maintains these properties:
 
-1. The connector links `virtual-yubihsm-core` without copied protocol code.
+1. Every frontend links `virtual-yubihsm-core` without copied protocol or
+   persistent-device lifecycle code.
 2. Factory instances answer device information and authenticate through the
    ordinary connector client path.
-3. Direct-core, FunctionFS, and connector adapters preserve the same frame
+3. Direct-core, FunctionFS, I2C, and connector adapters preserve the same frame
    behavior.
 4. Immediate and batched mutations enforce response-release ordering.
 5. Restart restores objects, global ID generations, and state epoch while
@@ -188,13 +214,7 @@ The integration maintains these properties:
    ownership fail closed.
 7. Multiple virtual and physical devices operate without a global command lock.
 
-## Next steps
-
-1. Qualify the embedded backend against the same real-client scenarios used for
-   the USB worker and physical YubiHSMs.
-2. Extend cancellation, shutdown, persistence-failure, and state-lock fault
-   injection around the actor boundary.
-3. Harden connector authentication, authorization, admission control, and
-   deployment guidance before exposing it beyond a trusted network.
-4. Replace coordinated sibling paths with versioned releases or pinned Git
-   revisions when independently reproducible checkouts become a requirement.
+The connector remains intended for trusted-network deployment unless its TLS,
+client-authentication, and admission controls are configured for the exposure.
+The repositories currently use coordinated sibling paths; independently
+reproducible releases require versioned crates or pinned Git revisions.

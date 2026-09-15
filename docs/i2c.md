@@ -4,9 +4,13 @@ I2C is a niche experimental frontend. `virtual-yubihsm-i2c` exposes the real
 `virtual-yubihsm-core` protocol through
 the Linux character device provided by
 [`raspberry-pi-i2c-target`](https://github.com/qpernil/raspberry-pi-i2c-target).
-It is a transport frontend, not a mock: authentication, secure sessions,
-objects, cryptographic commands, options, audit records, and persistent state
-all use the same core as the USB-gadget and embedded-connector frontends.
+It is a transport frontend, not a separate HSM implementation or a mock:
+authentication, secure sessions, objects, cryptographic commands, options, and
+audit records use the same device core as the USB-gadget and
+embedded-connector frontends. State locking, restoration, command mutation
+accounting, and persistence use the core's optional `persistent-runtime`
+feature. The I2C binary owns only argument validation, target-device I/O,
+READY-aware request/response exchange, and process signals.
 
 ## Oscilloscope experiments
 
