@@ -148,10 +148,15 @@ service configuration to be used with either connector build.
 
 ## Identity and lifecycle
 
-The backend identity is derived from `DeviceConfig` and the core device-info
-response. Connector clients use the normal device-selection and command APIs;
-authentication keys, object sequences, audit behavior, and protocol errors are
-the same for USB and embedded execution from the same initial state.
+The backend identity is derived from the running firmware's `DeviceConfig` and
+the core device-info response. Restoring a durable state file preserves objects,
+options, audit history, and device secrets while adopting the running build's
+firmware version, algorithm set, capacity, and part number. This lets a software
+upgrade expose new virtual firmware capabilities without resetting provisioned
+objects. The configured serial must still match the persisted serial. Connector
+clients use the normal device-selection and command APIs; authentication keys,
+object sequences, audit behavior, and protocol errors are the same for USB and
+embedded execution from the same initial state.
 
 Startup validates unique configuration, acquires state ownership, restores or
 bootstraps the device, starts persistence, registers the backend, and then
