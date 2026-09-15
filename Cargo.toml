@@ -30,3 +30,8 @@ gpiocdev-uapi = "0.7.0"
 [[bin]]
 name = "virtual-yubihsm-worker"
 path = "src/main.rs"
+
+[patch.crates-io]
+# Keep these paired: the vector storage API also requires the ML-KEM iterator changes.
+module-lattice = { git = "https://github.com/qpernil/KEMs.git", rev = "38545c295eac0c2bcccd4138084cc9dbde5f6009" }
+ml-kem = { git = "https://github.com/qpernil/KEMs.git", rev = "38545c295eac0c2bcccd4138084cc9dbde5f6009" }
