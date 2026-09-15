@@ -751,8 +751,7 @@ dependencies = [
 [[package]]
 name = "ml-kem"
 version = "0.3.2"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "5e15f3e5b957493873e396a66914e83e616b6afe335cdef7efe5c6e1216aba66"
+source = "git+https://github.com/qpernil/KEMs.git?rev=38545c295eac0c2bcccd4138084cc9dbde5f6009#38545c295eac0c2bcccd4138084cc9dbde5f6009"
 dependencies = [
  "const-oid 0.10.2",
  "hybrid-array",
@@ -760,15 +759,15 @@ dependencies = [
  "module-lattice",
  "pkcs8 0.11.0",
  "rand_core 0.10.1",
- "sha3 0.11.0",
+ "sha3",
+ "shake",
  "zeroize",
 ]
 
 [[package]]
 name = "module-lattice"
 version = "0.2.3"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "0c61b87c9683ab7cb1c6871d261ad5479b6b10ceb52c4352aaca3b5d35a8febe"
+source = "git+https://github.com/qpernil/KEMs.git?rev=38545c295eac0c2bcccd4138084cc9dbde5f6009#38545c295eac0c2bcccd4138084cc9dbde5f6009"
 dependencies = [
  "ctutils",
  "hybrid-array",
@@ -1243,16 +1242,6 @@ dependencies = [
 
 [[package]]
 name = "sha3"
-version = "0.11.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "be176f1a57ce4e3d31c1a166222d9768de5954f811601fb7ca06fc8203905ce1"
-dependencies = [
- "digest 0.11.3",
- "keccak",
-]
-
-[[package]]
-name = "sha3"
 version = "0.12.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "bc9bad02c26382724b2d2692c6f179285e4b54eeecd7968f52a50059c3c11759"
@@ -1332,7 +1321,7 @@ dependencies = [
  "rsa",
  "sha1",
  "sha2",
- "sha3 0.12.0",
+ "sha3",
  "signature 3.0.0",
  "subtle",
  "x25519-dalek",
