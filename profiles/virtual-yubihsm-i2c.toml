@@ -10,8 +10,22 @@ state_directory = "/var/lib/virtual-yubihsm-i2c"
 runtime_directory = "/run/virtual-yubihsm-i2c"
 
 [[resources]]
-type = "character-device"
+type = "bsc-target"
 name = "target"
 path = "/dev/bsc-target0"
-access = "read-write"
+kernel_directory = "/opt/usb-gadget-supervisor/bsc-target"
+module = "bcm27xx_bsc_target"
+address = 0x24
+ready_gpio = 17
+idle_pull = "none"
 fd = 3
+
+[[resources.variants]]
+model_contains = "Raspberry Pi 3 Model B"
+overlay = "bsc-target-pi3"
+target_gpios = [18, 19]
+
+[[resources.variants]]
+model_contains = "Raspberry Pi 4 Model B"
+overlay = "bsc-target-pi4"
+target_gpios = [10, 11]
