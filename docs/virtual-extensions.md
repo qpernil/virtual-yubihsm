@@ -16,6 +16,46 @@ YubiHSM implements the same values or command forms.
 | Protected volatile derivation objects | Capability `session-objects` (`0x39`) on the active Authentication Key | `SessionObject` (`0x0b`), one envelope containing generation, ECDH, composition, derivation, controlled reads, AES-CMAC verification, and deletion | `session-objects` on the authenticated session; persistent ECDH and AES sources additionally require their ordinary operation capability and domain visibility |
 | ML-DSA and ML-KEM | ML-DSA algorithms 59–61 and ML-KEM algorithms 62–64 | Existing asymmetric-key generation, seed import, public-key and object commands; `SignMlDsa` (`0x0d`), `EncapsulateMlKem` (`0x0e`), and `DecapsulateMlKem` (`0x0f`) | Existing generate/put/delete permissions plus `sign-ml-dsa` (`0x3a`), `encapsulate-ml-kem` (`0x3b`), or `decapsulate-ml-kem` (`0x3c`) on both the session and private-key object |
 
+## Command hierarchy
+
+The wire protocol has two levels. The ordinary top-level registry contains the
+published YubiHSM commands plus five virtual commands in the unused
+`0x0b`–`0x0f` range:
+
+| Code | Command | Role |
+| --- | --- | --- |
+| `0x0b` | `SessionObject` | Namespace for operations on volatile protected objects |
+| `0x0c` | `DeriveEcdhKdf` | One-shot prefixed ECDH and X9.63 derivation |
+| `0x0d` | `SignMlDsa` | ML-DSA signing |
+| `0x0e` | `EncapsulateMlKem` | ML-KEM encapsulation |
+| `0x0f` | `DecapsulateMlKem` | ML-KEM decapsulation |
+
+There is no generic extension dispatcher and no command-code negotiation.
+Clients learn algorithms through the algorithm list and authorization through
+object capabilities. Unsupported top-level codes receive the ordinary invalid
+command response.
+
+`SessionObject` is the only nested namespace. Its first payload byte selects
+the operation and the remainder uses that operation's own request format. It
+is an explicit family of commands rather than a modifier that can be placed in
+front of any ordinary command. Volatile handles, output policy, and atomic
+object creation require different payloads and responses from persistent
+objects.
+
+A nested operation reuses an ordinary command number only when the action has
+the same meaning: generate an asymmetric key (`0x46`), derive ECDH (`0x57`),
+or delete an object (`0x58`). Session-only transforms use their own nested
+values `0x01`–`0x07`. Future operations that produce or consume volatile
+handles belong in this namespace; operations that return ordinary wire data
+and have independent authorization remain top-level commands. Reusing a number
+does not imply that the nested payload equals the ordinary command payload.
+
+Capabilities follow the same boundary. `session-objects` authorizes entry to
+the namespace, while a persistent source must also permit its ordinary
+operation. ML-DSA signing, ML-KEM encapsulation, ML-KEM decapsulation, and
+prefixed ECDH retain separate capabilities because they are independently
+grantable sensitive operations.
+
 ## Firmware profiles
 
 The compiled firmware profile defines what the virtual device itself exposes
@@ -62,9 +102,8 @@ different profile is restored. Clients select extensions from active
 Authentication Key and source-object capabilities without algorithm marker
 values or trial commands.
 
-The extension commands form one contiguous block in the unused request-code
-gap `0x0b`–`0x0f`. Their response codes are the normal request code with bit 7
-set. No legacy aliases or alternate dispatch command exist.
+Extension response codes are the normal request code with bit 7 set. No legacy
+aliases or alternate dispatch command exist.
 
 ## Post-quantum commands
 
@@ -103,9 +142,9 @@ Both results travel inside the authenticated and encrypted YubiHSM session.
 
 ## Protected volatile derivation objects
 
-The `SessionObject` command lets a client run a chainable derivation graph while keeping
-long-term credentials and raw agreements behind the device boundary. Final
-working keys may be read once for local message encryption and MAC.
+The `SessionObject` command lets a client run a chainable derivation graph while
+keeping long-term credentials and raw agreements behind the device boundary.
+Final working keys may be read once for local message encryption and MAC.
 
 Every request begins with a nested operation byte. Operations that have an
 ordinary object equivalent reuse its command code: `GenerateAsymmetricKey`
@@ -124,12 +163,12 @@ algorithm 12 after the flags. Sources are a volatile 64-bit handle (tag 0), a
 persistent asymmetric-object ID (tag 1), or a persistent symmetric-object ID
 (tag 2). Generated or derived outputs are inserted atomically.
 
-Every envelope request requires `session-objects` in the secure session. A persistent
-asymmetric ECDH source also requires `derive-ecdh` on the
-session and object, plus normal domain visibility. A persistent symmetric
-counter-KDF source similarly requires `encrypt-ecb`; a volatile source requires
-its derive flag. Reads require the readable flag. Verification requires an AES
-object with the verify flag and accepts CMAC lengths from 1 through 16 bytes.
+Every envelope request requires `session-objects` in the secure session. A
+persistent asymmetric ECDH source also requires `derive-ecdh` on the session
+and object, plus normal domain visibility. A persistent symmetric counter-KDF
+source similarly requires `encrypt-ecb`; a volatile source requires its derive
+flag. Reads require the readable flag. Verification requires an AES object with
+the verify flag and accepts CMAC lengths from 1 through 16 bytes.
 
 Each secure session holds at most 64 objects. Handles are random, nonzero
 64-bit values and are never persisted or valid in another secure session.
