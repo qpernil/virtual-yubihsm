@@ -79,14 +79,14 @@ pub enum CommandCode {
 }
 
 impl CommandCode {
-    /// Whether this build exposes the command as part of its compiled persona.
-    pub const fn supported_by_build(self) -> bool {
+    /// Whether the compiled firmware profile exposes this command.
+    pub const fn supported_by_firmware(self) -> bool {
         use CommandCode::*;
         match self {
-            DeriveEcdhKdf => cfg!(feature = "prefixed-ecdh"),
-            SessionObject => cfg!(feature = "session-objects"),
+            DeriveEcdhKdf => crate::FirmwareProfile::compiled().prefixed_ecdh(),
+            SessionObject => crate::FirmwareProfile::compiled().session_objects(),
             SignMlDsa | EncapsulateMlKem | DecapsulateMlKem => {
-                cfg!(feature = "post-quantum")
+                crate::FirmwareProfile::compiled().post_quantum()
             }
             _ => true,
         }

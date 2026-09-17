@@ -7,6 +7,11 @@ the connector process. The connector calls `virtual-yubihsm-core` through its
 Rust API; embedded devices do not pass through USB, HTTP, a Unix socket, or a
 worker subprocess internally.
 
+The connector compiles the core with default features disabled and forwards
+the same three firmware profiles as `firmware-yubihsm2`,
+`firmware-secure-channel`, and `firmware-full`. Selecting a profile also
+enables the embedded runtime.
+
 One protocol implementation and one persistent runtime serve every deployed
 frontend:
 
@@ -147,9 +152,10 @@ simultaneously.
 
 ## Configuration
 
-Embedded devices are enabled on Unix by building `pkcs11rs-connector` with the
-`embedded-virtual-yubihsm` feature. Instances and common persistence policy are
-configured with:
+Embedded devices are enabled on Unix by building `pkcs11rs-connector` with one
+of `firmware-yubihsm2`, `firmware-secure-channel`, or `firmware-full`. That
+feature selects the core firmware profile and enables the embedded runtime.
+Instances and common persistence policy are configured with:
 
 ```text
 --virtual-yubihsm SERIAL=STATE_DIRECTORY
@@ -167,9 +173,9 @@ mode waits for durable storage before every successful mutating response.
 Persistence policy and batch delay apply to every embedded instance in one
 connector process.
 
-A build without `embedded-virtual-yubihsm` accepts the virtual-device arguments,
-logs that they are ignored, and retains physical discovery. This permits one
-service configuration to be used with either connector build.
+A build without a firmware-profile feature accepts the virtual-device
+arguments, logs that they are ignored, and retains physical discovery. This
+permits one service configuration to be used with either connector build.
 
 ## Identity and lifecycle
 

@@ -11,6 +11,7 @@ mod authorization;
 mod capability;
 mod device;
 mod error;
+mod firmware;
 mod frame;
 mod object;
 #[cfg(all(feature = "persistent-runtime", unix))]
@@ -25,6 +26,7 @@ pub use authorization::SessionAuthorization;
 pub use capability::{Capability, CapabilitySet};
 pub use device::{Device, DeviceConfig};
 pub use error::{DeviceError, Result};
+pub use firmware::FirmwareProfile;
 pub use frame::{Frame, MAX_FRAME_LENGTH};
 pub use object::{
     AuthenticationKeyMaterial, ObjectInfo, ObjectKey, ObjectMaterial, ObjectRecord, ObjectType,

@@ -8,19 +8,12 @@ license = "MIT OR Apache-2.0"
 publish = false
 
 [features]
-default = ["full"]
-full = [
-    "direct-rsa-wrap",
-    "extended-curves",
-    "post-quantum",
-    "secure-channel-derivation",
-]
-direct-rsa-wrap = []
-extended-curves = []
-post-quantum = []
-prefixed-ecdh = []
-session-objects = []
-secure-channel-derivation = ["prefixed-ecdh", "session-objects"]
+default = ["firmware-full"]
+firmware-yubihsm2 = []
+firmware-secure-channel = []
+firmware-full = []
+test-firmware-prefixed-ecdh = []
+test-firmware-session-objects = []
 persistent-runtime = ["dep:usb-gadget-worker"]
 
 [dependencies]

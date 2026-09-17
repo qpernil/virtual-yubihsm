@@ -138,16 +138,18 @@ impl Algorithm {
         Some(unsafe { core::mem::transmute::<u8, Self>(value) })
     }
 
-    /// Whether this build includes the implementation behind this algorithm.
-    pub const fn supported_by_build(self) -> bool {
+    /// Whether the compiled firmware profile exposes this algorithm.
+    pub const fn supported_by_firmware(self) -> bool {
         match self {
-            Self::X25519 | Self::X448 | Self::Ed448 => cfg!(feature = "extended-curves"),
+            Self::X25519 | Self::X448 | Self::Ed448 => {
+                crate::FirmwareProfile::compiled().extended_curves()
+            }
             Self::MlDsa44
             | Self::MlDsa65
             | Self::MlDsa87
             | Self::MlKem512
             | Self::MlKem768
-            | Self::MlKem1024 => cfg!(feature = "post-quantum"),
+            | Self::MlKem1024 => crate::FirmwareProfile::compiled().post_quantum(),
             _ => true,
         }
     }

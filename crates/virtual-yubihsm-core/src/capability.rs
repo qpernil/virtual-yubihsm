@@ -73,12 +73,12 @@ pub enum Capability {
 }
 
 impl Capability {
-    pub const fn supported_by_build(self) -> bool {
+    pub const fn supported_by_firmware(self) -> bool {
         match self {
-            Self::DeriveEcdhKdf => cfg!(feature = "prefixed-ecdh"),
-            Self::SessionObjects => cfg!(feature = "session-objects"),
+            Self::DeriveEcdhKdf => crate::FirmwareProfile::compiled().prefixed_ecdh(),
+            Self::SessionObjects => crate::FirmwareProfile::compiled().session_objects(),
             Self::SignMlDsa | Self::EncapsulateMlKem | Self::DecapsulateMlKem => {
-                cfg!(feature = "post-quantum")
+                crate::FirmwareProfile::compiled().post_quantum()
             }
             _ => true,
         }
@@ -136,7 +136,7 @@ impl CapabilitySet {
         self.0[7 - bit / 8] &= !(1 << (bit % 8));
     }
 
-    pub fn retain_build_supported(&mut self) {
+    pub fn retain_firmware_supported(&mut self) {
         for capability in [
             Capability::DeriveEcdhKdf,
             Capability::SessionObjects,
@@ -144,7 +144,7 @@ impl CapabilitySet {
             Capability::EncapsulateMlKem,
             Capability::DecapsulateMlKem,
         ] {
-            if !capability.supported_by_build() {
+            if !capability.supported_by_firmware() {
                 self.remove(capability);
             }
         }

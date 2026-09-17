@@ -61,10 +61,12 @@ device, using this same persistent runtime as the USB and I2C frontends.
 See the [built-in connector integration](docs/pkcs11rs-connector-integration.md).
 The deliberate differences from physical firmware are catalogued in
 [virtual extensions](docs/virtual-extensions.md).
-Those extensions are compile-time features. The default `full` persona enables
-all of them; `--no-default-features` builds a stock YubiHSM 2 protocol persona,
-and individual curve, post-quantum, RSA-wrap, or secure-channel derivation
-features can be added independently.
+Three compile-time firmware profiles keep the device identity explicit. The
+default `firmware-full` profile enables every virtual extension;
+`firmware-secure-channel` enables only the protected client-authentication
+extensions, and `firmware-yubihsm2` provides the physical-compatible baseline.
+See [virtual extensions](docs/virtual-extensions.md#firmware-profiles) for the
+motivation and exact surfaces.
 The [object-info length contract](docs/object-info-lengths.md) records the
 compatibility rules for reported object sizes.
 The virtual `derive-ecdh-kdf` command maps to
