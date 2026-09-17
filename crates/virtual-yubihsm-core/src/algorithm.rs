@@ -1,7 +1,7 @@
 /// Algorithm identifiers from the YubiHSM 2 protocol.
 ///
 /// The published registry ends at `AesKwp`. The following values are
-/// project-supported extension discovery markers.
+/// project-supported virtual extensions.
 #[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
 #[repr(u8)]
 pub enum Algorithm {
@@ -61,14 +61,14 @@ pub enum Algorithm {
     AesCbc = 54,
     AesKwp = 55,
     X25519 = 56,
-    /// Support for the virtual `DeriveEcdhKdf` command.
-    EcdhKdf = 57,
-    /// Support for direct PKCS #1 v1.5 wrapping of symmetric key material.
-    RsaPkcs1Wrap = 58,
-    X448 = 59,
-    Ed448 = 60,
-    /// Support for volatile objects and protected derivation graphs.
-    SessionKeyDerivation = 61,
+    X448 = 57,
+    Ed448 = 58,
+    MlDsa44 = 59,
+    MlDsa65 = 60,
+    MlDsa87 = 61,
+    MlKem512 = 62,
+    MlKem768 = 63,
+    MlKem1024 = 64,
 }
 
 impl Algorithm {
@@ -131,11 +131,31 @@ impl Algorithm {
     ];
 
     pub const fn from_byte(value: u8) -> Option<Self> {
-        if value == 0 || value > Self::SessionKeyDerivation as u8 {
+        if value == 0 || value > Self::MlKem1024 as u8 {
             return None;
         }
-        // SAFETY: every value in the inclusive range 1..=61 is represented.
+        // SAFETY: every value in the inclusive range 1..=64 is represented.
         Some(unsafe { core::mem::transmute::<u8, Self>(value) })
+    }
+
+    pub const fn ml_dsa(self) -> Option<software_key_core::post_quantum::MlDsaParameterSet> {
+        use software_key_core::post_quantum::MlDsaParameterSet::*;
+        match self {
+            Self::MlDsa44 => Some(MlDsa44),
+            Self::MlDsa65 => Some(MlDsa65),
+            Self::MlDsa87 => Some(MlDsa87),
+            _ => None,
+        }
+    }
+
+    pub const fn ml_kem(self) -> Option<software_key_core::post_quantum::MlKemParameterSet> {
+        use software_key_core::post_quantum::MlKemParameterSet::*;
+        match self {
+            Self::MlKem512 => Some(MlKem512),
+            Self::MlKem768 => Some(MlKem768),
+            Self::MlKem1024 => Some(MlKem1024),
+            _ => None,
+        }
     }
 
     pub const fn is_rsa_key(self) -> bool {
@@ -160,6 +180,8 @@ impl Algorithm {
     /// software crypto backend.
     pub const fn asymmetric_key_length(self) -> Option<usize> {
         match self {
+            Self::MlDsa44 | Self::MlDsa65 | Self::MlDsa87 => Some(32),
+            Self::MlKem512 | Self::MlKem768 | Self::MlKem1024 => Some(64),
             Self::Rsa2048 => Some(256),
             Self::Rsa3072 => Some(384),
             Self::Rsa4096 => Some(512),
@@ -180,6 +202,8 @@ impl Algorithm {
     /// This is metadata only and must not be used as a key or wire length.
     pub const fn asymmetric_object_length(self) -> Option<usize> {
         match self {
+            Self::MlDsa44 | Self::MlDsa65 | Self::MlDsa87 => Some(32),
+            Self::MlKem512 | Self::MlKem768 | Self::MlKem1024 => Some(64),
             Self::Rsa2048 => Some(896),
             Self::Rsa3072 => Some(1_344),
             Self::Rsa4096 => Some(1_792),
@@ -228,15 +252,11 @@ mod tests {
         }
         assert_eq!(Algorithm::X25519 as u8, 56);
         assert_eq!(Algorithm::from_byte(56), Some(Algorithm::X25519));
-        assert_eq!(Algorithm::from_byte(57), Some(Algorithm::EcdhKdf));
-        assert_eq!(Algorithm::from_byte(58), Some(Algorithm::RsaPkcs1Wrap));
-        assert_eq!(Algorithm::from_byte(59), Some(Algorithm::X448));
-        assert_eq!(Algorithm::from_byte(60), Some(Algorithm::Ed448));
-        assert_eq!(
-            Algorithm::from_byte(61),
-            Some(Algorithm::SessionKeyDerivation)
-        );
-        assert_eq!(Algorithm::from_byte(62), None);
+        assert_eq!(Algorithm::from_byte(57), Some(Algorithm::X448));
+        assert_eq!(Algorithm::from_byte(58), Some(Algorithm::Ed448));
+        assert_eq!(Algorithm::from_byte(59), Some(Algorithm::MlDsa44));
+        assert_eq!(Algorithm::from_byte(64), Some(Algorithm::MlKem1024));
+        assert_eq!(Algorithm::from_byte(65), None);
     }
 
     #[test]

@@ -25,7 +25,7 @@ pub use authorization::SessionAuthorization;
 pub use capability::{Capability, CapabilitySet};
 pub use device::{Device, DeviceConfig};
 pub use error::{DeviceError, Result};
-pub use frame::Frame;
+pub use frame::{Frame, MAX_FRAME_LENGTH};
 pub use object::{
     AuthenticationKeyMaterial, ObjectInfo, ObjectKey, ObjectMaterial, ObjectRecord, ObjectType,
 };

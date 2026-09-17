@@ -115,8 +115,8 @@ sources. Counter KDF operates directly on each AES handle, including physical
 YubiHSM keys, without exporting or splitting long-term values. The prepared-session
 pair resolver uses the short label suffixes to distinguish roles.
 
-Algorithm 61 and capability `derive-session-key` provide bounded volatile
-P-256, generic-secret, and AES objects. The command family supports P-256
+Capability `derive-session-key` provides bounded volatile P-256,
+generic-secret, and AES objects. The command family supports P-256
 generation and ECDH, key/data concatenation, bit extraction, SHA-256, SP
 800-108 counter KDF, AES-CMAC verification, explicit reads, and deletion.
 Long-term credentials remain ordinary persistent P-256 or AES objects; raw ECDH
@@ -266,10 +266,19 @@ authentication that cannot be logged is reflected in the unlogged-authentication
 counter. The `Session Message` envelope itself can never be audited; its
 decrypted command is considered separately.
 
-Successful command responses must fit the protocol's maximum encrypted return
-frame. An otherwise successful operation that produces too much return data is
-reported as `WRONG LENGTH`. `Reset Device` also renews the static P-256 device
-identity in addition to restoring the factory object and option state.
+Successful command responses must fit the implementation's 8,192-byte maximum
+encrypted return frame. This permits an 8,189-byte unencrypted frame payload
+or up to 8,172 bytes of clear authenticated response data after framing,
+padding, session ID, and MAC overhead. The wire format retains its two-byte
+payload length. The 8,192-byte implementation bound is semi-arbitrary: it is
+believed to be large enough for all anticipated post-quantum key and signature
+payloads while keeping per-command memory bounded.
+Inconsistently encoded requests are rejected as `WRONG LENGTH` before command
+dispatch. An otherwise successful operation that produces too much return data
+is also reported as `WRONG LENGTH`. The USB worker reads one additional packet
+so a full-size frame with trailing data reaches this validation. `Reset Device`
+also renews the static P-256 device identity in addition to restoring the
+factory object and option state.
 
 ## Worker lifecycle
 

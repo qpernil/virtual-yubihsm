@@ -33,6 +33,11 @@ describe the exchange contract, signal-integrity checks, and evidence to retain.
 Response mode requires an active-low, open-drain READY GPIO and driver ABI 3.
 Upgrade the controller, driver and HSM frontend together. Receive-only display
 workloads do not require READY and retain their 1,024-record receive ring.
+The HSM transport accepts complete frames up to 8,192 bytes. Its frontend checks
+the kernel driver's reported maximum transfer at startup and fails if the driver
+cannot carry a full frame. This is the common semi-arbitrary implementation
+ceiling, believed to be large enough for all anticipated post-quantum payloads;
+it is not an I2C or YubiHSM wire-format limit.
 
 The controller holds the physical bus lock while writing a complete request.
 The driver invalidates the previous result when new input arrives and clears

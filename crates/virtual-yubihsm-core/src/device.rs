@@ -301,11 +301,14 @@ impl Default for DeviceConfig {
                 .into_iter()
                 .chain([
                     Algorithm::X25519,
-                    Algorithm::EcdhKdf,
-                    Algorithm::RsaPkcs1Wrap,
                     Algorithm::X448,
                     Algorithm::Ed448,
-                    Algorithm::SessionKeyDerivation,
+                    Algorithm::MlDsa44,
+                    Algorithm::MlDsa65,
+                    Algorithm::MlDsa87,
+                    Algorithm::MlKem512,
+                    Algorithm::MlKem768,
+                    Algorithm::MlKem1024,
                 ])
                 .map(|algorithm| algorithm as u8)
                 .collect(),
@@ -987,6 +990,8 @@ impl Device {
             CommandCode::SignPss => self.sign_pss(authorization, &request.data),
             CommandCode::SignEcdsa => self.sign_ecdsa(authorization, &request.data),
             CommandCode::SignEddsa => self.sign_eddsa(authorization, &request.data),
+            CommandCode::SignMlDsa => self.sign_ml_dsa(authorization, &request.data),
+            CommandCode::MlKem => self.ml_kem(authorization, &request.data),
             CommandCode::DeriveEcdh => self.derive_ecdh(authorization, &request.data),
             CommandCode::DeriveEcdhKdf => self.derive_ecdh_kdf(authorization, &request.data),
             CommandCode::DeriveSessionObject => self.derive_session_object(
@@ -1152,6 +1157,7 @@ impl Device {
             CommandCode::SignPss => first(ObjectType::AsymmetricKey, Capability::SignPss),
             CommandCode::SignEcdsa => first(ObjectType::AsymmetricKey, Capability::SignEcdsa),
             CommandCode::SignEddsa => first(ObjectType::AsymmetricKey, Capability::SignEddsa),
+            CommandCode::SignMlDsa => first(ObjectType::AsymmetricKey, Capability::SignMlDsa),
             CommandCode::DeriveEcdh => first(ObjectType::AsymmetricKey, Capability::DeriveEcdh),
             CommandCode::DeriveEcdhKdf => {
                 first(ObjectType::AsymmetricKey, Capability::DeriveEcdhKdf)
@@ -1776,6 +1782,8 @@ impl Device {
                 ObjectMaterial::Public(public) => output.extend_from_slice(public),
                 _ => return Err(DeviceError::InvalidData),
             }
+        } else if let ObjectMaterial::MlKemKey(key) = &object.material {
+            output.extend_from_slice(&key.public_key());
         } else if matches!(
             Algorithm::from_byte(object.info.algorithm),
             Some(Algorithm::X25519 | Algorithm::X448)
@@ -1967,6 +1975,69 @@ impl Device {
             .map_err(|_| DeviceError::InvalidData)
     }
 
+    /// key-id (BE), hedge mode (0 deterministic, 1 required, 2 preferred),
+    /// context length (u8), context, message. Returns a raw FIPS 204 signature.
+    fn sign_ml_dsa(&self, authorization: SessionAuthorization, data: &[u8]) -> Result<Vec<u8>> {
+        use software_key_core::post_quantum::MlDsaRandomization;
+        if data.len() < 4 || data.len() < 4 + usize::from(data[3]) {
+            return Err(DeviceError::WrongLength);
+        }
+        let object =
+            self.asymmetric_object(authorization, u16::from_be_bytes([data[0], data[1]]))?;
+        self.require_algorithm_enabled(object.info.algorithm)?;
+        let mode = match data[2] {
+            0 => MlDsaRandomization::Deterministic,
+            1 => MlDsaRandomization::Randomized,
+            2 => MlDsaRandomization::HedgePreferred,
+            _ => return Err(DeviceError::InvalidData),
+        };
+        let SoftwareSigningKey::MlDsa(key) = signing_key(object)? else {
+            return Err(DeviceError::InvalidData);
+        };
+        let (context, message) = data[4..].split_at(usize::from(data[3]));
+        key.sign(message, context, mode)
+            .map_err(|_| DeviceError::InvalidData)
+    }
+
+    /// key-id (BE), operation (0 encapsulate, 1 decapsulate), ciphertext
+    /// (decapsulation only). Returns ciphertext || 32-byte secret, or secret.
+    fn ml_kem(&self, authorization: SessionAuthorization, data: &[u8]) -> Result<Vec<u8>> {
+        if data.len() < 3 {
+            return Err(DeviceError::WrongLength);
+        }
+        let capability = match data[2] {
+            0 => Capability::EncapsulateMlKem,
+            1 => Capability::DecapsulateMlKem,
+            _ => return Err(DeviceError::InvalidData),
+        };
+        authorization.require_capability(capability)?;
+        let object =
+            self.asymmetric_object(authorization, u16::from_be_bytes([data[0], data[1]]))?;
+        authorization.authorize_use(&object.info, capability, capability)?;
+        self.require_algorithm_enabled(object.info.algorithm)?;
+        let ObjectMaterial::MlKemKey(key) = &object.material else {
+            return Err(DeviceError::InvalidData);
+        };
+        let payload = &data[3..];
+        if data[2] == 0 {
+            require_empty(payload)?;
+            let (mut ciphertext, secret) = software_key_core::post_quantum::ml_kem_encapsulate(
+                key.parameter_set(),
+                &key.public_key(),
+            )
+            .map_err(|_| DeviceError::InvalidData)?;
+            ciphertext.extend_from_slice(&secret);
+            Ok(ciphertext)
+        } else {
+            if payload.len() != key.parameter_set().ciphertext_length() {
+                return Err(DeviceError::WrongLength);
+            }
+            key.decapsulate(payload)
+                .map(|secret| secret.to_vec())
+                .map_err(|_| DeviceError::InvalidData)
+        }
+    }
+
     fn sign_eddsa(&self, authorization: SessionAuthorization, data: &[u8]) -> Result<Vec<u8>> {
         if data.len() < 2 {
             return Err(DeviceError::WrongLength);
@@ -2058,7 +2129,6 @@ impl Device {
         objects: &mut SessionObjects,
         data: &[u8],
     ) -> Result<Vec<u8>> {
-        self.require_algorithm_enabled(Algorithm::SessionKeyDerivation as u8)?;
         let (&operation, rest) = data.split_first().ok_or(DeviceError::WrongLength)?;
         let (&flags, rest) = rest.split_first().ok_or(DeviceError::WrongLength)?;
         if flags & !(FLAG_READABLE | FLAG_DERIVE | FLAG_VERIFY) != 0 {
@@ -2233,7 +2303,6 @@ impl Device {
     }
 
     fn read_session_object(&self, objects: &SessionObjects, data: &[u8]) -> Result<Vec<u8>> {
-        self.require_algorithm_enabled(Algorithm::SessionKeyDerivation as u8)?;
         let handle = parse_u64(data)?;
         let object = objects.get(handle).ok_or(DeviceError::ObjectNotFound)?;
         if object.flags & FLAG_READABLE == 0 {
@@ -2246,7 +2315,6 @@ impl Device {
     }
 
     fn verify_session_object(&self, objects: &SessionObjects, data: &[u8]) -> Result<Vec<u8>> {
-        self.require_algorithm_enabled(Algorithm::SessionKeyDerivation as u8)?;
         if data.len() < 10 {
             return Err(DeviceError::WrongLength);
         }
@@ -2270,7 +2338,6 @@ impl Device {
     }
 
     fn delete_session_object(&self, objects: &mut SessionObjects, data: &[u8]) -> Result<Vec<u8>> {
-        self.require_algorithm_enabled(Algorithm::SessionKeyDerivation as u8)?;
         let handle = parse_u64(data)?;
         objects.remove(handle).ok_or(DeviceError::ObjectNotFound)?;
         Ok(Vec::new())
@@ -2668,7 +2735,9 @@ impl Device {
             .ok_or(DeviceError::ObjectNotFound)?;
         let direct_pkcs1 = data[5..8] == [0, 0, 0];
         if direct_pkcs1 {
-            self.require_algorithm_enabled(Algorithm::RsaPkcs1Wrap as u8)?;
+            if self.options.fips_mode != OPTION_OFF {
+                return Err(DeviceError::InvalidData);
+            }
             if data.len() != 8 {
                 return Err(DeviceError::WrongLength);
             }
@@ -2788,7 +2857,9 @@ impl Device {
             let wrap_key = self.rsa_private_wrap_key(authorization, wrap_id)?;
             let modulus_length = rsa_modulus_length(wrap_key)?;
             let plaintext = if direct_pkcs1 {
-                self.require_algorithm_enabled(Algorithm::RsaPkcs1Wrap as u8)?;
+                if self.options.fips_mode != OPTION_OFF {
+                    return Err(DeviceError::InvalidData);
+                }
                 if object_type != ObjectType::SymmetricKey {
                     return Err(DeviceError::InvalidData);
                 }
@@ -3386,6 +3457,18 @@ fn asymmetric_key_material(
     let expected_length = algorithm
         .asymmetric_key_length()
         .ok_or(DeviceError::InvalidData)?;
+    if let Some(parameters) = algorithm.ml_kem() {
+        if generate && !supplied.is_empty() || !generate && supplied.len() != 64 {
+            return Err(DeviceError::WrongLength);
+        }
+        let key = if generate {
+            software_key_core::post_quantum::MlKemPrivateKey::generate(parameters)
+        } else {
+            software_key_core::post_quantum::MlKemPrivateKey::from_seed_slice(parameters, supplied)
+        }
+        .map_err(|_| DeviceError::InvalidData)?;
+        return Ok(ObjectMaterial::MlKemKey(key));
+    }
     if generate && !supplied.is_empty() {
         return Err(DeviceError::WrongLength);
     }
@@ -3432,13 +3515,16 @@ fn asymmetric_key_material(
         SoftwareSigningKey::from_serialized_for_kind(key_kind, supplied)
             .map_err(|_| DeviceError::InvalidData)?
     };
-    if key.private_value().map_or(0, |secret| secret.len()) != expected_length {
+    if key.serialized().map_or(0, |secret| secret.len()) != expected_length {
         return Err(DeviceError::InvalidData);
     }
     Ok(ObjectMaterial::SigningKey(key))
 }
 
 fn asymmetric_key_kind(algorithm: Algorithm) -> Result<KeyKind> {
+    if let Some(parameters) = algorithm.ml_dsa() {
+        return Ok(KeyKind::MlDsa(parameters));
+    }
     Ok(match algorithm {
         Algorithm::EcP224 => KeyKind::Ec(EcCurve::P224),
         Algorithm::EcP256 => KeyKind::Ec(EcCurve::P256),
@@ -4486,7 +4572,6 @@ fn fips_disallowed_algorithm(algorithm: u8) -> bool {
                 | Algorithm::EcdsaSha1
                 | Algorithm::EcK256
                 | Algorithm::RsaPkcs1Decrypt
-                | Algorithm::RsaPkcs1Wrap
         )
     )
 }
@@ -4913,26 +4998,6 @@ mod tests {
             device.execute_inner_with_session(insufficient, &derive, Some(&mut objects)),
             Frame::error(DeviceError::InsufficientPermissions)
         );
-
-        let mut config = DeviceConfig::default();
-        config
-            .algorithms
-            .retain(|algorithm| *algorithm != Algorithm::SessionKeyDerivation as u8);
-        let mut disabled = Device::factory_default(config);
-        let disabled_authorization = SessionAuthorization {
-            authentication_key_id: 1,
-            capabilities: CapabilitySet::from_capabilities([Capability::DeriveSessionKey]),
-            delegated_capabilities: CapabilitySet::NONE,
-            domains: u16::MAX,
-        };
-        assert_eq!(
-            disabled.execute_inner_with_session(
-                disabled_authorization,
-                &derive,
-                Some(&mut SessionObjects::default()),
-            ),
-            Frame::error(DeviceError::InvalidData)
-        );
     }
 
     #[test]
@@ -4992,17 +5057,34 @@ mod tests {
         let mut device = Device::factory_default(DeviceConfig::default());
         let authorization = device.session_authorization(1).unwrap();
         let maximum =
-            Frame::new(CommandCode::GetPseudoRandom as u8, 3_116_u16.to_be_bytes()).unwrap();
+            Frame::new(CommandCode::GetPseudoRandom as u8, 8_172_u16.to_be_bytes()).unwrap();
         assert_eq!(
             device.execute_inner(authorization, &maximum).data.len(),
-            3_116
+            8_172
         );
 
         let oversized =
-            Frame::new(CommandCode::GetPseudoRandom as u8, 3_117_u16.to_be_bytes()).unwrap();
+            Frame::new(CommandCode::GetPseudoRandom as u8, 8_173_u16.to_be_bytes()).unwrap();
         assert_eq!(
             device.execute_inner(authorization, &oversized),
             Frame::error(DeviceError::WrongLength)
+        );
+    }
+
+    #[test]
+    fn overlong_encoded_request_is_rejected_before_dispatch() {
+        let mut device = Device::factory_default(DeviceConfig::default());
+        let mut request = Frame::new(
+            CommandCode::Echo as u8,
+            vec![0; crate::frame::MAX_DATA_LENGTH],
+        )
+        .unwrap()
+        .encode();
+        request.push(0);
+
+        assert_eq!(
+            device.handle_encoded(&request),
+            Frame::error(DeviceError::WrongLength).encode()
         );
     }
 
@@ -5716,6 +5798,181 @@ mod tests {
     }
 
     #[test]
+    fn post_quantum_commands_sign_encapsulate_and_survive_persistence() {
+        use software_key_core::post_quantum::{MlDsaParameterSet, verify_ml_dsa};
+
+        const DSA_ID: u16 = 70;
+        const KEM_ID: u16 = 71;
+        let config = DeviceConfig::default();
+        let mut device = Device::factory_default(config.clone());
+        let admin = device.session_authorization(1).unwrap();
+
+        let generate_dsa = generate_asymmetric_key_request(
+            DSA_ID,
+            1,
+            CapabilitySet::from_capabilities([Capability::SignMlDsa]),
+            Algorithm::MlDsa87 as u8,
+        );
+        assert_eq!(
+            device.execute_inner(admin, &generate_dsa).data,
+            DSA_ID.to_be_bytes()
+        );
+        let generate_kem = generate_asymmetric_key_request(
+            KEM_ID,
+            1,
+            CapabilitySet::from_capabilities([
+                Capability::EncapsulateMlKem,
+                Capability::DecapsulateMlKem,
+            ]),
+            Algorithm::MlKem1024 as u8,
+        );
+        assert_eq!(
+            device.execute_inner(admin, &generate_kem).data,
+            KEM_ID.to_be_bytes()
+        );
+
+        let public_dsa = device.execute_inner(
+            admin,
+            &Frame::new(CommandCode::GetPublicKey as u8, DSA_ID.to_be_bytes()).unwrap(),
+        );
+        assert_eq!(public_dsa.data[0], Algorithm::MlDsa87 as u8);
+        let context = b"virtual-yubihsm";
+        let message = b"signature larger than the former transport ceiling";
+        let sign_data = [
+            DSA_ID.to_be_bytes().as_slice(),
+            &[0, context.len() as u8],
+            context,
+            message,
+        ]
+        .concat();
+        let sign = Frame::new(CommandCode::SignMlDsa as u8, sign_data.clone()).unwrap();
+        let signature = device.execute_inner(admin, &sign);
+        assert_eq!(signature.command, CommandCode::SignMlDsa as u8 | 0x80);
+        assert!(signature.data.len() > 3_136);
+        verify_ml_dsa(
+            MlDsaParameterSet::MlDsa87,
+            &public_dsa.data[1..],
+            message,
+            context,
+            &signature.data,
+        )
+        .unwrap();
+
+        let encapsulate = Frame::new(
+            CommandCode::MlKem as u8,
+            [KEM_ID.to_be_bytes().as_slice(), &[0]].concat(),
+        )
+        .unwrap();
+        let encapsulated = device.execute_inner(admin, &encapsulate);
+        assert_eq!(encapsulated.command, CommandCode::MlKem as u8 | 0x80);
+        assert_eq!(encapsulated.data.len(), 1_568 + 32);
+        let (ciphertext, shared) = encapsulated.data.split_at(1_568);
+        let decapsulate = Frame::new(
+            CommandCode::MlKem as u8,
+            [KEM_ID.to_be_bytes().as_slice(), &[1], ciphertext].concat(),
+        )
+        .unwrap();
+        assert_eq!(device.execute_inner(admin, &decapsulate).data, shared);
+
+        for malformed in [
+            vec![],
+            vec![0, KEM_ID as u8],
+            vec![0, KEM_ID as u8, 2],
+            vec![0, KEM_ID as u8, 0, 1],
+            vec![0, KEM_ID as u8, 1, 1],
+        ] {
+            let response = device.execute_inner(
+                admin,
+                &Frame::new(CommandCode::MlKem as u8, malformed).unwrap(),
+            );
+            assert!(matches!(
+                DeviceError::from_byte(response.data[0]),
+                Some(DeviceError::WrongLength | DeviceError::InvalidData)
+            ));
+        }
+        let restricted = SessionAuthorization {
+            authentication_key_id: 2,
+            capabilities: CapabilitySet::NONE,
+            delegated_capabilities: CapabilitySet::NONE,
+            domains: 1,
+        };
+        assert_eq!(
+            device.execute_inner(restricted, &sign),
+            Frame::error(DeviceError::InsufficientPermissions)
+        );
+
+        let state = device.persistent_state().unwrap();
+        let mut restored = Device::from_persistent_state(config, &state).unwrap();
+        assert_eq!(restored.execute_inner(admin, &decapsulate).data, shared);
+        let restored_signature = restored.execute_inner(admin, &sign);
+        verify_ml_dsa(
+            MlDsaParameterSet::MlDsa87,
+            &public_dsa.data[1..],
+            message,
+            context,
+            &restored_signature.data,
+        )
+        .unwrap();
+    }
+
+    #[test]
+    fn post_quantum_seed_imports_use_existing_asymmetric_object_commands() {
+        use software_key_core::post_quantum::{MlDsaParameterSet, verify_ml_dsa};
+
+        let mut device = Device::factory_default(DeviceConfig::default());
+        let admin = device.session_authorization(1).unwrap();
+        let dsa_capabilities = CapabilitySet::from_capabilities([Capability::SignMlDsa]);
+        let kem_capabilities = CapabilitySet::from_capabilities([
+            Capability::EncapsulateMlKem,
+            Capability::DecapsulateMlKem,
+        ]);
+
+        let put_dsa =
+            put_asymmetric_key_request(72, 1, dsa_capabilities, Algorithm::MlDsa44, &[0x44; 32]);
+        assert_eq!(
+            device.execute_inner(admin, &put_dsa).data,
+            72_u16.to_be_bytes()
+        );
+        let put_kem =
+            put_asymmetric_key_request(73, 1, kem_capabilities, Algorithm::MlKem512, &[0x51; 64]);
+        assert_eq!(
+            device.execute_inner(admin, &put_kem).data,
+            73_u16.to_be_bytes()
+        );
+
+        let public = device.execute_inner(
+            admin,
+            &Frame::new(CommandCode::GetPublicKey as u8, 72_u16.to_be_bytes()).unwrap(),
+        );
+        assert_eq!(public.data.len(), 1 + 1_312);
+        let sign = Frame::new(
+            CommandCode::SignMlDsa as u8,
+            [72_u16.to_be_bytes().as_slice(), &[0, 0], b"seed import"].concat(),
+        )
+        .unwrap();
+        let signature = device.execute_inner(admin, &sign).data;
+        verify_ml_dsa(
+            MlDsaParameterSet::MlDsa44,
+            &public.data[1..],
+            b"seed import",
+            &[],
+            &signature,
+        )
+        .unwrap();
+
+        for (algorithm, seed) in [
+            (Algorithm::MlDsa44, vec![0; 31]),
+            (Algorithm::MlKem512, vec![0; 63]),
+        ] {
+            let request = put_asymmetric_key_request(74, 1, CapabilitySet::NONE, algorithm, &seed);
+            assert_eq!(
+                device.execute_inner(admin, &request),
+                Frame::error(DeviceError::WrongLength)
+            );
+        }
+    }
+
+    #[test]
     fn asymmetric_authentication_key_exposes_its_public_key() {
         let mut device = Device::factory_default(DeviceConfig::default());
         let admin = device.session_authorization(1).unwrap();
@@ -6392,7 +6649,7 @@ mod tests {
         previous.version = [2, 4, 1];
         previous
             .algorithms
-            .retain(|algorithm| *algorithm != Algorithm::SessionKeyDerivation as u8);
+            .retain(|algorithm| *algorithm != Algorithm::MlKem1024 as u8);
         let encoded = Device::factory_default(previous)
             .persistent_state()
             .unwrap();
@@ -6402,7 +6659,7 @@ mod tests {
             restored.execute_plain(&Frame::new(CommandCode::GetDeviceInfo as u8, vec![]).unwrap());
         assert_eq!(&response.data[..3], &current.version);
         assert!(
-            response.data[9..].contains(&(Algorithm::SessionKeyDerivation as u8)),
+            response.data[9..].contains(&(Algorithm::MlKem1024 as u8)),
             "restored device must advertise capabilities of the running firmware"
         );
 

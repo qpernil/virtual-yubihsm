@@ -67,6 +67,9 @@ pub enum Capability {
     DeriveEcdhKdf = 0x38,
     /// Create, use, read, and destroy volatile protected objects.
     DeriveSessionKey = 0x39,
+    SignMlDsa = 0x3a,
+    EncapsulateMlKem = 0x3b,
+    DecapsulateMlKem = 0x3c,
 }
 
 /// The protocol's big-endian eight-byte capability bitmap.
