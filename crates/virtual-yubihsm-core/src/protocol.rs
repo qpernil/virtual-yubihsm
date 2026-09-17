@@ -78,6 +78,44 @@ pub enum CommandCode {
     ImportRsaWrapped = 0x77,
 }
 
+/// Operation selectors inside the [`CommandCode::SessionObject`] namespace.
+///
+/// Operations that have the same purpose as a persistent-object command reuse
+/// that command's numeric value. Operations that exist only for volatile
+/// objects have values in this independent nested registry.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[repr(u8)]
+pub enum SessionObjectCommand {
+    Read = 0x01,
+    VerifyCmac = 0x02,
+    ConcatenateKey = 0x03,
+    ConcatenateData = 0x04,
+    Extract = 0x05,
+    Sha256 = 0x06,
+    CounterKdf = 0x07,
+    GenerateAsymmetricKey = 0x46,
+    DeriveEcdh = 0x57,
+    DeleteObject = 0x58,
+}
+
+impl SessionObjectCommand {
+    pub fn from_byte(value: u8) -> Option<Self> {
+        Some(match value {
+            0x01 => Self::Read,
+            0x02 => Self::VerifyCmac,
+            0x03 => Self::ConcatenateKey,
+            0x04 => Self::ConcatenateData,
+            0x05 => Self::Extract,
+            0x06 => Self::Sha256,
+            0x07 => Self::CounterKdf,
+            0x46 => Self::GenerateAsymmetricKey,
+            0x57 => Self::DeriveEcdh,
+            0x58 => Self::DeleteObject,
+            _ => return None,
+        })
+    }
+}
+
 impl CommandCode {
     /// Whether the compiled firmware profile exposes this command.
     pub const fn supported_by_firmware(self) -> bool {
@@ -224,5 +262,44 @@ impl CommandCode {
             | SessionMessage | GetDeviceInfo | GetDevicePublicKey | CloseSession
             | GetStorageInfo | ListObjects | GetObjectInfo | GetPublicKey | BlinkDevice => None,
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{CommandCode, SessionObjectCommand};
+
+    #[test]
+    fn session_object_registry_reuses_only_matching_command_codes() {
+        for (nested, ordinary) in [
+            (
+                SessionObjectCommand::GenerateAsymmetricKey,
+                CommandCode::GenerateAsymmetricKey,
+            ),
+            (SessionObjectCommand::DeriveEcdh, CommandCode::DeriveEcdh),
+            (
+                SessionObjectCommand::DeleteObject,
+                CommandCode::DeleteObject,
+            ),
+        ] {
+            assert_eq!(nested as u8, ordinary as u8);
+            assert_eq!(SessionObjectCommand::from_byte(nested as u8), Some(nested));
+        }
+
+        for operation in [
+            SessionObjectCommand::Read,
+            SessionObjectCommand::VerifyCmac,
+            SessionObjectCommand::ConcatenateKey,
+            SessionObjectCommand::ConcatenateData,
+            SessionObjectCommand::Extract,
+            SessionObjectCommand::Sha256,
+            SessionObjectCommand::CounterKdf,
+        ] {
+            assert_eq!(
+                SessionObjectCommand::from_byte(operation as u8),
+                Some(operation)
+            );
+        }
+        assert_eq!(SessionObjectCommand::from_byte(0), None);
     }
 }

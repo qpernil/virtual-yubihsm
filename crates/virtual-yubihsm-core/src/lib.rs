@@ -33,4 +33,4 @@ pub use object::{
 };
 #[cfg(all(feature = "persistent-runtime", unix))]
 pub use persistent_runtime::{PersistenceMode, PersistentDevice, PersistentDeviceHandle};
-pub use protocol::CommandCode;
+pub use protocol::{CommandCode, SessionObjectCommand};

@@ -2,7 +2,7 @@ use crate::object::StoredObjectRecord;
 use crate::{
     Algorithm, AuthenticationKeyMaterial, Capability, CapabilitySet, CommandCode, DeviceError,
     FirmwareProfile, Frame, ObjectInfo, ObjectKey, ObjectMaterial, ObjectRecord, ObjectType,
-    Result, SessionAuthorization,
+    Result, SessionAuthorization, SessionObjectCommand,
     session::{
         AUTHENTICATION_ALGORITHM_AES128_YUBICO, AUTHENTICATION_ALGORITHM_EC_P256, CHALLENGE_LENGTH,
         P256_PUBLIC_KEY_LENGTH, SecureSession, SessionEntry, random_secret_key,
@@ -2153,10 +2153,14 @@ impl Device {
         data: &[u8],
     ) -> Result<Vec<u8>> {
         let (&operation, rest) = data.split_first().ok_or(DeviceError::WrongLength)?;
+        let operation =
+            SessionObjectCommand::from_byte(operation).ok_or(DeviceError::InvalidData)?;
         match operation {
-            SESSION_READ => return self.read_session_object(objects, rest),
-            SESSION_VERIFY_CMAC => return self.verify_session_object(objects, rest),
-            value if value == CommandCode::DeleteObject as u8 => {
+            SessionObjectCommand::Read => return self.read_session_object(objects, rest),
+            SessionObjectCommand::VerifyCmac => {
+                return self.verify_session_object(objects, rest);
+            }
+            SessionObjectCommand::DeleteObject => {
                 return self.delete_session_object(objects, rest);
             }
             _ => {}
@@ -2166,7 +2170,7 @@ impl Device {
             return Err(DeviceError::InvalidData);
         }
 
-        if operation == CommandCode::GenerateAsymmetricKey as u8 {
+        if operation == SessionObjectCommand::GenerateAsymmetricKey {
             if rest != [Algorithm::EcP256 as u8] || flags & FLAG_DERIVE == 0 {
                 return Err(DeviceError::InvalidData);
             }
@@ -2194,7 +2198,7 @@ impl Device {
         }
         let rest = &rest[3..];
         let value = match operation {
-            value if value == CommandCode::DeriveEcdh as u8 => {
+            SessionObjectCommand::DeriveEcdh => {
                 let mut offset = 0;
                 let source = parse_session_source(rest, &mut offset)?;
                 if rest.len() < offset + 2 {
@@ -2234,7 +2238,7 @@ impl Device {
                 let offset = value.len() - output_length;
                 Zeroizing::new(value[offset..].to_vec())
             }
-            SESSION_CONCATENATE_KEY => {
+            SessionObjectCommand::ConcatenateKey => {
                 if rest.len() != 16 {
                     return Err(DeviceError::WrongLength);
                 }
@@ -2251,7 +2255,7 @@ impl Device {
                 value.extend(left.iter().chain(right.iter()).take(output_length).copied());
                 value
             }
-            SESSION_CONCATENATE_DATA => {
+            SessionObjectCommand::ConcatenateData => {
                 if rest.len() < 8 {
                     return Err(DeviceError::WrongLength);
                 }
@@ -2267,7 +2271,7 @@ impl Device {
                 value.extend(base.iter().chain(&rest[8..]).take(output_length).copied());
                 value
             }
-            SESSION_EXTRACT => {
+            SessionObjectCommand::Extract => {
                 if rest.len() != 10 {
                     return Err(DeviceError::WrongLength);
                 }
@@ -2293,7 +2297,7 @@ impl Device {
                 }
                 value
             }
-            SESSION_SHA256 => {
+            SessionObjectCommand::Sha256 => {
                 if rest.len() != 8 || output_length > 32 {
                     return Err(DeviceError::WrongLength);
                 }
@@ -2301,7 +2305,7 @@ impl Device {
                 let digest = HashAlgorithm::Sha256.digest(&base);
                 Zeroizing::new(digest[..output_length].to_vec())
             }
-            SESSION_COUNTER_KDF => {
+            SessionObjectCommand::CounterKdf => {
                 let mut offset = 0;
                 let source = parse_session_source(rest, &mut offset)?;
                 let key = match source {
@@ -4354,14 +4358,6 @@ fn ecdh_kdf_hash(value: u8) -> Result<HashAlgorithm> {
     }
 }
 
-const SESSION_READ: u8 = 0x01;
-const SESSION_VERIFY_CMAC: u8 = 0x02;
-const SESSION_CONCATENATE_KEY: u8 = 0x03;
-const SESSION_CONCATENATE_DATA: u8 = 0x04;
-const SESSION_EXTRACT: u8 = 0x05;
-const SESSION_SHA256: u8 = 0x06;
-const SESSION_COUNTER_KDF: u8 = 0x07;
-
 #[derive(Clone, Copy)]
 enum SessionSource {
     Volatile(u64),
@@ -4888,7 +4884,7 @@ mod tests {
         objects: &mut SessionObjects,
         handle: u64,
     ) -> Frame {
-        let mut data = vec![SESSION_READ];
+        let mut data = vec![SessionObjectCommand::Read as u8];
         data.extend_from_slice(&handle.to_be_bytes());
         let request = Frame::new(CommandCode::SessionObject as u8, data).unwrap();
         device.execute_inner_with_session(authorization, &request, Some(objects))
@@ -4908,7 +4904,7 @@ mod tests {
         let generate = Frame::new(
             CommandCode::SessionObject as u8,
             vec![
-                CommandCode::GenerateAsymmetricKey as u8,
+                SessionObjectCommand::GenerateAsymmetricKey as u8,
                 FLAG_DERIVE,
                 Algorithm::EcP256 as u8,
             ],
@@ -4929,7 +4925,7 @@ mod tests {
         tail.extend_from_slice(&(peer_public.as_bytes().len() as u16).to_be_bytes());
         tail.extend_from_slice(peer_public.as_bytes());
         let derive = session_derive_request(
-            CommandCode::DeriveEcdh as u8,
+            SessionObjectCommand::DeriveEcdh as u8,
             FLAG_READABLE | FLAG_DERIVE,
             SessionObjectKind::GenericSecret,
             16,
@@ -4954,7 +4950,7 @@ mod tests {
         );
 
         let protected = session_derive_request(
-            SESSION_CONCATENATE_DATA,
+            SessionObjectCommand::ConcatenateData as u8,
             FLAG_DERIVE,
             SessionObjectKind::GenericSecret,
             16,
@@ -4972,7 +4968,7 @@ mod tests {
         let delete = Frame::new(
             CommandCode::SessionObject as u8,
             [
-                &[CommandCode::DeleteObject as u8],
+                &[SessionObjectCommand::DeleteObject as u8],
                 secret_handle.to_be_bytes().as_slice(),
             ]
             .concat(),
@@ -5020,7 +5016,7 @@ mod tests {
         tail.extend_from_slice(b"SCP");
         tail.extend_from_slice(&[2, 16, 0, 0]);
         let derive = session_derive_request(
-            SESSION_COUNTER_KDF,
+            SessionObjectCommand::CounterKdf as u8,
             FLAG_READABLE | FLAG_VERIFY,
             SessionObjectKind::Aes,
             16,
@@ -5057,7 +5053,7 @@ mod tests {
         verify_data.push(8);
         verify_data.extend_from_slice(&signature[..8]);
         verify_data.extend_from_slice(message);
-        verify_data.insert(0, SESSION_VERIFY_CMAC);
+        verify_data.insert(0, SessionObjectCommand::VerifyCmac as u8);
         let verify = Frame::new(CommandCode::SessionObject as u8, verify_data).unwrap();
         assert_eq!(
             device
