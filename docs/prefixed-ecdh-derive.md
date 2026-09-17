@@ -18,6 +18,15 @@ device boundary.
 This is deliberately a generic ECDH derivation mechanism rather than an SCP11
 mechanism. SCP11 asymmetric authentication is its first intended consumer.
 
+This command is the middle placement tier for a client that supports native
+volatile session objects. When algorithm 61 and `derive-session-key` permit the
+complete protected graph, the client keeps its ephemeral private key and both
+agreements in device objects and selects that graph first. `DeriveEcdhKdf` is
+selected when the client must supply the ephemeral agreement as literal prefix
+bytes. Ordinary `DeriveEcdh`, followed by composition and KDF in the client
+module, is the final compatibility path. Selection is completed before
+execution; an operational failure never triggers a weaker retry.
+
 ## Cryptographic operation
 
 For the HSM-held private key `d`, peer public key `Q`, caller prefix `P`, shared
@@ -147,10 +156,13 @@ L = 64
 Hash = SHA-256
 ```
 
-The connector generates a client ephemeral P-256 key and computes
-`Zephemeral` from the target's fresh ephemeral public key. It invokes
-`DeriveEcdhKdf` on the source HSM using the protected client-static private key
-and the target's static device public key. The 64-byte response contains:
+On this literal-prefix path, the connector generates a client ephemeral P-256
+key and computes `Zephemeral` from the target's fresh ephemeral public key. It
+invokes `DeriveEcdhKdf` on the source HSM using the protected client-static
+private key and the target's static device public key. When native session
+P-256 and protected ECDH are available, the stronger session-object graph
+performs the same mathematical prefix derivation without exporting
+`Zephemeral`. The 64-byte result contains:
 
 ```text
 0..16   receipt key
