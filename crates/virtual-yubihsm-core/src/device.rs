@@ -1,8 +1,8 @@
 use crate::object::StoredObjectRecord;
 use crate::{
     Algorithm, AuthenticationKeyMaterial, Capability, CapabilitySet, CommandCode, DeviceError,
-    Frame, ObjectInfo, ObjectKey, ObjectMaterial, ObjectRecord, ObjectType, Result,
-    SessionAuthorization,
+    FirmwareProfile, Frame, ObjectInfo, ObjectKey, ObjectMaterial, ObjectRecord, ObjectType,
+    Result, SessionAuthorization,
     session::{
         AUTHENTICATION_ALGORITHM_AES128_YUBICO, AUTHENTICATION_ALGORITHM_EC_P256, CHALLENGE_LENGTH,
         P256_PUBLIC_KEY_LENGTH, SecureSession, SessionEntry, random_secret_key,
@@ -310,7 +310,7 @@ impl Default for DeviceConfig {
                     Algorithm::MlKem768,
                     Algorithm::MlKem1024,
                 ])
-                .filter(|algorithm| algorithm.supported_by_build())
+                .filter(|algorithm| algorithm.supported_by_firmware())
                 .map(|algorithm| algorithm as u8)
                 .collect(),
             part_number: *b"78CLUFX5000P\0",
@@ -735,8 +735,8 @@ impl Device {
         request: &Frame,
         objects: Option<&mut SessionObjects>,
     ) -> Frame {
-        let command =
-            CommandCode::from_byte(request.command).filter(|command| command.supported_by_build());
+        let command = CommandCode::from_byte(request.command)
+            .filter(|command| command.supported_by_firmware());
         let should_audit = command.is_some_and(|command| self.should_audit(command));
         if command.is_some_and(|command| {
             !command_is_meta(command)
@@ -944,7 +944,7 @@ impl Device {
             return result;
         }
         let command = CommandCode::from_byte(request.command).ok_or(DeviceError::InvalidCommand)?;
-        if !command.supported_by_build() {
+        if !command.supported_by_firmware() {
             return Err(DeviceError::InvalidCommand);
         }
         self.authorize_command_request(authorization, command, &request.data)?;
@@ -971,8 +971,8 @@ impl Device {
                 let object = self.objects.get(&key).ok_or(DeviceError::ObjectNotFound)?;
                 authorization.require_visible(&object.info)?;
                 let mut info = object.info.clone();
-                info.capabilities.retain_build_supported();
-                info.delegated_capabilities.retain_build_supported();
+                info.capabilities.retain_firmware_supported();
+                info.delegated_capabilities.retain_firmware_supported();
                 Ok(info.encode().to_vec())
             }
             CommandCode::GetLogEntries => self.get_log_entries(&request.data),
@@ -1380,7 +1380,8 @@ impl Device {
             OPTION_COMMAND_AUDIT => {
                 let mut output = Vec::new();
                 for command in 0..=u8::MAX {
-                    if CommandCode::from_byte(command).is_some_and(CommandCode::supported_by_build)
+                    if CommandCode::from_byte(command)
+                        .is_some_and(CommandCode::supported_by_firmware)
                     {
                         output.extend_from_slice(&[
                             command,
@@ -1397,7 +1398,7 @@ impl Device {
             OPTION_ALGORITHM_TOGGLE => {
                 let mut output = Vec::with_capacity(self.config.algorithms.len() * 2);
                 for algorithm in self.config.algorithms.iter().filter(|algorithm| {
-                    Algorithm::from_byte(**algorithm).is_some_and(Algorithm::supported_by_build)
+                    Algorithm::from_byte(**algorithm).is_some_and(Algorithm::supported_by_firmware)
                 }) {
                     output.extend_from_slice(&[
                         *algorithm,
@@ -1439,7 +1440,7 @@ impl Device {
                 let mut updated = self.options.command_audit.clone();
                 for pair in values.as_chunks::<2>().0 {
                     let Some(command) = CommandCode::from_byte(pair[0])
-                        .filter(|command| command.supported_by_build())
+                        .filter(|command| command.supported_by_firmware())
                     else {
                         return Err(DeviceError::InvalidData);
                     };
@@ -1464,7 +1465,8 @@ impl Device {
                 let mut updated = self.options.algorithm_toggle.clone();
                 for pair in values.as_chunks::<2>().0 {
                     if !self.config.algorithms.contains(&pair[0])
-                        || !Algorithm::from_byte(pair[0]).is_some_and(Algorithm::supported_by_build)
+                        || !Algorithm::from_byte(pair[0])
+                            .is_some_and(Algorithm::supported_by_firmware)
                         || !valid_option_value(pair[1])
                     {
                         return Err(DeviceError::InvalidData);
@@ -1510,7 +1512,7 @@ impl Device {
     }
 
     fn algorithm_enabled(&self, algorithm: u8) -> bool {
-        Algorithm::from_byte(algorithm).is_some_and(Algorithm::supported_by_build)
+        Algorithm::from_byte(algorithm).is_some_and(Algorithm::supported_by_firmware)
             && self.config.algorithms.contains(&algorithm)
             && self
                 .options
@@ -2764,7 +2766,7 @@ impl Device {
             .ok_or(DeviceError::ObjectNotFound)?;
         let direct_pkcs1 = data[5..8] == [0, 0, 0];
         if direct_pkcs1 {
-            if !cfg!(feature = "direct-rsa-wrap") {
+            if !FirmwareProfile::compiled().direct_rsa_wrap() {
                 return Err(DeviceError::InvalidData);
             }
             if self.options.fips_mode != OPTION_OFF {
@@ -2889,7 +2891,7 @@ impl Device {
             let wrap_key = self.rsa_private_wrap_key(authorization, wrap_id)?;
             let modulus_length = rsa_modulus_length(wrap_key)?;
             let plaintext = if direct_pkcs1 {
-                if !cfg!(feature = "direct-rsa-wrap") {
+                if !FirmwareProfile::compiled().direct_rsa_wrap() {
                     return Err(DeviceError::InvalidData);
                 }
                 if self.options.fips_mode != OPTION_OFF {
@@ -4690,7 +4692,12 @@ mod tests {
     use crate::secure_channel_crypto::{
         BLOCK_SIZE, cbc_decrypt, cbc_encrypt, cmac, encrypt_block, pad, scp03_kdf, unpad,
     };
-    #[cfg(any(feature = "session-objects", feature = "prefixed-ecdh"))]
+    #[cfg(any(
+        feature = "firmware-secure-channel",
+        feature = "firmware-full",
+        feature = "test-firmware-prefixed-ecdh",
+        feature = "test-firmware-session-objects"
+    ))]
     use p256::ecdh::diffie_hellman;
     use p256::elliptic_curve::sec1::ToSec1Point;
     use software_key_core::software_signing::EcCurve;
@@ -4785,7 +4792,11 @@ mod tests {
         Frame::new(CommandCode::PutAuthenticationKey as u8, data).unwrap()
     }
 
-    #[cfg(any(feature = "post-quantum", feature = "prefixed-ecdh"))]
+    #[cfg(any(
+        feature = "firmware-secure-channel",
+        feature = "firmware-full",
+        feature = "test-firmware-prefixed-ecdh"
+    ))]
     fn put_asymmetric_key_request(
         id: u16,
         domains: u16,
@@ -4838,7 +4849,11 @@ mod tests {
         Frame::new(CommandCode::PutSymmetricKey as u8, data).unwrap()
     }
 
-    #[cfg(feature = "session-objects")]
+    #[cfg(any(
+        feature = "firmware-secure-channel",
+        feature = "firmware-full",
+        feature = "test-firmware-session-objects"
+    ))]
     fn session_derive_request(
         operation: u8,
         flags: u8,
@@ -4852,13 +4867,21 @@ mod tests {
         Frame::new(CommandCode::SessionObject as u8, data).unwrap()
     }
 
-    #[cfg(feature = "session-objects")]
+    #[cfg(any(
+        feature = "firmware-secure-channel",
+        feature = "firmware-full",
+        feature = "test-firmware-session-objects"
+    ))]
     fn session_object_handle(response: &Frame) -> u64 {
         assert_eq!(response.command, CommandCode::SessionObject as u8 | 0x80);
         u64::from_be_bytes(response.data[..8].try_into().unwrap())
     }
 
-    #[cfg(feature = "session-objects")]
+    #[cfg(any(
+        feature = "firmware-secure-channel",
+        feature = "firmware-full",
+        feature = "test-firmware-session-objects"
+    ))]
     fn read_session_object(
         device: &mut Device,
         authorization: SessionAuthorization,
@@ -4872,7 +4895,11 @@ mod tests {
     }
 
     #[test]
-    #[cfg(feature = "session-objects")]
+    #[cfg(any(
+        feature = "firmware-secure-channel",
+        feature = "firmware-full",
+        feature = "test-firmware-session-objects"
+    ))]
     fn volatile_ecdh_objects_are_scoped_protected_and_right_truncated() {
         let mut device = Device::factory_default(DeviceConfig::default());
         let authorization = device.session_authorization(1).unwrap();
@@ -4965,7 +4992,11 @@ mod tests {
     }
 
     #[test]
-    #[cfg(feature = "session-objects")]
+    #[cfg(any(
+        feature = "firmware-secure-channel",
+        feature = "firmware-full",
+        feature = "test-firmware-session-objects"
+    ))]
     fn volatile_counter_kdf_and_cmac_verify_enforce_native_policy() {
         let mut device = Device::factory_default(DeviceConfig::default());
         let authorization = device.session_authorization(1).unwrap();
@@ -5069,16 +5100,17 @@ mod tests {
     }
 
     #[test]
-    fn compiled_persona_advertises_only_enabled_algorithms_and_commands() {
+    fn compiled_firmware_profile_advertises_only_enabled_algorithms_and_commands() {
         let mut device = Device::factory_default(DeviceConfig::default());
         let authorization = device.session_authorization(1).unwrap();
+        let firmware = FirmwareProfile::compiled();
         let info = device
             .execute_plain(&Frame::new(CommandCode::GetDeviceInfo as u8, Vec::new()).unwrap());
         let algorithms = &info.data[9..];
         for algorithm in [Algorithm::X25519, Algorithm::X448, Algorithm::Ed448] {
             assert_eq!(
                 algorithms.contains(&(algorithm as u8)),
-                cfg!(feature = "extended-curves")
+                firmware.extended_curves()
             );
         }
         for algorithm in [
@@ -5091,7 +5123,7 @@ mod tests {
         ] {
             assert_eq!(
                 algorithms.contains(&(algorithm as u8)),
-                cfg!(feature = "post-quantum")
+                firmware.post_quantum()
             );
         }
 
@@ -5107,20 +5139,11 @@ mod tests {
             .map(|pair| pair[0])
             .collect::<Vec<_>>();
         for (command, enabled) in [
-            (CommandCode::DeriveEcdhKdf, cfg!(feature = "prefixed-ecdh")),
-            (
-                CommandCode::SessionObject,
-                cfg!(feature = "session-objects"),
-            ),
-            (CommandCode::SignMlDsa, cfg!(feature = "post-quantum")),
-            (
-                CommandCode::EncapsulateMlKem,
-                cfg!(feature = "post-quantum"),
-            ),
-            (
-                CommandCode::DecapsulateMlKem,
-                cfg!(feature = "post-quantum"),
-            ),
+            (CommandCode::DeriveEcdhKdf, firmware.prefixed_ecdh()),
+            (CommandCode::SessionObject, firmware.session_objects()),
+            (CommandCode::SignMlDsa, firmware.post_quantum()),
+            (CommandCode::EncapsulateMlKem, firmware.post_quantum()),
+            (CommandCode::DecapsulateMlKem, firmware.post_quantum()),
         ] {
             assert_eq!(commands.contains(&(command as u8)), enabled);
         }
@@ -5135,14 +5158,11 @@ mod tests {
         );
         let capabilities = CapabilitySet::from_bytes(authkey_info.data[..8].try_into().unwrap());
         for (capability, enabled) in [
-            (Capability::DeriveEcdhKdf, cfg!(feature = "prefixed-ecdh")),
-            (
-                Capability::SessionObjects,
-                cfg!(feature = "session-objects"),
-            ),
-            (Capability::SignMlDsa, cfg!(feature = "post-quantum")),
-            (Capability::EncapsulateMlKem, cfg!(feature = "post-quantum")),
-            (Capability::DecapsulateMlKem, cfg!(feature = "post-quantum")),
+            (Capability::DeriveEcdhKdf, firmware.prefixed_ecdh()),
+            (Capability::SessionObjects, firmware.session_objects()),
+            (Capability::SignMlDsa, firmware.post_quantum()),
+            (Capability::EncapsulateMlKem, firmware.post_quantum()),
+            (Capability::DecapsulateMlKem, firmware.post_quantum()),
         ] {
             assert_eq!(capabilities.contains(capability), enabled);
         }
@@ -5938,7 +5958,7 @@ mod tests {
     }
 
     #[test]
-    #[cfg(feature = "post-quantum")]
+    #[cfg(feature = "firmware-full")]
     fn post_quantum_commands_sign_encapsulate_and_survive_persistence() {
         use software_key_core::post_quantum::{MlDsaParameterSet, verify_ml_dsa};
 
@@ -6058,7 +6078,7 @@ mod tests {
     }
 
     #[test]
-    #[cfg(feature = "post-quantum")]
+    #[cfg(feature = "firmware-full")]
     fn post_quantum_seed_imports_use_existing_asymmetric_object_commands() {
         use software_key_core::post_quantum::{MlDsaParameterSet, verify_ml_dsa};
 
@@ -6248,7 +6268,7 @@ mod tests {
     }
 
     #[test]
-    #[cfg(feature = "direct-rsa-wrap")]
+    #[cfg(feature = "firmware-full")]
     fn direct_pkcs1_variant_wraps_and_imports_symmetric_key_material() {
         const WRAP_ID: u16 = 200;
         const SOURCE_ID: u16 = 201;
@@ -6546,7 +6566,11 @@ mod tests {
     }
 
     #[test]
-    #[cfg(feature = "prefixed-ecdh")]
+    #[cfg(any(
+        feature = "firmware-secure-channel",
+        feature = "firmware-full",
+        feature = "test-firmware-prefixed-ecdh"
+    ))]
     fn protected_ecdh_kdf_can_authenticate_back_to_the_same_hsm() {
         let mut device = Device::factory_default(DeviceConfig::default());
         let admin = device.session_authorization(1).unwrap();

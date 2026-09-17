@@ -8,24 +8,24 @@ permissions:
   contents: read
 
 jobs:
-  personas:
+  firmware-profiles:
     runs-on: ubuntu-latest
     strategy:
       fail-fast: false
       matrix:
         include:
-          - name: stock
-            cargo_args: --no-default-features
-          - name: prefixed-ecdh
-            cargo_args: --no-default-features --features prefixed-ecdh
-          - name: session-objects
-            cargo_args: --no-default-features --features session-objects
-          - name: secure-channel-derivation
-            cargo_args: --no-default-features --features secure-channel-derivation
+          - name: yubihsm2
+            feature: firmware-yubihsm2
+          - name: test-prefixed-ecdh
+            feature: test-firmware-prefixed-ecdh
+          - name: test-session-objects
+            feature: test-firmware-session-objects
+          - name: secure-channel
+            feature: firmware-secure-channel
           - name: full
-            cargo_args: --features full
+            feature: firmware-full
 
-    name: persona (${{ matrix.name }})
+    name: firmware profile (${{ matrix.name }})
     steps:
       - name: Check out repository
         uses: actions/checkout@v7
@@ -38,8 +38,17 @@ jobs:
           git clone --depth 1 https://github.com/qpernil/display-backends.git ../display-backends
           git clone --depth 1 https://github.com/qpernil/raspberry-pi-i2c-target.git ../raspberry-pi-i2c-target
 
-      - name: Test compiled persona
-        run: cargo test --locked -p virtual-yubihsm-core ${{ matrix.cargo_args }}
+      - name: Test compiled firmware profile
+        run: >-
+          cargo test --locked -p virtual-yubihsm-core --no-default-features
+          --features "${{ matrix.feature }}"
+
+      - name: Check deployment frontends
+        if: ${{ !startsWith(matrix.name, 'test-') }}
+        run: |
+          cargo check --locked -p virtual-yubihsm --no-default-features --features "${{ matrix.feature }}"
+          cargo check --locked -p virtual-yubihsm-i2c --no-default-features --features "${{ matrix.feature }}"
+          cargo check --locked -p yubihsm-qualification --no-default-features --features "${{ matrix.feature }}"
 
   test:
     runs-on: ubuntu-latest

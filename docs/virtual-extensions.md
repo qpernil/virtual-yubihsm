@@ -16,32 +16,51 @@ YubiHSM implements the same values or command forms.
 | Protected volatile derivation objects | Capability `session-objects` (`0x39`) on the active Authentication Key | `SessionObject` (`0x0b`), one envelope containing generation, ECDH, composition, derivation, controlled reads, AES-CMAC verification, and deletion | `session-objects` on the authenticated session; persistent ECDH and AES sources additionally require their ordinary operation capability and domain visibility |
 | ML-DSA and ML-KEM | ML-DSA algorithms 59–61 and ML-KEM algorithms 62–64 | Existing asymmetric-key generation, seed import, public-key and object commands; `SignMlDsa` (`0x0d`), `EncapsulateMlKem` (`0x0e`), and `DecapsulateMlKem` (`0x0f`) | Existing generate/put/delete permissions plus `sign-ml-dsa` (`0x3a`), `encapsulate-ml-kem` (`0x3b`), or `decapsulate-ml-kem` (`0x3c`) on both the session and private-key object |
 
-## Compiled personas
+## Firmware profiles
 
-The default build enables the complete virtual extension set. A stock protocol
-persona is built with `--no-default-features`; it advertises only algorithms
-1–55 and rejects every extension command as an invalid command. The same flags
-are forwarded by the USB worker, I2C frontend, qualification binary, and core:
+The compiled firmware profile defines what the virtual device itself exposes
+over the YubiHSM protocol. It does not describe PKCS #11 mechanisms assembled
+by a client module or software session objects held outside the device.
+The complementary
+[firmware and provider capability model](https://github.com/qpernil/pkcs11rs/blob/master/docs/yubihsm-capability-layers.md)
+documents those separate layers.
 
-| Cargo feature | Enabled behavior |
-| --- | --- |
-| `extended-curves` | X25519, X448, and Ed448 algorithms 56–58 |
-| `prefixed-ecdh` | `DeriveEcdhKdf` |
-| `session-objects` | The protected volatile-object envelope |
-| `secure-channel-derivation` | `prefixed-ecdh` plus `session-objects` |
-| `post-quantum` | ML-DSA/ML-KEM algorithms, signing, encapsulation, and decapsulation |
-| `direct-rsa-wrap` | The reserved-zero direct RSAES-PKCS1-v1_5 wrap form |
-| `full` | Every extension above; this is the default |
+There are three deployment profiles:
 
-For example, `cargo build --no-default-features` produces the stock persona,
-while `cargo build --no-default-features --features secure-channel-derivation`
-produces a stock-algorithm device with only the two client-side secure-channel
-derivation extensions. Device information, command-audit option `0x03`,
-algorithm-toggle option `0x04`, and extension capability bits returned by
-`GetObjectInfo` are filtered to the compiled persona, including after a state
-file created by a different persona is restored. Clients can therefore select
-extensions from active Authentication Key and source-object capabilities
-without algorithm marker values or trial commands.
+| Cargo feature | Algorithms and commands | Purpose |
+| --- | --- | --- |
+| `firmware-yubihsm2` | Algorithms 1–55 and the YubiHSM 2-compatible command surface | Exercise physical-device compatibility without virtual extension commands |
+| `firmware-secure-channel` | Baseline plus `SessionObject` and `DeriveEcdhKdf` | Keep client-side SCP11 ephemeral keys and intermediate agreements inside the device |
+| `firmware-full` | Secure-channel profile plus X25519, X448, Ed448, ML-DSA, ML-KEM, and direct RSA wrapping | Fully featured virtual deployments and interoperability experiments |
+
+`firmware-full` is the default. Build either restricted profile explicitly:
+
+```sh
+cargo build --no-default-features --features firmware-yubihsm2
+cargo build --no-default-features --features firmware-secure-channel
+```
+
+The USB worker, I2C frontend, qualification binary, core, and embedded
+connector all forward these same profile names. A connector firmware feature
+also enables its embedded persistent runtime.
+
+Two core and connector features are reserved for tests:
+`test-firmware-prefixed-ecdh` and `test-firmware-session-objects`. Each exposes
+only one secure-channel extension so CI can verify the client's strongest-to-
+weakest path selection. They are not deployment profiles.
+
+This configurability has three purposes. The baseline catches accidental use
+of virtual commands when testing physical compatibility. The secure-channel
+profile provides the smallest extension that improves protection of client
+credentials. The full profile keeps post-quantum and other experimental
+algorithms available without implying that physical firmware implements them.
+
+Device information, command-audit option `0x03`, algorithm-toggle option
+`0x04`, and extension capability bits returned by `GetObjectInfo` are filtered
+to the compiled firmware profile, including after a state file created by a
+different profile is restored. Clients select extensions from active
+Authentication Key and source-object capabilities without algorithm marker
+values or trial commands.
 
 The extension commands form one contiguous block in the unused request-code
 gap `0x0b`–`0x0f`. Their response codes are the normal request code with bit 7

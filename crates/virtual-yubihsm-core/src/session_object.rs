@@ -129,7 +129,14 @@ impl SessionObjects {
         self.0.remove(&handle)
     }
 
-    #[cfg(all(test, feature = "session-objects"))]
+    #[cfg(all(
+        test,
+        any(
+            feature = "firmware-secure-channel",
+            feature = "firmware-full",
+            feature = "test-firmware-session-objects"
+        )
+    ))]
     pub(crate) fn len(&self) -> usize {
         self.0.len()
     }

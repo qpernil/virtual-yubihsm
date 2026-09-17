@@ -20,19 +20,10 @@ yubihsm-auth-client = { path = "../../../pkcs11rs/crates/yubihsm-auth-client", o
 zeroize = "1.9.0"
 
 [features]
-default = ["full"]
-full = [
-    "direct-rsa-wrap",
-    "extended-curves",
-    "post-quantum",
-    "secure-channel-derivation",
-]
-direct-rsa-wrap = ["virtual-yubihsm-core/direct-rsa-wrap"]
-extended-curves = ["virtual-yubihsm-core/extended-curves"]
-post-quantum = ["virtual-yubihsm-core/post-quantum"]
-prefixed-ecdh = ["virtual-yubihsm-core/prefixed-ecdh"]
-session-objects = ["virtual-yubihsm-core/session-objects"]
-secure-channel-derivation = ["prefixed-ecdh", "session-objects"]
+default = ["firmware-full"]
+firmware-yubihsm2 = ["virtual-yubihsm-core/firmware-yubihsm2"]
+firmware-secure-channel = ["virtual-yubihsm-core/firmware-secure-channel"]
+firmware-full = ["virtual-yubihsm-core/firmware-full"]
 platform-credential = ["dep:platform-credential"]
 native-hsmauth = ["dep:pcsc", "dep:yubihsm-auth-client"]
 
