@@ -65,11 +65,24 @@ pub enum Capability {
     /// This is a virtual-device extension and is intentionally distinct from
     /// `DeriveEcdh`, which returns the raw ECDH result.
     DeriveEcdhKdf = 0x38,
-    /// Create, use, read, and destroy volatile protected objects.
-    DeriveSessionKey = 0x39,
+    /// Create, use, read, verify with, and destroy volatile protected objects.
+    SessionObjects = 0x39,
     SignMlDsa = 0x3a,
     EncapsulateMlKem = 0x3b,
     DecapsulateMlKem = 0x3c,
+}
+
+impl Capability {
+    pub const fn supported_by_build(self) -> bool {
+        match self {
+            Self::DeriveEcdhKdf => cfg!(feature = "prefixed-ecdh"),
+            Self::SessionObjects => cfg!(feature = "session-objects"),
+            Self::SignMlDsa | Self::EncapsulateMlKem | Self::DecapsulateMlKem => {
+                cfg!(feature = "post-quantum")
+            }
+            _ => true,
+        }
+    }
 }
 
 /// The protocol's big-endian eight-byte capability bitmap.
@@ -116,6 +129,25 @@ impl CapabilitySet {
     pub fn insert(&mut self, capability: Capability) {
         let bit = capability as usize;
         self.0[7 - bit / 8] |= 1 << (bit % 8);
+    }
+
+    pub fn remove(&mut self, capability: Capability) {
+        let bit = capability as usize;
+        self.0[7 - bit / 8] &= !(1 << (bit % 8));
+    }
+
+    pub fn retain_build_supported(&mut self) {
+        for capability in [
+            Capability::DeriveEcdhKdf,
+            Capability::SessionObjects,
+            Capability::SignMlDsa,
+            Capability::EncapsulateMlKem,
+            Capability::DecapsulateMlKem,
+        ] {
+            if !capability.supported_by_build() {
+                self.remove(capability);
+            }
+        }
     }
 
     pub fn intersection(self, other: Self) -> Self {

@@ -19,8 +19,9 @@ This is deliberately a generic ECDH derivation mechanism rather than an SCP11
 mechanism. SCP11 asymmetric authentication is its first intended consumer.
 
 This command is the middle placement tier for a client that supports native
-volatile session objects. When algorithm 61 and `derive-session-key` permit the
-complete protected graph, the client keeps its ephemeral private key and both
+volatile session objects. When the `SessionObject` envelope is compiled in and
+the active Authentication Key permits `session-objects`, the complete
+protected graph keeps its ephemeral private key and both
 agreements in device objects and selects that graph first. `DeriveEcdhKdf` is
 selected when the client must supply the ephemeral agreement as literal prefix
 bytes. Ordinary `DeriveEcdh`, followed by composition and KDF in the client
@@ -106,9 +107,9 @@ The key-capability mapping is:
 The extension uses:
 
 ```text
-command code       0x78  DeriveEcdhKdf
+command code       0x0c  DeriveEcdhKdf
 capability bit     0x38  derive-ecdh-kdf
-algorithm advert   57    ECDH KDF extension present
+discovery          capability 0x38 on active Authentication Key and source key
 ```
 
 The authenticated request is big-endian and has this format:
@@ -249,7 +250,7 @@ messaging itself behind the HSM boundary.
 
 The [SCP03/SCP11 key-provider plan](https://github.com/qpernil/pkcs11rs/blob/master/docs/scp-key-provider/README.md)
 uses one protocol implementation with software or native key operations.
-The `derive-session-key` capability implements generic protected, chainable
+The `session-objects` capability implements generic protected, chainable
 device outputs alongside this one-shot prefixed mechanism. The native
 command family covers volatile P-256 generation and ECDH, key/data
 concatenation, bit extraction, SHA-256, SP 800-108 counter KDF, AES-CMAC

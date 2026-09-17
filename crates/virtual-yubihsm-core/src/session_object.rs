@@ -129,7 +129,7 @@ impl SessionObjects {
         self.0.remove(&handle)
     }
 
-    #[cfg(test)]
+    #[cfg(all(test, feature = "session-objects"))]
     pub(crate) fn len(&self) -> usize {
         self.0.len()
     }

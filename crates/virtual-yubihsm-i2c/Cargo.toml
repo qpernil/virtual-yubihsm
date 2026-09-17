@@ -7,9 +7,24 @@ description = "Unprivileged I2C target frontend for virtual-yubihsm-core"
 license = "MIT OR Apache-2.0"
 publish = false
 
+[features]
+default = ["full"]
+full = [
+    "direct-rsa-wrap",
+    "extended-curves",
+    "post-quantum",
+    "secure-channel-derivation",
+]
+direct-rsa-wrap = ["virtual-yubihsm-core/direct-rsa-wrap"]
+extended-curves = ["virtual-yubihsm-core/extended-curves"]
+post-quantum = ["virtual-yubihsm-core/post-quantum"]
+prefixed-ecdh = ["virtual-yubihsm-core/prefixed-ecdh"]
+session-objects = ["virtual-yubihsm-core/session-objects"]
+secure-channel-derivation = ["prefixed-ecdh", "session-objects"]
+
 [dependencies]
 libc = "0.2.189"
-virtual-yubihsm-core = { path = "../virtual-yubihsm-core", features = ["persistent-runtime"] }
+virtual-yubihsm-core = { path = "../virtual-yubihsm-core", default-features = false, features = ["persistent-runtime"] }
 
 [[bin]]
 name = "virtual-yubihsm-i2c"

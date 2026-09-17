@@ -14,13 +14,25 @@ p256 = { version = "0.14.0", features = ["ecdh"] }
 platform-credential = { path = "../../../pkcs11rs/crates/platform-credential", optional = true }
 pcsc = { version = "2.9.0", optional = true }
 software-key-core = { workspace = true }
-virtual-yubihsm-core = { path = "../virtual-yubihsm-core" }
+virtual-yubihsm-core = { path = "../virtual-yubihsm-core", default-features = false }
 x509-cert = { version = "0.3.0", default-features = false, features = ["std"] }
 yubihsm-auth-client = { path = "../../../pkcs11rs/crates/yubihsm-auth-client", optional = true }
 zeroize = "1.9.0"
 
 [features]
-default = []
+default = ["full"]
+full = [
+    "direct-rsa-wrap",
+    "extended-curves",
+    "post-quantum",
+    "secure-channel-derivation",
+]
+direct-rsa-wrap = ["virtual-yubihsm-core/direct-rsa-wrap"]
+extended-curves = ["virtual-yubihsm-core/extended-curves"]
+post-quantum = ["virtual-yubihsm-core/post-quantum"]
+prefixed-ecdh = ["virtual-yubihsm-core/prefixed-ecdh"]
+session-objects = ["virtual-yubihsm-core/session-objects"]
+secure-channel-derivation = ["prefixed-ecdh", "session-objects"]
 platform-credential = ["dep:platform-credential"]
 native-hsmauth = ["dep:pcsc", "dep:yubihsm-auth-client"]
 
