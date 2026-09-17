@@ -10,6 +10,16 @@ pub enum CommandCode {
     GetDeviceInfo = 0x06,
     ResetDevice = 0x08,
     GetDevicePublicKey = 0x0a,
+    /// Virtual-device namespace for protected volatile objects.
+    SessionObject = 0x0b,
+    /// Virtual-device extension for atomic prefixed ECDH key derivation.
+    DeriveEcdhKdf = 0x0c,
+    /// Virtual ML-DSA signing.
+    SignMlDsa = 0x0d,
+    /// Virtual ML-KEM encapsulation.
+    EncapsulateMlKem = 0x0e,
+    /// Virtual ML-KEM decapsulation.
+    DecapsulateMlKem = 0x0f,
     CloseSession = 0x40,
     GetStorageInfo = 0x41,
     PutOpaque = 0x42,
@@ -66,23 +76,22 @@ pub enum CommandCode {
     PutRsaWrappedKey = 0x75,
     ExportRsaWrapped = 0x76,
     ImportRsaWrapped = 0x77,
-    /// Virtual-device extension for atomic prefixed ECDH key derivation.
-    DeriveEcdhKdf = 0x78,
-    /// Virtual-device extension for protected volatile-object derivation.
-    DeriveSessionObject = 0x79,
-    /// Virtual-device extension for policy-controlled volatile-object reads.
-    ReadSessionObject = 0x7a,
-    /// Virtual-device extension for volatile-object verification.
-    VerifySessionObject = 0x7b,
-    /// Virtual-device extension for explicit volatile-object destruction.
-    DeleteSessionObject = 0x7c,
-    /// Virtual ML-DSA signing (response 0xfd).
-    SignMlDsa = 0x7d,
-    /// Virtual ML-KEM encapsulation and decapsulation (response 0xfe).
-    MlKem = 0x7e,
 }
 
 impl CommandCode {
+    /// Whether this build exposes the command as part of its compiled persona.
+    pub const fn supported_by_build(self) -> bool {
+        use CommandCode::*;
+        match self {
+            DeriveEcdhKdf => cfg!(feature = "prefixed-ecdh"),
+            SessionObject => cfg!(feature = "session-objects"),
+            SignMlDsa | EncapsulateMlKem | DecapsulateMlKem => {
+                cfg!(feature = "post-quantum")
+            }
+            _ => true,
+        }
+    }
+
     pub fn from_byte(value: u8) -> Option<Self> {
         use CommandCode::*;
         Some(match value {
@@ -93,6 +102,11 @@ impl CommandCode {
             0x06 => GetDeviceInfo,
             0x08 => ResetDevice,
             0x0a => GetDevicePublicKey,
+            0x0b => SessionObject,
+            0x0c => DeriveEcdhKdf,
+            0x0d => SignMlDsa,
+            0x0e => EncapsulateMlKem,
+            0x0f => DecapsulateMlKem,
             0x40 => CloseSession,
             0x41 => GetStorageInfo,
             0x42 => PutOpaque,
@@ -149,13 +163,6 @@ impl CommandCode {
             0x75 => PutRsaWrappedKey,
             0x76 => ExportRsaWrapped,
             0x77 => ImportRsaWrapped,
-            0x78 => DeriveEcdhKdf,
-            0x79 => DeriveSessionObject,
-            0x7a => ReadSessionObject,
-            0x7b => VerifySessionObject,
-            0x7c => DeleteSessionObject,
-            0x7d => SignMlDsa,
-            0x7e => MlKem,
             _ => return None,
         })
     }
@@ -184,9 +191,7 @@ impl CommandCode {
             SignEcdsa => Some(Capability::SignEcdsa),
             DeriveEcdh => Some(Capability::DeriveEcdh),
             DeriveEcdhKdf => Some(Capability::DeriveEcdhKdf),
-            DeriveSessionObject | ReadSessionObject | VerifySessionObject | DeleteSessionObject => {
-                Some(Capability::DeriveSessionKey)
-            }
+            SessionObject => Some(Capability::SessionObjects),
             DecryptOaep => Some(Capability::DecryptOaep),
             GenerateHmacKey => Some(Capability::GenerateHmacKey),
             GenerateWrapKey => Some(Capability::GenerateWrapKey),
@@ -204,6 +209,8 @@ impl CommandCode {
             UnwrapData => Some(Capability::UnwrapData),
             SignEddsa => Some(Capability::SignEddsa),
             SignMlDsa => Some(Capability::SignMlDsa),
+            EncapsulateMlKem => Some(Capability::EncapsulateMlKem),
+            DecapsulateMlKem => Some(Capability::DecapsulateMlKem),
             ChangeAuthenticationKey => Some(Capability::ChangeAuthenticationKey),
             PutSymmetricKey => Some(Capability::PutSymmetricKey),
             GenerateSymmetricKey => Some(Capability::GenerateSymmetricKey),
@@ -213,7 +220,7 @@ impl CommandCode {
             EncryptCbc => Some(Capability::EncryptCbc),
             PutPublicWrapKey => Some(Capability::PutPublicWrapKey),
             ResetDevice => Some(Capability::ResetDevice),
-            MlKem | RewrapOtpAead | DeleteObject | Echo | CreateSession | AuthenticateSession
+            RewrapOtpAead | DeleteObject | Echo | CreateSession | AuthenticateSession
             | SessionMessage | GetDeviceInfo | GetDevicePublicKey | CloseSession
             | GetStorageInfo | ListObjects | GetObjectInfo | GetPublicKey | BlinkDevice => None,
         }

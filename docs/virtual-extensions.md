@@ -9,12 +9,43 @@ YubiHSM implements the same values or command forms.
 | --- | --- | --- | --- |
 | Authentication Key public projection | Support is learned by attempting the operation | `GetPublicKey` with object type `AuthenticationKey` | The Authentication Key must be visible in the session domain |
 | X25519 | algorithm 56 | Existing asymmetric-key generate/import/public-key/`DeriveEcdh` commands | Existing generate, put, get-public-key and ECDH capabilities |
-| Atomic prefixed ECDH with X9.63 KDF | `DeriveEcdhKdf` (`0x78`) and capability `derive-ecdh-kdf` (`0x38`) | The extension command described in [prefixed ECDH derivation](prefixed-ecdh-derive.md) | `derive-ecdh-kdf` on both the session and source key, plus normal domain visibility |
+| Atomic prefixed ECDH with X9.63 KDF | Capability `derive-ecdh-kdf` (`0x38`) on the active Authentication Key and source key | `DeriveEcdhKdf` (`0x0c`), described in [prefixed ECDH derivation](prefixed-ecdh-derive.md) | `derive-ecdh-kdf` on both the session and source key, plus normal domain visibility |
 | Direct RSAES-PKCS1-v1_5 secret-key wrapping | Presence of RSA and any actual virtual key algorithm | `GetRsaWrappedKey` and `PutRsaWrappedKey` with their normally nonzero hybrid-wrap selector fields set to zero | Existing `export-wrapped`/`import-wrapped` permissions; the source key also needs `exportable-under-wrap`, and delegated-capability/domain rules remain in force |
 | X448 | algorithm 57 | Existing asymmetric-key generate/import/public-key/`DeriveEcdh` commands | Existing generate, put, get-public-key and ECDH capabilities |
 | Ed448 | algorithm 58 | Existing asymmetric-key generate/import/public-key/`SignEddsa` commands | Existing generate, put, get-public-key and EdDSA-sign capabilities |
-| Protected volatile derivation objects | Commands `DeriveSessionObject` (`0x79`), `ReadSessionObject` (`0x7a`), `VerifySessionObject` (`0x7b`), and `DeleteSessionObject` (`0x7c`), capability `derive-session-key` (`0x39`) | Session-scoped P-256 generation/ECDH, generic-secret or AES composition and derivation, controlled reads, AES-CMAC verification, and deletion | `derive-session-key` on the authenticated session; persistent ECDH and AES sources additionally require their ordinary operation capability and domain visibility |
-| ML-DSA and ML-KEM | ML-DSA algorithms 59–61 and ML-KEM algorithms 62–64 | Existing asymmetric-key generation, seed import, public-key and object commands; `SignMlDsa` (`0x7d`) and `MlKem` (`0x7e`) | Existing generate/put/delete permissions plus `sign-ml-dsa` (`0x3a`), `encapsulate-ml-kem` (`0x3b`), or `decapsulate-ml-kem` (`0x3c`) on both the session and private-key object |
+| Protected volatile derivation objects | Capability `session-objects` (`0x39`) on the active Authentication Key | `SessionObject` (`0x0b`), one envelope containing generation, ECDH, composition, derivation, controlled reads, AES-CMAC verification, and deletion | `session-objects` on the authenticated session; persistent ECDH and AES sources additionally require their ordinary operation capability and domain visibility |
+| ML-DSA and ML-KEM | ML-DSA algorithms 59–61 and ML-KEM algorithms 62–64 | Existing asymmetric-key generation, seed import, public-key and object commands; `SignMlDsa` (`0x0d`), `EncapsulateMlKem` (`0x0e`), and `DecapsulateMlKem` (`0x0f`) | Existing generate/put/delete permissions plus `sign-ml-dsa` (`0x3a`), `encapsulate-ml-kem` (`0x3b`), or `decapsulate-ml-kem` (`0x3c`) on both the session and private-key object |
+
+## Compiled personas
+
+The default build enables the complete virtual extension set. A stock protocol
+persona is built with `--no-default-features`; it advertises only algorithms
+1–55 and rejects every extension command as an invalid command. The same flags
+are forwarded by the USB worker, I2C frontend, qualification binary, and core:
+
+| Cargo feature | Enabled behavior |
+| --- | --- |
+| `extended-curves` | X25519, X448, and Ed448 algorithms 56–58 |
+| `prefixed-ecdh` | `DeriveEcdhKdf` |
+| `session-objects` | The protected volatile-object envelope |
+| `secure-channel-derivation` | `prefixed-ecdh` plus `session-objects` |
+| `post-quantum` | ML-DSA/ML-KEM algorithms, signing, encapsulation, and decapsulation |
+| `direct-rsa-wrap` | The reserved-zero direct RSAES-PKCS1-v1_5 wrap form |
+| `full` | Every extension above; this is the default |
+
+For example, `cargo build --no-default-features` produces the stock persona,
+while `cargo build --no-default-features --features secure-channel-derivation`
+produces a stock-algorithm device with only the two client-side secure-channel
+derivation extensions. Device information, command-audit option `0x03`,
+algorithm-toggle option `0x04`, and extension capability bits returned by
+`GetObjectInfo` are filtered to the compiled persona, including after a state
+file created by a different persona is restored. Clients can therefore select
+extensions from active Authentication Key and source-object capabilities
+without algorithm marker values or trial commands.
+
+The extension commands form one contiguous block in the unused request-code
+gap `0x0b`–`0x0f`. Their response codes are the normal request code with bit 7
+set. No legacy aliases or alternate dispatch command exist.
 
 ## Post-quantum commands
 
@@ -31,7 +62,7 @@ Private-key imports carry the 32-byte ML-DSA seed or 64-byte ML-KEM seed.
 encoding. Object metadata records the seed length while private material stays
 inside the HSM object and secure session.
 
-`SignMlDsa` (`0x7d`) has this request body:
+`SignMlDsa` (`0x0d`) has this request body:
 
 ```text
 key id          u16, big endian
@@ -45,34 +76,36 @@ Its response is the raw FIPS 204 signature. The context is limited to 255
 bytes by the one-byte length and FIPS 204. ML-DSA-87 signatures are 4,627 bytes,
 so a secure response crosses the former 3,136-byte transport ceiling.
 
-`MlKem` (`0x7e`) starts with a big-endian key ID and an operation byte. Operation
-0 is encapsulation and permits no trailing request data; its response is the
-parameter-set ciphertext followed by the 32-byte shared secret. Operation 1 is
-decapsulation and requires exactly one parameter-set ciphertext; its response
-is the 32-byte shared secret. Both results travel inside the authenticated and
-encrypted YubiHSM session.
-
-The response codes are `0xfd` and `0xfe`. Command `0x7f` remains unused because
-setting its response bit would collide with the protocol error response
-`0xff`.
+`EncapsulateMlKem` (`0x0e`) takes exactly the big-endian key ID. Its response is
+the parameter-set ciphertext followed by the 32-byte shared secret.
+`DecapsulateMlKem` (`0x0f`) takes the big-endian key ID followed immediately by
+exactly one parameter-set ciphertext and returns the 32-byte shared secret.
+Both results travel inside the authenticated and encrypted YubiHSM session.
 
 ## Protected volatile derivation objects
 
-These commands let a client run a chainable derivation graph while keeping
+The `SessionObject` command lets a client run a chainable derivation graph while keeping
 long-term credentials and raw agreements behind the device boundary. Final
 working keys may be read once for local message encryption and MAC.
 
-`DeriveSessionObject` starts with an operation byte and output flags. Bit 0
-permits reading, bit 1 permits use as a derivation source, and bit 2 permits
-AES-CMAC verification. Output kinds are generic secret (1) and AES (2); P-256
-private objects are produced only by the generation operation. Sources are a
-volatile 64-bit handle (tag 0), a persistent asymmetric-object ID (tag 1), or a
-persistent symmetric-object ID (tag 2). The operations are P-256 generation
-(1), ECDH (2), concatenate base and key (3), concatenate base and data (4),
-extract bits (5), SHA-256 (6), and SP 800-108 counter KDF using AES-CMAC (7).
-Generated or derived outputs are inserted atomically.
+Every request begins with a nested operation byte. Operations that have an
+ordinary object equivalent reuse its command code: `GenerateAsymmetricKey`
+(`0x46`) generates a P-256 private object, `DeriveEcdh` (`0x57`) creates an
+agreement object, and `DeleteObject` (`0x58`) deletes a handle. Session-only
+operations use `0x01` read, `0x02` verify AES-CMAC, `0x03` concatenate key,
+`0x04` concatenate data, `0x05` extract bits, `0x06` SHA-256, and `0x07`
+SP 800-108 counter KDF using AES-CMAC. These values are nested operations,
+not independently advertised top-level commands.
 
-Every command requires `derive-session-key` in the secure session. A persistent
+Creation operations carry output flags after the nested operation. Bit 0
+permits reading, bit 1 permits use as a derivation source, and bit 2 permits
+AES-CMAC verification. Derived output then specifies kind (generic secret 1 or
+AES 2) and a big-endian `u16` length. P-256 generation instead specifies
+algorithm 12 after the flags. Sources are a volatile 64-bit handle (tag 0), a
+persistent asymmetric-object ID (tag 1), or a persistent symmetric-object ID
+(tag 2). Generated or derived outputs are inserted atomically.
+
+Every envelope request requires `session-objects` in the secure session. A persistent
 asymmetric ECDH source also requires `derive-ecdh` on the
 session and object, plus normal domain visibility. A persistent symmetric
 counter-KDF source similarly requires `encrypt-ecb`; a volatile source requires

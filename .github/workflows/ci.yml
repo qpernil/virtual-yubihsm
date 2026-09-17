@@ -8,6 +8,39 @@ permissions:
   contents: read
 
 jobs:
+  personas:
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - name: stock
+            cargo_args: --no-default-features
+          - name: prefixed-ecdh
+            cargo_args: --no-default-features --features prefixed-ecdh
+          - name: session-objects
+            cargo_args: --no-default-features --features session-objects
+          - name: secure-channel-derivation
+            cargo_args: --no-default-features --features secure-channel-derivation
+          - name: full
+            cargo_args: --features full
+
+    name: persona (${{ matrix.name }})
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v7
+
+      - name: Check out first-party dependencies
+        run: |
+          git clone --depth 1 https://github.com/qpernil/pkcs11rs.git ../pkcs11rs
+          git clone --depth 1 https://github.com/qpernil/software-key-core.git ../software-key-core
+          git clone --depth 1 https://github.com/qpernil/usb-gadget-supervisor.git ../usb-gadget-supervisor
+          git clone --depth 1 https://github.com/qpernil/display-backends.git ../display-backends
+          git clone --depth 1 https://github.com/qpernil/raspberry-pi-i2c-target.git ../raspberry-pi-i2c-target
+
+      - name: Test compiled persona
+        run: cargo test --locked -p virtual-yubihsm-core ${{ matrix.cargo_args }}
+
   test:
     runs-on: ubuntu-latest
 

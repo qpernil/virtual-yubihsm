@@ -61,6 +61,10 @@ device, using this same persistent runtime as the USB and I2C frontends.
 See the [built-in connector integration](docs/pkcs11rs-connector-integration.md).
 The deliberate differences from physical firmware are catalogued in
 [virtual extensions](docs/virtual-extensions.md).
+Those extensions are compile-time features. The default `full` persona enables
+all of them; `--no-default-features` builds a stock YubiHSM 2 protocol persona,
+and individual curve, post-quantum, RSA-wrap, or secure-channel derivation
+features can be added independently.
 The [object-info length contract](docs/object-info-lengths.md) records the
 compatibility rules for reported object sizes.
 The virtual `derive-ecdh-kdf` command maps to
@@ -115,8 +119,8 @@ sources. Counter KDF operates directly on each AES handle, including physical
 YubiHSM keys, without exporting or splitting long-term values. The prepared-session
 pair resolver uses the short label suffixes to distinguish roles.
 
-Capability `derive-session-key` provides bounded volatile P-256,
-generic-secret, and AES objects. The command family supports P-256
+Capability `session-objects` provides bounded volatile P-256,
+generic-secret, and AES objects. A single `SessionObject` envelope supports P-256
 generation and ECDH, key/data concatenation, bit extraction, SHA-256, SP
 800-108 counter KDF, AES-CMAC verification, explicit reads, and deletion.
 Long-term credentials remain ordinary persistent P-256 or AES objects; raw ECDH
@@ -137,9 +141,9 @@ the target channel owns their lifetime and zeroizes them on close or failure.
 The pkcs11rs public PKCS #11 tests exercise the native operation graph,
 including cross-session visibility inside one slot, policy denial,
 secure-session recreation, stale-handle invalidation, cleanup, and
-readable-output fallback for software-only operations. Complete SCP03/SCP11
-channel qualification with a virtual YubiHSM as the derivation provider remains
-the next integration step. A virtual device exercises a real protocol and
+readable-output fallback for software-only operations. Cross-HSM authentication
+tests cover session-object, prefixed-ECDH, basic-ECDH, and rejected-policy
+selection. A virtual device exercises a real protocol and
 authorization boundary without claiming physical tamper resistance. See
 [protected-key composition](docs/prefixed-ecdh-derive.md#native-protected-key-derivation).
 
