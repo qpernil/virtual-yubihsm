@@ -9,7 +9,7 @@ The binary supports both `--inherited-device` for supervisor profiles and
 `--device` for direct device-path opening.
 
 The binary was built from clean `virtual-yubihsm` commit
-`e0028a2efd6f3cb227aabb9997717c837aedad32` on `ubuntu4`, running Ubuntu
+`0311405078ed84237568c1cdbb91988aaad920ee` on `ubuntu4`, running Ubuntu
 26.04 LTS on ARM64, with Rust and Cargo 1.98.1 and glibc 2.43. Its path
 dependencies were:
 
@@ -26,9 +26,14 @@ Verify it before installation:
 (cd prebuilt/aarch64 && sha256sum -c SHA256SUMS)
 ```
 
-GitHub `main` remains the source of truth. A capable ARM64 build machine should
-normally use:
+GitHub `main` remains the source of truth. Build this artifact on a capable
+ARM64 machine with:
 
 ```sh
 cargo build --release --locked -p virtual-yubihsm-i2c
 ```
+
+Do not run Rust builds on `raspberrypi-1` or `raspberrypi-2`; they do not have
+enough RAM for the Rust dependency graph. Build on `ubuntu4`, update this binary
+and its checksum in the canonical Mac repository, commit and push them, and let
+the Raspberry Pis receive the prebuilt through Git.
