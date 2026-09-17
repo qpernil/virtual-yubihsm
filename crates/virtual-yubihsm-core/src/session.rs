@@ -269,8 +269,8 @@ mod tests {
 
     #[test]
     fn secure_response_limit_accounts_for_frame_padding_session_id_and_mac() {
-        assert!(secure_response_data_fits(3_116));
-        assert!(!secure_response_data_fits(3_117));
+        assert!(secure_response_data_fits(8_172));
+        assert!(!secure_response_data_fits(8_173));
         assert!(!secure_response_data_fits(usize::MAX));
     }
 }

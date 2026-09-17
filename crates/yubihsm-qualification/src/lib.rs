@@ -1334,7 +1334,22 @@ fn run_extensions(
         true => passed.push("prefixed ECDH KDF"),
         false => unsupported.push("prefixed ECDH KDF"),
     }
-    if algorithms.contains(&(Algorithm::RsaPkcs1Wrap as u8)) {
+    if algorithms.iter().any(|algorithm| {
+        matches!(
+            Algorithm::from_byte(*algorithm),
+            Some(
+                Algorithm::X25519
+                    | Algorithm::X448
+                    | Algorithm::Ed448
+                    | Algorithm::MlDsa44
+                    | Algorithm::MlDsa65
+                    | Algorithm::MlDsa87
+                    | Algorithm::MlKem512
+                    | Algorithm::MlKem768
+                    | Algorithm::MlKem1024
+            )
+        )
+    }) {
         run_case(passed, "direct PKCS #1 secret-key wrapping", || {
             rsa_pkcs1_wrapping_scenario(transport, credentials)
         })?;

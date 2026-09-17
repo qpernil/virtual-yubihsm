@@ -76,6 +76,10 @@ pub enum CommandCode {
     VerifySessionObject = 0x7b,
     /// Virtual-device extension for explicit volatile-object destruction.
     DeleteSessionObject = 0x7c,
+    /// Virtual ML-DSA signing (response 0xfd).
+    SignMlDsa = 0x7d,
+    /// Virtual ML-KEM encapsulation and decapsulation (response 0xfe).
+    MlKem = 0x7e,
 }
 
 impl CommandCode {
@@ -150,6 +154,8 @@ impl CommandCode {
             0x7a => ReadSessionObject,
             0x7b => VerifySessionObject,
             0x7c => DeleteSessionObject,
+            0x7d => SignMlDsa,
+            0x7e => MlKem,
             _ => return None,
         })
     }
@@ -197,6 +203,7 @@ impl CommandCode {
             WrapData => Some(Capability::WrapData),
             UnwrapData => Some(Capability::UnwrapData),
             SignEddsa => Some(Capability::SignEddsa),
+            SignMlDsa => Some(Capability::SignMlDsa),
             ChangeAuthenticationKey => Some(Capability::ChangeAuthenticationKey),
             PutSymmetricKey => Some(Capability::PutSymmetricKey),
             GenerateSymmetricKey => Some(Capability::GenerateSymmetricKey),
@@ -206,7 +213,7 @@ impl CommandCode {
             EncryptCbc => Some(Capability::EncryptCbc),
             PutPublicWrapKey => Some(Capability::PutPublicWrapKey),
             ResetDevice => Some(Capability::ResetDevice),
-            RewrapOtpAead | DeleteObject | Echo | CreateSession | AuthenticateSession
+            MlKem | RewrapOtpAead | DeleteObject | Echo | CreateSession | AuthenticateSession
             | SessionMessage | GetDeviceInfo | GetDevicePublicKey | CloseSession
             | GetStorageInfo | ListObjects | GetObjectInfo | GetPublicKey | BlinkDevice => None,
         }

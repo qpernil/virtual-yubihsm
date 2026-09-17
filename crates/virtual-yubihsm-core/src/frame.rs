@@ -1,7 +1,8 @@
 use crate::{DeviceError, Result};
 
 pub const HEADER_LENGTH: usize = 3;
-pub const MAX_DATA_LENGTH: usize = 3_133;
+pub const MAX_FRAME_LENGTH: usize = 8192;
+pub const MAX_DATA_LENGTH: usize = MAX_FRAME_LENGTH - HEADER_LENGTH;
 pub const RESPONSE_BIT: u8 = 0x80;
 pub const ERROR_COMMAND: u8 = 0x7f;
 
@@ -69,5 +70,20 @@ mod tests {
     fn rejects_truncated_and_trailing_data() {
         assert_eq!(Frame::parse(&[1, 0]), Err(DeviceError::WrongLength));
         assert_eq!(Frame::parse(&[1, 0, 0, 2]), Err(DeviceError::WrongLength));
+    }
+
+    #[test]
+    fn accepts_the_implementation_frame_limit_and_rejects_larger_frames() {
+        let maximum = Frame::new(1, vec![0; MAX_DATA_LENGTH]).unwrap().encode();
+        assert_eq!(maximum.len(), HEADER_LENGTH + MAX_DATA_LENGTH);
+        assert!(Frame::parse(&maximum).is_ok());
+        assert_eq!(
+            Frame::new(1, vec![0; MAX_DATA_LENGTH + 1]),
+            Err(DeviceError::WrongLength)
+        );
+
+        let mut oversized = vec![1, 0x1f, 0xfe];
+        oversized.resize(HEADER_LENGTH + MAX_DATA_LENGTH + 1, 0);
+        assert_eq!(Frame::parse(&oversized), Err(DeviceError::WrongLength));
     }
 }

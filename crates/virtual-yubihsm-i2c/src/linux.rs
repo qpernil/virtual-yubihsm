@@ -11,10 +11,9 @@ use std::{
     time::Duration,
 };
 use virtual_yubihsm_core::{
-    DeviceConfig, PersistenceMode, PersistentDevice, PersistentDeviceHandle,
+    DeviceConfig, MAX_FRAME_LENGTH, PersistenceMode, PersistentDevice, PersistentDeviceHandle,
 };
 
-const MAX_TRANSFER: usize = 8_192;
 const O_NONBLOCK: i32 = 0x800;
 const BSC_TARGET_IOC_GET_INFO: libc::c_ulong = 0x8020_4200;
 const PERSISTENCE_BATCH_DELAY: Duration = Duration::from_millis(500);
@@ -91,7 +90,7 @@ fn open_target(options: &Options) -> io::Result<File> {
 }
 
 fn serve(target: &mut File, hsm: &PersistentDeviceHandle) -> io::Result<()> {
-    let mut request = vec![0_u8; MAX_TRANSFER];
+    let mut request = vec![0_u8; MAX_FRAME_LENGTH];
     while !STOP_REQUESTED.load(Ordering::Relaxed) {
         let length = match target.read(&mut request) {
             Ok(0) => continue,
@@ -194,10 +193,20 @@ fn validate_target(target: &File) -> io::Result<()> {
             "query I2C target ABI",
         ));
     }
+    validate_target_info(&info)
+}
+
+fn validate_target_info(info: &[u32; 8]) -> io::Result<()> {
     if info[0] != 3 || info[5] != 1 {
         return Err(io::Error::other(
             "I2C target requires driver ABI 3 with a configured READY GPIO",
         ));
+    }
+    if usize::try_from(info[3]).unwrap_or_default() < MAX_FRAME_LENGTH {
+        return Err(io::Error::other(format!(
+            "I2C target supports {}-byte transfers; at least {MAX_FRAME_LENGTH} bytes are required",
+            info[3]
+        )));
     }
     Ok(())
 }
@@ -224,4 +233,25 @@ fn with_path(error: io::Error, context: &str, path: &Path) -> io::Error {
         error.kind(),
         format!("{context} {}: {error}", path.display()),
     )
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn target_info_requires_ready_abi_and_full_frame_capacity() {
+        let mut info = [0_u32; 8];
+        info[0] = 3;
+        info[3] = MAX_FRAME_LENGTH as u32;
+        info[5] = 1;
+        assert!(validate_target_info(&info).is_ok());
+
+        info[3] = MAX_FRAME_LENGTH as u32 - 1;
+        assert!(validate_target_info(&info).is_err());
+
+        info[3] = MAX_FRAME_LENGTH as u32;
+        info[5] = 0;
+        assert!(validate_target_info(&info).is_err());
+    }
 }

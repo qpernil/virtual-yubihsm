@@ -19,11 +19,11 @@ use std::{
 };
 use usb_gadget_worker::{EndpointLifecycle, UsbBusEvent};
 use virtual_yubihsm_core::{
-    CommandCode, DeviceConfig, DeviceError, Frame, PersistenceMode, PersistentDevice,
-    PersistentDeviceHandle, SessionAuthorization,
+    CommandCode, DeviceConfig, DeviceError, Frame, MAX_FRAME_LENGTH, PersistenceMode,
+    PersistentDevice, PersistentDeviceHandle, SessionAuthorization,
 };
 
-const MAX_TRANSFER: usize = u16::MAX as usize + 3;
+const RECEIVE_BUFFER_SIZE: usize = MAX_FRAME_LENGTH + MAX_PACKET_SIZE as usize;
 fn publish_personality(
     control: &Channel<'static>,
     generation: u32,
@@ -525,7 +525,9 @@ fn serve_endpoint(
     lifecycle: Arc<EndpointLifecycle>,
 ) -> io::Result<()> {
     let result = (|| {
-        let mut request = vec![0_u8; MAX_TRANSFER];
+        // The extra packet lets the protocol layer reject a frame with trailing
+        // bytes instead of silently accepting a full-length prefix.
+        let mut request = vec![0_u8; RECEIVE_BUFFER_SIZE];
         let mut activation = 0;
         while let Some(next_activation) = lifecycle.wait_for_activation_after(activation) {
             activation = next_activation;

@@ -237,8 +237,8 @@ messaging itself behind the HSM boundary.
 
 The [SCP03/SCP11 key-provider plan](https://github.com/qpernil/pkcs11rs/blob/master/docs/scp-key-provider/README.md)
 uses one protocol implementation with software or native key operations.
-Algorithm 61 and the `derive-session-key` capability implement generic protected,
-chainable device outputs alongside this one-shot prefixed mechanism. The native
+The `derive-session-key` capability implements generic protected, chainable
+device outputs alongside this one-shot prefixed mechanism. The native
 command family covers volatile P-256 generation and ECDH, key/data
 concatenation, bit extraction, SHA-256, SP 800-108 counter KDF, AES-CMAC
 verification, policy-controlled reads, and explicit deletion.
@@ -258,7 +258,7 @@ invalidates those handles if the secure session is lost.
 
 A PKCS #11 session object describes lifetime, not execution location. The
 pkcs11rs common layer holds session keys in host memory on a physical-device
-slot that lacks algorithm 61. A virtual YubiHSM advertising the extension uses
+slot. A virtual YubiHSM advertising actual virtual key algorithms uses
 explicit device placement and commands for supported operations. A readable
 result that requests a software-only operation is materialized once into the
 common layer; a protected result is never downgraded. Existing physical firmware
