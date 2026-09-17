@@ -17,9 +17,11 @@ mod object;
 #[cfg(all(feature = "persistent-runtime", unix))]
 mod persistent_runtime;
 mod protocol;
+mod request;
 mod secure_channel_crypto;
 mod session;
 mod session_object;
+mod wire;
 
 pub use algorithm::Algorithm;
 pub use authorization::SessionAuthorization;
