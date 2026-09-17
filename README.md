@@ -35,6 +35,14 @@ counters, audit policy, and device error mapping. This keeps the cryptography
 shared without making either the HSM protocol or its authorization model a
 dependency of other consumers.
 
+Each wire command has a typed request structure implementing the core's small
+borrowing `Decode` trait. The shared reader performs bounds checks, big-endian
+integer reads, fixed-array reads, length-delimited slices, and final trailing
+data rejection. Request implementations therefore mirror the published field
+order while command handlers operate on named fields. Serde remains reserved
+for durable CBOR state, whose self-describing data model fits it better than
+the positional command protocol.
+
 The in-memory object store keeps private asymmetric keys in their typed
 runtime form. Generation and import parse once; RSA CRT precomputation,
 Ed25519/Ed448 expansion, EC validation, and X25519/X448 construction are therefore not
