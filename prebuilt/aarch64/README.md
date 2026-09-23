@@ -9,12 +9,12 @@ The binary supports both `--inherited-device` for supervisor profiles and
 `--device` for direct device-path opening.
 
 The binary was built from clean `virtual-yubihsm` commit
-`6e8ef4bb2b47734a60ef970252ee84328bde0096` on `ubuntu4`, running Ubuntu
+`b68108b83d1e3fb6d7a1ed1626132523eb84875e` on `ubuntu4`, running Ubuntu
 26.04 LTS on ARM64, with Rust and Cargo 1.98.1 and glibc 2.43. Its path
 dependencies were:
 
-- `software-key-core` at `4c51bcb43c5c6943f20bc17d4e35250560b15ee1`;
-- `usb-gadget-supervisor` at `8ca57a2e829d912df5382797084bdedb9bae2594`.
+- `software-key-core` at `ca33b43e7563b7969910e211082a65f46e420b50`;
+- `usb-gadget-supervisor` at `886fc1b1703807abeb27e8293334bddbef9927ff`.
 
 It is an AArch64 PIE executable. ELF version inspection shows it
 requires at most `GLIBC_2.34`, which is compatible with the Raspberry Pi OS
