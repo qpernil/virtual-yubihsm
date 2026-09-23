@@ -1,8 +1,22 @@
-# virtual-yubihsm
+# Virtual YubiHSM
+
+[![CI](https://github.com/qpernil/virtual-yubihsm/actions/workflows/ci.yml/badge.svg)](https://github.com/qpernil/virtual-yubihsm/actions/workflows/ci.yml)
 
 `virtual-yubihsm` is a software implementation of the YubiHSM 2 device
-protocol. The protocol/device core is deliberately independent of USB,
-FunctionFS, HTTP connector, and process-supervision concerns.
+protocol. It can run behind the USB gadget worker, the experimental I2C target,
+or the persistent devices built into `pkcs11rs-connector`, and its core can be
+used directly by tests.
+
+It is a software compatibility test double, not a security device. Keys on a
+general-purpose computer or Raspberry Pi do not have the tamper, extraction, or
+side-channel protections of a physical YubiHSM. The protocol/device core is
+deliberately independent of USB, FunctionFS, HTTP connector, and
+process-supervision concerns.
+
+The [documentation index](docs/README.md) links the deployment,
+qualification, persistence, wire-format, and virtual-extension references.
+Implementation provenance and the independent compatibility boundary are
+recorded in [PROVENANCE.md](PROVENANCE.md).
 
 ## Architecture
 
@@ -403,3 +417,10 @@ boundaries, and extension rules.
 The factory Authentication Key is object ID 1, all capabilities, all delegated
 capabilities and all domains. Its compatibility password is `password`; change
 or delete it before connecting the core to any persistent deployment.
+
+## Independence and trademarks
+
+This is an independent compatibility project. It is not affiliated with,
+sponsored by, or endorsed by Yubico. Yubico and YubiHSM are registered
+trademarks of Yubico AB. Their names are used descriptively to identify the
+protocols and products with which this test implementation interoperates.
