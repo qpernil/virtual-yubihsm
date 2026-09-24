@@ -1,13 +1,13 @@
 //! Shared persistent device ownership for transport frontends.
 
 use crate::{Device, DeviceConfig, Frame, SessionAuthorization};
+pub use software_key_core::state_persistence::PersistenceMode;
+use software_key_core::state_persistence::{
+    StateLock, StatePersistence, StatePersistenceHandle, replace_file_atomically,
+};
 use std::{
     fs, io,
     path::{Path, PathBuf},
-};
-pub use usb_gadget_worker::PersistenceMode;
-use usb_gadget_worker::{
-    StateLock, StatePersistence, StatePersistenceHandle, replace_file_atomically,
 };
 
 /// Owns one durable virtual YubiHSM and its exclusive state lock.

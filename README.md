@@ -75,8 +75,10 @@ The default core is a synchronous in-memory device. Its optional
 `persistent-runtime` feature owns the state-file lock, restoration or factory
 bootstrap, mutation accounting, immediate or batched persistence, session
 cleanup, and final flush used by the USB, I2C, and embedded-connector
-frontends. Those frontends retain their distinct transport loops and do not
-carry independent copies of the durable device lifecycle.
+frontends. Generic locking and durable-write scheduling come from
+`software-key-core/state-persistence`; state format and lifecycle remain here.
+Those frontends retain their distinct transport loops and do not carry
+independent copies of the durable device lifecycle.
 
 The core also runs directly inside `pkcs11rs-connector` as an embedded virtual
 device, using this same persistent runtime as the USB and I2C frontends.

@@ -130,8 +130,8 @@ physical and virtual devices can execute concurrently.
 ## Persistence and ownership
 
 The `virtual-yubihsm-core/persistent-runtime` feature composes the generic
-coordinator from `usb-gadget-worker` with the device state machine. The USB,
-I2C, and embedded frontends all use this API. For each instance:
+`software-key-core/state-persistence` coordinator with the device state
+machine. The USB, I2C, and embedded frontends all use this API. For each instance:
 
 - the state file is `STATE_DIRECTORY/yubihsm-<serial>.cbor`;
 - a missing file triggers explicit factory bootstrap before registration;
