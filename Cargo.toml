@@ -36,7 +36,3 @@ gpiocdev-uapi = "0.7.0"
 [[bin]]
 name = "virtual-yubihsm-worker"
 path = "src/main.rs"
-
-[patch.crates-io]
-# Reduce ML-DSA matrix stack usage without changing public lattice types.
-ml-dsa = { git = "https://github.com/qpernil/signatures.git", rev = "e06d2e28699428fbcc135c388516883bbb71f170" }

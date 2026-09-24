@@ -424,3 +424,8 @@ This is an independent compatibility project. It is not affiliated with,
 sponsored by, or endorsed by Yubico. Yubico and YubiHSM are registered
 trademarks of Yubico AB. Their names are used descriptively to identify the
 protocols and products with which this test implementation interoperates.
+
+## License
+
+Licensed under either the [MIT License](LICENSE-MIT) or the
+[Apache License 2.0](LICENSE-APACHE), at your option.
