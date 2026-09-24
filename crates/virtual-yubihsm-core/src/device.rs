@@ -18,12 +18,11 @@ use ciborium::Value as CborValue;
 use const_oid::ObjectIdentifier;
 use der::{
     Decode, Encode, Sequence,
-    asn1::{Any, BitString, OctetString},
+    asn1::{BitString, OctetString},
 };
-use rsa::{BigUint, RsaPublicKey, pkcs8::EncodePublicKey as EncodeRsaPublicKey};
 use serde::{Deserialize, Serialize};
-use signature::{Keypair, Signer};
 use software_key_core::{
+    certificate_signing::{CertificateSignature, CertificateSigner, subject_public_key_info},
     counter_kdf::cmac_counter_kdf,
     digest::{HashAlgorithm, x963_kdf},
     rsa_signing::RsaHashAlgorithm,
@@ -38,10 +37,7 @@ use software_key_core::{
         encrypt_aes_ccm, encrypt_aes_ecb, encrypt_yubico_otp_aead, unwrap_aes_kwp, wrap_aes_kwp,
     },
 };
-use spki::{
-    AlgorithmIdentifierOwned, DynSignatureAlgorithmIdentifier, SignatureBitStringEncoding,
-    SubjectPublicKeyInfoOwned,
-};
+use spki::{AlgorithmIdentifierOwned, SubjectPublicKeyInfoOwned};
 use std::{collections::BTreeMap, io::Cursor};
 use std::{
     str::FromStr,
@@ -182,77 +178,6 @@ struct AttestationProfile {
     key_encipherment: bool,
     template_extensions: Vec<Extension>,
     metadata_extensions: Vec<Extension>,
-}
-
-#[derive(Clone)]
-struct CertificateVerifyingKey(Vec<u8>);
-
-impl spki::EncodePublicKey for CertificateVerifyingKey {
-    fn to_public_key_der(&self) -> spki::Result<spki::Document> {
-        let encoded = ec_subject_public_key_info(EcCurve::P256, &self.0)
-            .map_err(|_| spki::Error::KeyMalformed)?
-            .to_der()?;
-        spki::Document::try_from(encoded).map_err(Into::into)
-    }
-}
-
-struct CertificateSigner {
-    key: SoftwareSigningKey,
-    verifying_key: CertificateVerifyingKey,
-}
-
-impl CertificateSigner {
-    fn from_key(key: &SoftwareSigningKey) -> Result<Self> {
-        let SoftwarePublicKey::Ec {
-            curve: EcCurve::P256,
-            uncompressed,
-        } = key.public_key()
-        else {
-            return Err(DeviceError::InvalidData);
-        };
-        Ok(Self {
-            key: key.clone(),
-            verifying_key: CertificateVerifyingKey(uncompressed),
-        })
-    }
-}
-
-impl Keypair for CertificateSigner {
-    type VerifyingKey = CertificateVerifyingKey;
-
-    fn verifying_key(&self) -> Self::VerifyingKey {
-        self.verifying_key.clone()
-    }
-}
-
-impl DynSignatureAlgorithmIdentifier for CertificateSigner {
-    fn signature_algorithm_identifier(&self) -> spki::Result<AlgorithmIdentifierOwned> {
-        Ok(AlgorithmIdentifierOwned {
-            oid: ObjectIdentifier::new_unwrap("1.2.840.10045.4.3.2"),
-            parameters: None,
-        })
-    }
-}
-
-struct CertificateSignature(Vec<u8>);
-
-impl SignatureBitStringEncoding for CertificateSignature {
-    fn to_bitstring(&self) -> der::Result<BitString> {
-        BitString::from_bytes(&self.0)
-    }
-}
-
-impl Signer<CertificateSignature> for CertificateSigner {
-    fn try_sign(
-        &self,
-        message: &[u8],
-    ) -> core::result::Result<CertificateSignature, signature::Error> {
-        self.key
-            .sign_message(SignatureScheme::EcdsaP256Sha256, message)
-            .and_then(|signature| signature.to_ecdsa_der(EcCurve::P256))
-            .map(CertificateSignature)
-            .map_err(|_| signature::Error::new())
-    }
 }
 
 impl BuilderProfile for AttestationProfile {
@@ -1931,7 +1856,11 @@ impl Device {
                 return Err(DeviceError::StorageFailed);
             };
             (
-                ec_subject_public_key_info(EcCurve::P256, &public)?,
+                subject_public_key_info(&SoftwarePublicKey::Ec {
+                    curve: EcCurve::P256,
+                    uncompressed: public,
+                })
+                .map_err(|_| DeviceError::InvalidData)?,
                 ObjectInfo {
                     capabilities: CapabilitySet::NONE,
                     id: 0,
@@ -1968,7 +1897,8 @@ impl Device {
                 format!("CN=Virtual YubiHSM Attestation Key {attesting_id}"),
             )
         };
-        let signer = CertificateSigner::from_key(attesting_private)?;
+        let signer =
+            CertificateSigner::from_key(attesting_private).map_err(|_| DeviceError::InvalidData)?;
         let mut subject = Name::from_str(&format!("CN=Virtual YubiHSM Key {target_id}"))
             .map_err(|_| DeviceError::InvalidData)?;
         let mut issuer = Name::from_str(&issuer).map_err(|_| DeviceError::InvalidData)?;
@@ -3669,72 +3599,11 @@ fn object_subject_public_key_info(object: &ObjectRecord) -> Result<SubjectPublic
             .map_err(|_| DeviceError::InvalidData)?,
         });
     }
-    match signing_key(object)?.public_key() {
-        SoftwarePublicKey::Ec {
-            curve,
-            uncompressed,
-        } => ec_subject_public_key_info(curve, &uncompressed),
-        SoftwarePublicKey::Edwards {
-            curve: EdwardsCurve::Ed25519,
-            public_key,
-        } => Ok(SubjectPublicKeyInfoOwned {
-            algorithm: AlgorithmIdentifierOwned {
-                oid: ObjectIdentifier::new_unwrap("1.3.101.112"),
-                parameters: None,
-            },
-            subject_public_key: BitString::from_bytes(&public_key)
-                .map_err(|_| DeviceError::InvalidData)?,
-        }),
-        SoftwarePublicKey::Edwards {
-            curve: EdwardsCurve::Ed448,
-            public_key,
-        } => Ok(SubjectPublicKeyInfoOwned {
-            algorithm: AlgorithmIdentifierOwned {
-                oid: ObjectIdentifier::new_unwrap("1.3.101.113"),
-                parameters: None,
-            },
-            subject_public_key: BitString::from_bytes(&public_key)
-                .map_err(|_| DeviceError::InvalidData)?,
-        }),
-        SoftwarePublicKey::Rsa { modulus, exponent } => {
-            let public = RsaPublicKey::new(
-                BigUint::from_bytes_be(&modulus),
-                BigUint::from_bytes_be(&exponent),
-            )
-            .map_err(|_| DeviceError::InvalidData)?;
-            let encoded = public
-                .to_public_key_der()
-                .map_err(|_| DeviceError::InvalidData)?;
-            SubjectPublicKeyInfoOwned::from_der(encoded.as_bytes())
-                .map_err(|_| DeviceError::InvalidData)
-        }
-        SoftwarePublicKey::MlDsa { .. } => Err(DeviceError::InvalidData),
+    let public_key = signing_key(object)?.public_key();
+    if matches!(public_key, SoftwarePublicKey::MlDsa { .. }) {
+        return Err(DeviceError::InvalidData);
     }
-}
-
-fn ec_subject_public_key_info(
-    curve: EcCurve,
-    uncompressed: &[u8],
-) -> Result<SubjectPublicKeyInfoOwned> {
-    let curve_oid = match curve {
-        EcCurve::P224 => "1.3.132.0.33",
-        EcCurve::P256 => "1.2.840.10045.3.1.7",
-        EcCurve::P384 => "1.3.132.0.34",
-        EcCurve::P521 => "1.3.132.0.35",
-        EcCurve::Secp256k1 => "1.3.132.0.10",
-        EcCurve::BrainpoolP256 => "1.3.36.3.3.2.8.1.1.7",
-        EcCurve::BrainpoolP384 => "1.3.36.3.3.2.8.1.1.11",
-        EcCurve::BrainpoolP512 => "1.3.36.3.3.2.8.1.1.13",
-    };
-    let curve_oid = ObjectIdentifier::new(curve_oid).map_err(|_| DeviceError::InvalidData)?;
-    Ok(SubjectPublicKeyInfoOwned {
-        algorithm: AlgorithmIdentifierOwned {
-            oid: ObjectIdentifier::new_unwrap("1.2.840.10045.2.1"),
-            parameters: Some(Any::encode_from(&curve_oid).map_err(|_| DeviceError::InvalidData)?),
-        },
-        subject_public_key: BitString::from_bytes(uncompressed)
-            .map_err(|_| DeviceError::InvalidData)?,
-    })
+    subject_public_key_info(&public_key).map_err(|_| DeviceError::InvalidData)
 }
 
 fn attestation_metadata_extensions(
@@ -4531,6 +4400,7 @@ mod tests {
     ))]
     use p256::ecdh::diffie_hellman;
     use p256::elliptic_curve::sec1::ToSec1Point;
+    use rsa::{BigUint, RsaPublicKey};
     #[cfg(any(
         feature = "firmware-secure-channel",
         feature = "firmware-full",
