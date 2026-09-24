@@ -14,7 +14,7 @@ mod worker_protocol;
 #[cfg(target_os = "linux")]
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::{env, io, time::Duration};
-use usb_gadget_worker::PersistenceMode;
+use virtual_yubihsm_core::PersistenceMode;
 
 #[cfg(target_os = "linux")]
 static STOP_REQUESTED: AtomicBool = AtomicBool::new(false);
