@@ -123,6 +123,7 @@ pub enum ObjectMaterial {
     /// Parsed Montgomery-curve private key used at runtime.
     MontgomeryKey(SoftwareMontgomeryKey),
     MlKemKey(software_key_core::post_quantum::MlKemPrivateKey),
+    HybridKemKey(software_key_core::hybrid_kem::HybridKemPrivateKey),
     /// Symmetric, HMAC, and other byte-oriented secret material.
     Secret(Vec<u8>),
     Opaque(Vec<u8>),
@@ -149,6 +150,7 @@ impl ObjectMaterial {
             },
             Self::MontgomeryKey(key) => key.serialized().len(),
             Self::MlKemKey(_) => 64,
+            Self::HybridKemKey(_) => 32,
             Self::OtpAeadKey { key, .. } => key.len(),
         }
     }
@@ -168,6 +170,9 @@ impl PartialEq for ObjectMaterial {
             (Self::MontgomeryKey(a), Self::MontgomeryKey(b)) => a.serialized() == b.serialized(),
             (Self::MlKemKey(a), Self::MlKemKey(b)) => {
                 a.parameter_set() == b.parameter_set() && a.seed() == b.seed()
+            }
+            (Self::HybridKemKey(a), Self::HybridKemKey(b)) => {
+                a.construction() == b.construction() && a.seed() == b.seed()
             }
             (Self::Secret(a), Self::Secret(b))
             | (Self::Opaque(a), Self::Opaque(b))
@@ -196,7 +201,10 @@ impl Zeroize for ObjectMaterial {
             // Typed private keys clear themselves when their owning wrapper is
             // dropped; they are intentionally never converted back to bytes
             // merely to wipe a temporary representation.
-            Self::SigningKey(_) | Self::MontgomeryKey(_) | Self::MlKemKey(_) => {}
+            Self::SigningKey(_)
+            | Self::MontgomeryKey(_)
+            | Self::MlKemKey(_)
+            | Self::HybridKemKey(_) => {}
             Self::Secret(value) | Self::Opaque(value) | Self::Public(value) => value.zeroize(),
             Self::OtpAeadKey { nonce_id, key } => {
                 nonce_id.zeroize();
@@ -283,6 +291,7 @@ impl ObjectRecord {
             ObjectMaterial::MlKemKey(key) => {
                 StoredObjectMaterial::Secret(key.seed().ok_or(DeviceError::InvalidData)?.to_vec())
             }
+            ObjectMaterial::HybridKemKey(key) => StoredObjectMaterial::Secret(key.seed().to_vec()),
             ObjectMaterial::Secret(value) => StoredObjectMaterial::Secret(value.clone()),
             ObjectMaterial::Opaque(value) => StoredObjectMaterial::Opaque(value.clone()),
             ObjectMaterial::Public(value) => StoredObjectMaterial::Public(value.clone()),
@@ -399,6 +408,14 @@ fn typed_private_material(info: &ObjectInfo, encoded: &[u8]) -> Result<ObjectMat
             parameters, encoded,
         )
         .map(ObjectMaterial::MlKemKey)
+        .map_err(|_| DeviceError::InvalidData);
+    }
+    if let Some(construction) = algorithm.hybrid_kem() {
+        return software_key_core::hybrid_kem::HybridKemPrivateKey::from_seed_slice(
+            construction,
+            encoded,
+        )
+        .map(ObjectMaterial::HybridKemKey)
         .map_err(|_| DeviceError::InvalidData);
     }
     if matches!(algorithm, Algorithm::X25519 | Algorithm::X448) {

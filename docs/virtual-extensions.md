@@ -15,12 +15,13 @@ YubiHSM implements the same values or command forms.
 | Ed448 | algorithm 58 | Existing asymmetric-key generate/import/public-key/`SignEddsa` commands | Existing generate, put, get-public-key and EdDSA-sign capabilities |
 | Protected volatile derivation objects | Capability `session-objects` (`0x39`) on the active Authentication Key | `SessionObject` (`0x0b`), one envelope containing generation, ECDH, composition, derivation, controlled reads, AES-CMAC verification, and deletion | `session-objects` on the authenticated session; persistent ECDH and AES sources additionally require their ordinary operation capability and domain visibility |
 | ML-DSA and ML-KEM | ML-DSA algorithms 59–61 and ML-KEM algorithms 62–64 | Existing asymmetric-key generation, seed import, public-key and object commands; `SignMlDsa` (`0x0d`), `EncapsulateMlKem` (`0x0e`), and `DecapsulateMlKem` (`0x0f`) | Existing generate/put/delete permissions plus `sign-ml-dsa` (`0x3a`), `encapsulate-ml-kem` (`0x3b`), or `decapsulate-ml-kem` (`0x3c`) on both the session and private-key object |
+| Concrete hybrid PQ/T KEMs | algorithms 65–67 | Existing asymmetric-key generation, 32-byte seed import, public-key and object commands; `EncapsulateHybridKem` (`0x10`) and `DecapsulateHybridKem` (`0x11`) | Existing generate/put/delete permissions plus `encapsulate-hybrid-kem` (`0x3d`) or `decapsulate-hybrid-kem` (`0x3e`) on both the session and private-key object |
 
 ## Command hierarchy
 
 The wire protocol has two levels. The ordinary top-level registry contains the
-published YubiHSM commands plus five virtual commands in the unused
-`0x0b`–`0x0f` range:
+published YubiHSM commands plus seven virtual commands in the unused
+`0x0b`–`0x11` range:
 
 | Code | Command | Role |
 | --- | --- | --- |
@@ -29,6 +30,8 @@ published YubiHSM commands plus five virtual commands in the unused
 | `0x0d` | `SignMlDsa` | ML-DSA signing |
 | `0x0e` | `EncapsulateMlKem` | ML-KEM encapsulation |
 | `0x0f` | `DecapsulateMlKem` | ML-KEM decapsulation |
+| `0x10` | `EncapsulateHybridKem` | Concrete hybrid PQ/T KEM encapsulation |
+| `0x11` | `DecapsulateHybridKem` | Concrete hybrid PQ/T KEM decapsulation |
 
 There is no generic extension dispatcher and no command-code negotiation.
 Clients learn algorithms through the algorithm list and authorization through
@@ -52,9 +55,9 @@ does not imply that the nested payload equals the ordinary command payload.
 
 Capabilities follow the same boundary. `session-objects` authorizes entry to
 the namespace, while a persistent source must also permit its ordinary
-operation. ML-DSA signing, ML-KEM encapsulation, ML-KEM decapsulation, and
-prefixed ECDH retain separate capabilities because they are independently
-grantable sensitive operations.
+operation. ML-DSA signing, ML-KEM encapsulation and decapsulation, concrete
+hybrid KEM encapsulation and decapsulation, and prefixed ECDH retain separate
+capabilities because they are independently grantable sensitive operations.
 
 ## Firmware profiles
 
@@ -71,7 +74,7 @@ There are three deployment profiles:
 | --- | --- | --- |
 | `firmware-yubihsm2` | Algorithms 1–55 and the YubiHSM 2-compatible command surface | Exercise physical-device compatibility without virtual extension commands |
 | `firmware-secure-channel` | Baseline plus `SessionObject` and `DeriveEcdhKdf` | Keep client-side SCP11 ephemeral keys and intermediate agreements inside the device |
-| `firmware-full` | Secure-channel profile plus X25519, X448, Ed448, ML-DSA, ML-KEM, and direct RSA wrapping | Fully featured virtual deployments and interoperability experiments |
+| `firmware-full` | Secure-channel profile plus X25519, X448, Ed448, ML-DSA, ML-KEM, concrete hybrid PQ/T KEMs, and direct RSA wrapping | Fully featured virtual deployments and interoperability experiments |
 
 `firmware-full` is the default. Build either restricted profile explicitly:
 
@@ -139,6 +142,41 @@ the parameter-set ciphertext followed by the 32-byte shared secret.
 `DecapsulateMlKem` (`0x0f`) takes the big-endian key ID followed immediately by
 exactly one parameter-set ciphertext and returns the 32-byte shared secret.
 Both results travel inside the authenticated and encrypted YubiHSM session.
+
+### Concrete hybrid PQ/T KEMs
+
+The provisional implementation is pinned to
+`draft-irtf-cfrg-concrete-hybrid-kems-04` (6 July 2026), with the CG framework
+from `draft-irtf-cfrg-hybrid-kems-12`. It uses FIPS 203 ML-KEM, FIPS 202
+SHAKE256 and SHA3-256, SEC 1 version 2.0 uncompressed P-256/P-384 points, and
+RFC 7748 X25519. `MLKEM768-X25519` is the X-Wing construction specified by
+`draft-connolly-cfrg-xwing-kem-10`. Algorithm `65` is
+`MLKEM768-P256`, `66` is `MLKEM768-X25519` (X-Wing), and `67` is
+`MLKEM1024-P384`. Their combined public-key lengths are respectively 1249,
+1216, and 1665 bytes; ciphertext lengths are 1153, 1120, and 1665 bytes. All
+public encodings are `ek_PQ || ek_T`, all ciphertexts are `ct_PQ || ct_T`, and
+all command results are the draft's 32-byte SHA3-256 combined secret.
+
+The private object contains only the draft's 32-byte decapsulation seed. Both
+component keys are derived inside the object, so neither can be addressed or
+used independently. `PutAsymmetricKey` imports exactly this seed;
+`GenerateAsymmetricKey` creates it atomically; `GetPublicKey` returns
+`algorithm || ek_PQ || ek_T`. Cross-use through ML-KEM, ECDH, or a different
+hybrid algorithm is rejected as invalid data.
+
+`EncapsulateHybridKem` (`0x10`) takes a two-byte big-endian object ID and
+returns `ct_PQ || ct_T || ss`. `DecapsulateHybridKem` (`0x11`) takes the object
+ID followed by the construction-specific ciphertext and returns the 32-byte
+secret. Wrong request or ciphertext lengths return `WRONG_LENGTH`; wrong
+object algorithms, malformed traditional points, and non-contributory X25519
+inputs return `INVALID_DATA`.
+
+Generated hybrid objects can be attested through the existing
+`SignAttestationCertificate` command. The provisional SubjectPublicKeyInfo
+algorithm OIDs are `1.3.6.1.4.1.41482.12.1`, `.12.2`, and `.12.3` in the same
+algorithm order, with absent parameters and the raw combined public encoding
+in the BIT STRING. These private OIDs make no compatibility claim for physical
+YubiHSM firmware.
 
 ## Protected volatile derivation objects
 

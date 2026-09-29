@@ -20,6 +20,10 @@ pub enum CommandCode {
     EncapsulateMlKem = 0x0e,
     /// Virtual ML-KEM decapsulation.
     DecapsulateMlKem = 0x0f,
+    /// Virtual concrete hybrid PQ/T KEM encapsulation.
+    EncapsulateHybridKem = 0x10,
+    /// Virtual concrete hybrid PQ/T KEM decapsulation.
+    DecapsulateHybridKem = 0x11,
     CloseSession = 0x40,
     GetStorageInfo = 0x41,
     PutOpaque = 0x42,
@@ -123,9 +127,8 @@ impl CommandCode {
         match self {
             DeriveEcdhKdf => crate::FirmwareProfile::compiled().prefixed_ecdh(),
             SessionObject => crate::FirmwareProfile::compiled().session_objects(),
-            SignMlDsa | EncapsulateMlKem | DecapsulateMlKem => {
-                crate::FirmwareProfile::compiled().post_quantum()
-            }
+            SignMlDsa | EncapsulateMlKem | DecapsulateMlKem | EncapsulateHybridKem
+            | DecapsulateHybridKem => crate::FirmwareProfile::compiled().post_quantum(),
             _ => true,
         }
     }
@@ -145,6 +148,8 @@ impl CommandCode {
             0x0d => SignMlDsa,
             0x0e => EncapsulateMlKem,
             0x0f => DecapsulateMlKem,
+            0x10 => EncapsulateHybridKem,
+            0x11 => DecapsulateHybridKem,
             0x40 => CloseSession,
             0x41 => GetStorageInfo,
             0x42 => PutOpaque,
@@ -249,6 +254,8 @@ impl CommandCode {
             SignMlDsa => Some(Capability::SignMlDsa),
             EncapsulateMlKem => Some(Capability::EncapsulateMlKem),
             DecapsulateMlKem => Some(Capability::DecapsulateMlKem),
+            EncapsulateHybridKem => Some(Capability::EncapsulateHybridKem),
+            DecapsulateHybridKem => Some(Capability::DecapsulateHybridKem),
             ChangeAuthenticationKey => Some(Capability::ChangeAuthenticationKey),
             PutSymmetricKey => Some(Capability::PutSymmetricKey),
             GenerateSymmetricKey => Some(Capability::GenerateSymmetricKey),
