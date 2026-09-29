@@ -25,6 +25,7 @@ use software_key_core::{
     certificate_signing::{CertificateSignature, CertificateSigner, subject_public_key_info},
     counter_kdf::cmac_counter_kdf,
     digest::{HashAlgorithm, x963_kdf},
+    hybrid_kem::{HybridKemPrivateKey, hybrid_kem_encapsulate},
     rsa_signing::RsaHashAlgorithm,
     secure_channel::yubico_password_kdf,
     software_key_agreement::{MontgomeryCurve, SoftwareMontgomeryKey, derive_with_signing_key},
@@ -236,6 +237,9 @@ impl Default for DeviceConfig {
                     Algorithm::MlKem512,
                     Algorithm::MlKem768,
                     Algorithm::MlKem1024,
+                    Algorithm::HybridMlKem768P256,
+                    Algorithm::HybridMlKem768X25519,
+                    Algorithm::HybridMlKem1024P384,
                 ])
                 .filter(|algorithm| algorithm.supported_by_firmware())
                 .map(|algorithm| algorithm as u8)
@@ -926,6 +930,12 @@ impl Device {
             CommandCode::SignMlDsa => self.sign_ml_dsa(authorization, &request.data),
             CommandCode::EncapsulateMlKem => self.encapsulate_ml_kem(authorization, &request.data),
             CommandCode::DecapsulateMlKem => self.decapsulate_ml_kem(authorization, &request.data),
+            CommandCode::EncapsulateHybridKem => {
+                self.encapsulate_hybrid_kem(authorization, &request.data)
+            }
+            CommandCode::DecapsulateHybridKem => {
+                self.decapsulate_hybrid_kem(authorization, &request.data)
+            }
             CommandCode::DeriveEcdh => self.derive_ecdh(authorization, &request.data),
             CommandCode::DeriveEcdhKdf => self.derive_ecdh_kdf(authorization, &request.data),
             CommandCode::SessionObject => self.session_object_command(
@@ -1114,6 +1124,22 @@ impl Device {
                     ObjectType::AsymmetricKey,
                     request.id,
                     Capability::DecapsulateMlKem,
+                )
+            }
+            CommandCode::EncapsulateHybridKem => {
+                let request = decode_request::<EncapsulateMlKemRequest>(data)?;
+                authorize(
+                    ObjectType::AsymmetricKey,
+                    request.id,
+                    Capability::EncapsulateHybridKem,
+                )
+            }
+            CommandCode::DecapsulateHybridKem => {
+                let request = decode_request::<DecapsulateMlKemRequest>(data)?;
+                authorize(
+                    ObjectType::AsymmetricKey,
+                    request.id,
+                    Capability::DecapsulateHybridKem,
                 )
             }
             CommandCode::DeriveEcdh => {
@@ -1812,6 +1838,8 @@ impl Device {
             }
         } else if let ObjectMaterial::MlKemKey(key) = &object.material {
             output.extend_from_slice(&key.public_key());
+        } else if let ObjectMaterial::HybridKemKey(key) = &object.material {
+            output.extend_from_slice(&key.public_key().map_err(|_| DeviceError::InvalidData)?);
         } else if matches!(
             Algorithm::from_byte(object.info.algorithm),
             Some(Algorithm::X25519 | Algorithm::X448)
@@ -2067,6 +2095,47 @@ impl Device {
             return Err(DeviceError::WrongLength);
         }
         key.decapsulate(ciphertext)
+            .map(|secret| secret.to_vec())
+            .map_err(|_| DeviceError::InvalidData)
+    }
+
+    /// key-id (BE). Returns ciphertext followed by the 32-byte combined secret.
+    fn encapsulate_hybrid_kem(
+        &self,
+        authorization: SessionAuthorization,
+        data: &[u8],
+    ) -> Result<Vec<u8>> {
+        let request = decode_request::<EncapsulateMlKemRequest>(data)?;
+        let object = self.asymmetric_object(authorization, request.id)?;
+        self.require_algorithm_enabled(object.info.algorithm)?;
+        let ObjectMaterial::HybridKemKey(key) = &object.material else {
+            return Err(DeviceError::InvalidData);
+        };
+        let (mut ciphertext, secret) = hybrid_kem_encapsulate(
+            key.construction(),
+            &key.public_key().map_err(|_| DeviceError::InvalidData)?,
+        )
+        .map_err(|_| DeviceError::InvalidData)?;
+        ciphertext.extend_from_slice(&secret);
+        Ok(ciphertext)
+    }
+
+    /// key-id (BE), ciphertext. Returns the 32-byte combined secret.
+    fn decapsulate_hybrid_kem(
+        &self,
+        authorization: SessionAuthorization,
+        data: &[u8],
+    ) -> Result<Vec<u8>> {
+        let request = decode_request::<DecapsulateMlKemRequest>(data)?;
+        let object = self.asymmetric_object(authorization, request.id)?;
+        self.require_algorithm_enabled(object.info.algorithm)?;
+        let ObjectMaterial::HybridKemKey(key) = &object.material else {
+            return Err(DeviceError::InvalidData);
+        };
+        if request.ciphertext.len() != key.construction().ciphertext_length() {
+            return Err(DeviceError::WrongLength);
+        }
+        key.decapsulate(request.ciphertext)
             .map(|secret| secret.to_vec())
             .map_err(|_| DeviceError::InvalidData)
     }
@@ -3460,6 +3529,18 @@ fn asymmetric_key_material(
         .map_err(|_| DeviceError::InvalidData)?;
         return Ok(ObjectMaterial::MlKemKey(key));
     }
+    if let Some(construction) = algorithm.hybrid_kem() {
+        if generate && !supplied.is_empty() || !generate && supplied.len() != 32 {
+            return Err(DeviceError::WrongLength);
+        }
+        let key = if generate {
+            HybridKemPrivateKey::generate(construction)
+        } else {
+            HybridKemPrivateKey::from_seed_slice(construction, supplied)
+        }
+        .map_err(|_| DeviceError::InvalidData)?;
+        return Ok(ObjectMaterial::HybridKemKey(key));
+    }
     if generate && !supplied.is_empty() {
         return Err(DeviceError::WrongLength);
     }
@@ -3587,6 +3668,29 @@ fn rsa_modulus_length(object: &ObjectRecord) -> Result<usize> {
 }
 
 fn object_subject_public_key_info(object: &ObjectRecord) -> Result<SubjectPublicKeyInfoOwned> {
+    if let ObjectMaterial::HybridKemKey(key) = &object.material {
+        let oid = match key.construction() {
+            software_key_core::hybrid_kem::HybridKemConstruction::MlKem768P256 => {
+                ObjectIdentifier::new_unwrap("1.3.6.1.4.1.41482.12.1")
+            }
+            software_key_core::hybrid_kem::HybridKemConstruction::MlKem768X25519 => {
+                ObjectIdentifier::new_unwrap("1.3.6.1.4.1.41482.12.2")
+            }
+            software_key_core::hybrid_kem::HybridKemConstruction::MlKem1024P384 => {
+                ObjectIdentifier::new_unwrap("1.3.6.1.4.1.41482.12.3")
+            }
+        };
+        return Ok(SubjectPublicKeyInfoOwned {
+            algorithm: AlgorithmIdentifierOwned {
+                oid,
+                parameters: None,
+            },
+            subject_public_key: BitString::from_bytes(
+                &key.public_key().map_err(|_| DeviceError::InvalidData)?,
+            )
+            .map_err(|_| DeviceError::InvalidData)?,
+        });
+    }
     if let Some((curve, oid)) = montgomery_algorithm(object.info.algorithm) {
         return Ok(SubjectPublicKeyInfoOwned {
             algorithm: AlgorithmIdentifierOwned {
@@ -3844,6 +3948,12 @@ fn validate_wrapped_object(object: &ObjectRecord) -> Result<()> {
         }
         (ObjectType::AsymmetricKey, ObjectMaterial::MontgomeryKey(_)) => {
             matches!(algorithm, Algorithm::X25519 | Algorithm::X448)
+        }
+        (ObjectType::AsymmetricKey, ObjectMaterial::MlKemKey(value)) => {
+            algorithm.ml_kem() == Some(value.parameter_set())
+        }
+        (ObjectType::AsymmetricKey, ObjectMaterial::HybridKemKey(value)) => {
+            algorithm.hybrid_kem() == Some(value.construction())
         }
         (ObjectType::WrapKey, ObjectMaterial::SigningKey(value)) if algorithm.is_rsa_key() => {
             matches!(value, SoftwareSigningKey::Rsa(_))
@@ -5840,6 +5950,129 @@ mod tests {
                 Frame::error(DeviceError::WrongLength)
             );
         }
+    }
+
+    #[test]
+    #[cfg(feature = "firmware-full")]
+    fn concrete_hybrid_kems_generate_import_operate_attest_and_persist() {
+        use der::Decode;
+        use x509_cert::Certificate;
+
+        let config = DeviceConfig::default();
+        let mut device = Device::factory_default(config.clone());
+        let admin = device.session_authorization(1).unwrap();
+        let capabilities = CapabilitySet::from_capabilities([
+            Capability::EncapsulateHybridKem,
+            Capability::DecapsulateHybridKem,
+            // Deliberately grant the standalone capability too: algorithm
+            // binding, not merely missing authorization, must reject cross-use.
+            Capability::DecapsulateMlKem,
+        ]);
+
+        for (offset, algorithm, ciphertext_length, public_length, expected_oid) in [
+            (
+                0,
+                Algorithm::HybridMlKem768P256,
+                1_153,
+                1_249,
+                "1.3.6.1.4.1.41482.12.1",
+            ),
+            (
+                1,
+                Algorithm::HybridMlKem768X25519,
+                1_120,
+                1_216,
+                "1.3.6.1.4.1.41482.12.2",
+            ),
+            (
+                2,
+                Algorithm::HybridMlKem1024P384,
+                1_665,
+                1_665,
+                "1.3.6.1.4.1.41482.12.3",
+            ),
+        ] {
+            let id = 80 + offset;
+            let generate = generate_asymmetric_key_request(id, 1, capabilities, algorithm as u8);
+            assert_eq!(
+                device.execute_inner(admin, &generate).data,
+                id.to_be_bytes()
+            );
+            let public = device.execute_inner(
+                admin,
+                &Frame::new(CommandCode::GetPublicKey as u8, id.to_be_bytes()).unwrap(),
+            );
+            assert_eq!(public.data[0], algorithm as u8);
+            assert_eq!(public.data.len(), 1 + public_length);
+
+            let encapsulate = Frame::new(
+                CommandCode::EncapsulateHybridKem as u8,
+                id.to_be_bytes().to_vec(),
+            )
+            .unwrap();
+            let encapsulated = device.execute_inner(admin, &encapsulate);
+            let (ciphertext, shared) = encapsulated.data.split_at(ciphertext_length);
+            assert_eq!(shared.len(), 32);
+            let decapsulate = Frame::new(
+                CommandCode::DecapsulateHybridKem as u8,
+                [id.to_be_bytes().as_slice(), ciphertext].concat(),
+            )
+            .unwrap();
+            assert_eq!(device.execute_inner(admin, &decapsulate).data, shared);
+
+            let cross_use = Frame::new(
+                CommandCode::DecapsulateMlKem as u8,
+                [id.to_be_bytes().as_slice(), ciphertext].concat(),
+            )
+            .unwrap();
+            assert_eq!(
+                device.execute_inner(admin, &cross_use),
+                Frame::error(DeviceError::InvalidData)
+            );
+
+            let attestation = Frame::new(
+                CommandCode::SignAttestationCertificate as u8,
+                [id.to_be_bytes(), 0_u16.to_be_bytes()].concat(),
+            )
+            .unwrap();
+            let certificate =
+                Certificate::from_der(&device.execute_inner(admin, &attestation).data).unwrap();
+            assert_eq!(
+                certificate
+                    .tbs_certificate()
+                    .subject_public_key_info()
+                    .algorithm
+                    .oid,
+                ObjectIdentifier::new_unwrap(expected_oid)
+            );
+
+            let state = device.persistent_state().unwrap();
+            let mut restored = Device::from_persistent_state(config.clone(), &state).unwrap();
+            assert_eq!(restored.execute_inner(admin, &decapsulate).data, shared);
+        }
+
+        let import = put_asymmetric_key_request(
+            90,
+            1,
+            capabilities,
+            Algorithm::HybridMlKem768X25519,
+            &[0x42; 32],
+        );
+        assert_eq!(
+            device.execute_inner(admin, &import).data,
+            90_u16.to_be_bytes()
+        );
+        let malformed = put_asymmetric_key_request(
+            91,
+            1,
+            capabilities,
+            Algorithm::HybridMlKem768X25519,
+            &[0x42; 31],
+        );
+        assert_eq!(
+            device.execute_inner(admin, &malformed),
+            Frame::error(DeviceError::WrongLength)
+        );
     }
 
     #[test]

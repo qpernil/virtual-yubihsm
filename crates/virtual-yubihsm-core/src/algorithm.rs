@@ -69,6 +69,9 @@ pub enum Algorithm {
     MlKem512 = 62,
     MlKem768 = 63,
     MlKem1024 = 64,
+    HybridMlKem768P256 = 65,
+    HybridMlKem768X25519 = 66,
+    HybridMlKem1024P384 = 67,
 }
 
 impl Algorithm {
@@ -131,10 +134,10 @@ impl Algorithm {
     ];
 
     pub const fn from_byte(value: u8) -> Option<Self> {
-        if value == 0 || value > Self::MlKem1024 as u8 {
+        if value == 0 || value > Self::HybridMlKem1024P384 as u8 {
             return None;
         }
-        // SAFETY: every value in the inclusive range 1..=64 is represented.
+        // SAFETY: every value in the inclusive range 1..=67 is represented.
         Some(unsafe { core::mem::transmute::<u8, Self>(value) })
     }
 
@@ -149,7 +152,10 @@ impl Algorithm {
             | Self::MlDsa87
             | Self::MlKem512
             | Self::MlKem768
-            | Self::MlKem1024 => crate::FirmwareProfile::compiled().post_quantum(),
+            | Self::MlKem1024
+            | Self::HybridMlKem768P256
+            | Self::HybridMlKem768X25519
+            | Self::HybridMlKem1024P384 => crate::FirmwareProfile::compiled().post_quantum(),
             _ => true,
         }
     }
@@ -170,6 +176,16 @@ impl Algorithm {
             Self::MlKem512 => Some(MlKem512),
             Self::MlKem768 => Some(MlKem768),
             Self::MlKem1024 => Some(MlKem1024),
+            _ => None,
+        }
+    }
+
+    pub const fn hybrid_kem(self) -> Option<software_key_core::hybrid_kem::HybridKemConstruction> {
+        use software_key_core::hybrid_kem::HybridKemConstruction::*;
+        match self {
+            Self::HybridMlKem768P256 => Some(MlKem768P256),
+            Self::HybridMlKem768X25519 => Some(MlKem768X25519),
+            Self::HybridMlKem1024P384 => Some(MlKem1024P384),
             _ => None,
         }
     }
@@ -198,6 +214,9 @@ impl Algorithm {
         match self {
             Self::MlDsa44 | Self::MlDsa65 | Self::MlDsa87 => Some(32),
             Self::MlKem512 | Self::MlKem768 | Self::MlKem1024 => Some(64),
+            Self::HybridMlKem768P256 | Self::HybridMlKem768X25519 | Self::HybridMlKem1024P384 => {
+                Some(32)
+            }
             Self::Rsa2048 => Some(256),
             Self::Rsa3072 => Some(384),
             Self::Rsa4096 => Some(512),
@@ -220,6 +239,9 @@ impl Algorithm {
         match self {
             Self::MlDsa44 | Self::MlDsa65 | Self::MlDsa87 => Some(32),
             Self::MlKem512 | Self::MlKem768 | Self::MlKem1024 => Some(64),
+            Self::HybridMlKem768P256 | Self::HybridMlKem768X25519 | Self::HybridMlKem1024P384 => {
+                Some(32)
+            }
             Self::Rsa2048 => Some(896),
             Self::Rsa3072 => Some(1_344),
             Self::Rsa4096 => Some(1_792),
@@ -272,7 +294,15 @@ mod tests {
         assert_eq!(Algorithm::from_byte(58), Some(Algorithm::Ed448));
         assert_eq!(Algorithm::from_byte(59), Some(Algorithm::MlDsa44));
         assert_eq!(Algorithm::from_byte(64), Some(Algorithm::MlKem1024));
-        assert_eq!(Algorithm::from_byte(65), None);
+        assert_eq!(
+            Algorithm::from_byte(65),
+            Some(Algorithm::HybridMlKem768P256)
+        );
+        assert_eq!(
+            Algorithm::from_byte(67),
+            Some(Algorithm::HybridMlKem1024P384)
+        );
+        assert_eq!(Algorithm::from_byte(68), None);
     }
 
     #[test]

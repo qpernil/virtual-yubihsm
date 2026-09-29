@@ -70,6 +70,8 @@ pub enum Capability {
     SignMlDsa = 0x3a,
     EncapsulateMlKem = 0x3b,
     DecapsulateMlKem = 0x3c,
+    EncapsulateHybridKem = 0x3d,
+    DecapsulateHybridKem = 0x3e,
 }
 
 impl Capability {
@@ -77,9 +79,11 @@ impl Capability {
         match self {
             Self::DeriveEcdhKdf => crate::FirmwareProfile::compiled().prefixed_ecdh(),
             Self::SessionObjects => crate::FirmwareProfile::compiled().session_objects(),
-            Self::SignMlDsa | Self::EncapsulateMlKem | Self::DecapsulateMlKem => {
-                crate::FirmwareProfile::compiled().post_quantum()
-            }
+            Self::SignMlDsa
+            | Self::EncapsulateMlKem
+            | Self::DecapsulateMlKem
+            | Self::EncapsulateHybridKem
+            | Self::DecapsulateHybridKem => crate::FirmwareProfile::compiled().post_quantum(),
             _ => true,
         }
     }
@@ -143,6 +147,8 @@ impl CapabilitySet {
             Capability::SignMlDsa,
             Capability::EncapsulateMlKem,
             Capability::DecapsulateMlKem,
+            Capability::EncapsulateHybridKem,
+            Capability::DecapsulateHybridKem,
         ] {
             if !capability.supported_by_firmware() {
                 self.remove(capability);
