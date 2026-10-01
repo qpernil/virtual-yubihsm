@@ -2050,8 +2050,11 @@ impl Device {
         let SoftwareSigningKey::MlDsa(key) = signing_key(object)? else {
             return Err(DeviceError::InvalidData);
         };
-        key.sign(request.message, request.context, mode)
-            .map_err(|_| DeviceError::InvalidData)
+        match request.prehash {
+            Some(hash) => key.sign_prehash(request.message, request.context, hash, mode),
+            None => key.sign(request.message, request.context, mode),
+        }
+        .map_err(|_| DeviceError::InvalidData)
     }
 
     /// key-id (BE). Returns ciphertext followed by the 32-byte shared secret.
@@ -5818,7 +5821,7 @@ mod tests {
         let message = b"signature larger than the former transport ceiling";
         let sign_data = [
             DSA_ID.to_be_bytes().as_slice(),
-            &[0, context.len() as u8],
+            &[0, 0, context.len() as u8],
             context,
             message,
         ]
@@ -5835,6 +5838,48 @@ mod tests {
             &signature.data,
         )
         .unwrap();
+
+        for id in [1, 2, 3, 4, 7, 8, 9, 10, 11, 12] {
+            let hash = software_key_core::post_quantum::MlDsaPrehash::from_id(id).unwrap();
+            let digest = vec![0x42; hash.digest_length()];
+            for mode in [0, 1, 2] {
+                let data = [
+                    DSA_ID.to_be_bytes().as_slice(),
+                    &[mode, id, context.len() as u8],
+                    context,
+                    &digest,
+                ]
+                .concat();
+                let frame = Frame::new(CommandCode::SignMlDsa as u8, data.clone()).unwrap();
+                let response = device.execute_inner(admin, &frame);
+                assert_eq!(response.command, CommandCode::SignMlDsa as u8 | 0x80);
+                software_key_core::post_quantum::verify_ml_dsa_prehash(
+                    MlDsaParameterSet::MlDsa87,
+                    &public_dsa.data[1..],
+                    &digest,
+                    context,
+                    &response.data,
+                    hash,
+                )
+                .unwrap();
+                assert!(
+                    verify_ml_dsa(
+                        MlDsaParameterSet::MlDsa87,
+                        &public_dsa.data[1..],
+                        &digest,
+                        context,
+                        &response.data
+                    )
+                    .is_err()
+                );
+                let short = Frame::new(
+                    CommandCode::SignMlDsa as u8,
+                    data[..data.len() - 1].to_vec(),
+                )
+                .unwrap();
+                assert_eq!(device.execute_inner(admin, &short).command, 0x7f);
+            }
+        }
 
         let encapsulate = Frame::new(
             CommandCode::EncapsulateMlKem as u8,
@@ -5927,7 +5972,7 @@ mod tests {
         assert_eq!(public.data.len(), 1 + 1_312);
         let sign = Frame::new(
             CommandCode::SignMlDsa as u8,
-            [72_u16.to_be_bytes().as_slice(), &[0, 0], b"seed import"].concat(),
+            [72_u16.to_be_bytes().as_slice(), &[0, 0, 0], b"seed import"].concat(),
         )
         .unwrap();
         let signature = device.execute_inner(admin, &sign).data;
