@@ -438,6 +438,7 @@ impl<'a> Decode<'a> for SignPssRequest<'a> {
 
 #[derive(Clone, Copy, Debug)]
 pub(crate) struct SignMlDsaRequest<'a> {
+    pub(crate) prehash: Option<software_key_core::post_quantum::MlDsaPrehash>,
     pub(crate) id: u16,
     pub(crate) mode: u8,
     pub(crate) context: &'a [u8],
@@ -448,12 +449,26 @@ impl<'a> Decode<'a> for SignMlDsaRequest<'a> {
     fn decode(reader: &mut Reader<'a>) -> Result<Self> {
         let id = reader.read_u16()?;
         let mode = reader.read_u8()?;
+        let hash = reader.read_u8()?;
+        let prehash = if hash == 0 {
+            None
+        } else {
+            Some(
+                software_key_core::post_quantum::MlDsaPrehash::from_id(hash)
+                    .ok_or(DeviceError::InvalidData)?,
+            )
+        };
         let context = reader.read_u8_sized_slice()?;
+        let message = reader.read_remainder();
+        if prehash.is_some_and(|hash| message.len() != hash.digest_length()) {
+            return Err(DeviceError::WrongLength);
+        }
         Ok(Self {
             id,
             mode,
+            prehash,
             context,
-            message: reader.read_remainder(),
+            message,
         })
     }
 }

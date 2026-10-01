@@ -128,10 +128,21 @@ inside the HSM object and secure session.
 ```text
 key id          u16, big endian
 hedge mode      u8   (0 deterministic, 1 randomized required, 2 randomized preferred)
+prehash         u8   (0 pure; otherwise NIST hash OID final arc)
 context length  u8
 context         context length bytes
-message         remaining bytes
+input           remaining bytes (message for pure; digest for prehash)
 ```
+
+`0` selects pure ML-DSA. Prehash identifiers use the final arc of the NIST hash OID: `1` SHA-256, `2` SHA-384, `3` SHA-512, `4` SHA-224, `7` SHA3-224, `8` SHA3-256, `9` SHA3-384, `10` SHA3-512, `11` SHAKE128 (32 bytes), and `12` SHAKE256 (64 bytes). Other values are rejected.
+
+Hashing is performed by the caller. The device validates the digest length and constructs the FIPS 204 HashML-DSA domain separator, context, and hash OID before signing. Input length is implicit in the request remainder. All clients must use the explicit prehash field, including pure requests.
+
+The PKCS #11 module supports both client-prehashed generic `CKM_HASH_ML_DSA`
+and hash-specific mechanisms which hash message parts on the host. They share
+this request format. The shared-core [published KAT suite](https://github.com/qpernil/software-key-core/blob/main/docs/known-answer-tests.md)
+checks FIPS 203/204 across all parameter sets; pkcs11rs provider tests cover
+single-part/multipart calls through the virtual YubiHSM secure channel.
 
 Its response is the raw FIPS 204 signature. The context is limited to 255
 bytes by the one-byte length and FIPS 204. ML-DSA-87 signatures are 4,627 bytes,
