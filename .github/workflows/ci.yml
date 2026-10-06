@@ -96,8 +96,8 @@ jobs:
           git clone --depth 1 https://github.com/qpernil/virtual-yubikey.git ../virtual-yubikey
           git clone --depth 1 https://github.com/qpernil/raspberry-pi-i2c-target.git ../raspberry-pi-i2c-target
 
-      - name: Install Rust 1.94
-        uses: dtolnay/rust-toolchain@1.94.0
+      - name: Install Rust 1.95
+        uses: dtolnay/rust-toolchain@1.95.0
 
       - name: Install native dependencies
         run: |
