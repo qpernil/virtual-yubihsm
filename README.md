@@ -18,6 +18,9 @@ qualification, persistence, wire-format, and virtual-extension references.
 Implementation provenance and the independent compatibility boundary are
 recorded in [PROVENANCE.md](PROVENANCE.md).
 
+Rust 1.95 or newer is required for the core, USB worker, I2C frontend, and
+qualification tools. CI checks this minimum alongside stable Rust.
+
 ## Architecture
 
 ```text
