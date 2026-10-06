@@ -14,6 +14,7 @@ use std::{
     sync::{
         Arc,
         atomic::{AtomicBool, Ordering},
+        mpsc::{self, Receiver, SyncSender},
     },
     thread,
 };
@@ -493,7 +494,7 @@ impl Endpoints {
 }
 
 struct EndpointRuntime {
-    thread: thread::JoinHandle<io::Result<()>>,
+    threads: Vec<thread::JoinHandle<io::Result<()>>>,
 }
 
 impl EndpointRuntime {
@@ -504,21 +505,45 @@ impl EndpointRuntime {
         display_activity: crate::display::Activity,
         lifecycle: Arc<EndpointLifecycle>,
     ) -> io::Result<Self> {
+        let Endpoints { output, input } = endpoints;
+        let (responses, receiver) = mpsc::sync_channel(1);
+        let response_thread =
+            thread::Builder::new()
+                .name("yubihsm-in".to_owned())
+                .spawn(move || {
+                    let result = serve_responses(input, receiver);
+                    if result.is_err() {
+                        stop.store(true, Ordering::Relaxed);
+                    }
+                    result
+                })?;
         let thread = thread::Builder::new()
             .name("yubihsm-usb".to_owned())
-            .spawn(move || serve_endpoint(endpoints, device, stop, display_activity, lifecycle))?;
-        Ok(Self { thread })
+            .spawn(move || {
+                serve_endpoint(output, responses, device, stop, display_activity, lifecycle)
+            })?;
+        Ok(Self {
+            threads: vec![thread, response_thread],
+        })
     }
 
     fn shutdown(self) -> io::Result<()> {
-        self.thread
-            .join()
-            .map_err(|_| io::Error::other("YubiHSM endpoint thread panicked"))?
+        let mut result = Ok(());
+        for thread in self.threads {
+            let joined = thread
+                .join()
+                .map_err(|_| io::Error::other("YubiHSM endpoint thread panicked"))?;
+            if let Err(error) = joined {
+                result = Err(error);
+            }
+        }
+        result
     }
 }
 
 fn serve_endpoint(
-    mut endpoints: Endpoints,
+    mut output: File,
+    responses: SyncSender<Vec<u8>>,
     device: PersistentDeviceHandle,
     stop: &'static AtomicBool,
     display_activity: crate::display::Activity,
@@ -535,7 +560,7 @@ fn serve_endpoint(
                 if stop.load(Ordering::Relaxed) {
                     return Ok(());
                 }
-                match endpoints.output.read(&mut request) {
+                match output.read(&mut request) {
                     Ok(0) => {}
                     Ok(length) => {
                         let activity = display_activity.begin();
@@ -558,7 +583,9 @@ fn serve_endpoint(
                             },
                         )?;
                         log_outer_failure(outer_request.as_ref(), &response, length);
-                        write_transfer(&mut endpoints.input, &response)?;
+                        responses
+                            .send(response)
+                            .map_err(|_| io::Error::other("YubiHSM response writer stopped"))?;
                         drop(activity);
                     }
                     Err(error) if error.kind() == io::ErrorKind::Interrupted => {}
@@ -662,7 +689,24 @@ fn command_name(command: u8) -> String {
         .map_or_else(|| "Unknown".to_owned(), |command| format!("{command:?}"))
 }
 
-fn write_transfer(file: &mut File, bytes: &[u8]) -> io::Result<()> {
+fn serve_responses(mut input: impl Write, responses: Receiver<Vec<u8>>) -> io::Result<()> {
+    while let Ok(response) = responses.recv() {
+        write_response(&mut input, &response)?;
+    }
+    Ok(())
+}
+
+fn write_response(file: &mut impl Write, bytes: &[u8]) -> io::Result<()> {
+    write_transfer(file, bytes)?;
+    // Both official HSM transports read into a larger buffer and expect a
+    // short packet to terminate responses that end on a USB packet boundary.
+    if !bytes.is_empty() && bytes.len().is_multiple_of(MAX_PACKET_SIZE as usize) {
+        write_transfer(file, &[])?;
+    }
+    Ok(())
+}
+
+fn write_transfer(file: &mut impl Write, bytes: &[u8]) -> io::Result<()> {
     loop {
         match file.write(bytes) {
             Ok(length) if length == bytes.len() => return Ok(()),
@@ -722,6 +766,77 @@ fn data_error(message: impl Into<String>) -> io::Error {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn bulk_response_lengths_include_the_header_when_terminating_packets() {
+        #[derive(Default)]
+        struct Writes(Vec<usize>);
+        impl Write for Writes {
+            fn write(&mut self, bytes: &[u8]) -> io::Result<usize> {
+                self.0.push(bytes.len());
+                Ok(bytes.len())
+            }
+            fn flush(&mut self) -> io::Result<()> {
+                Ok(())
+            }
+        }
+        for (length, expected) in [
+            (63, vec![63]),
+            (64, vec![64, 0]),
+            (65, vec![65]),
+            (127, vec![127]),
+            (128, vec![128, 0]),
+            (129, vec![129]),
+            (8191, vec![8191]),
+            (8192, vec![8192, 0]),
+        ] {
+            let frame = Frame::response(CommandCode::Echo as u8, vec![0; length - 3]).encode();
+            let mut writes = Writes::default();
+            write_response(&mut writes, &frame).unwrap();
+            assert_eq!(writes.0, expected);
+        }
+    }
+
+    #[test]
+    fn pending_response_zlp_preserves_the_next_response_order() {
+        use std::time::Duration;
+        struct Endpoint {
+            written: mpsc::Sender<usize>,
+            release_zlp: Receiver<()>,
+        }
+        impl Write for Endpoint {
+            fn write(&mut self, bytes: &[u8]) -> io::Result<usize> {
+                self.written.send(bytes.len()).unwrap();
+                if bytes.is_empty() {
+                    self.release_zlp.recv().unwrap();
+                }
+                Ok(bytes.len())
+            }
+            fn flush(&mut self) -> io::Result<()> {
+                Ok(())
+            }
+        }
+        let (written, observed) = mpsc::channel();
+        let (release, release_zlp) = mpsc::channel();
+        let (sender, receiver) = mpsc::sync_channel(1);
+        let writer = thread::spawn(move || {
+            serve_responses(
+                Endpoint {
+                    written,
+                    release_zlp,
+                },
+                receiver,
+            )
+        });
+        sender.send(vec![0; 64]).unwrap();
+        assert_eq!(observed.recv_timeout(Duration::from_secs(1)).unwrap(), 64);
+        assert_eq!(observed.recv_timeout(Duration::from_secs(1)).unwrap(), 0);
+        sender.try_send(vec![0; 65]).unwrap();
+        release.send(()).unwrap();
+        assert_eq!(observed.recv_timeout(Duration::from_secs(1)).unwrap(), 65);
+        drop(sender);
+        writer.join().unwrap().unwrap();
+    }
 
     #[test]
     fn rejects_relative_state_directories() {
