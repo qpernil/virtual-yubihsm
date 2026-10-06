@@ -9,6 +9,11 @@ authentication derives its static keys locally. Asymmetric authentication
 delegates the static private-key operation to a credential provider and retains
 only the resulting per-session keys.
 
+The virtual YubiHSM workspace requires Rust 1.95, matching the optional qualification
+dependencies `platform-credential` and `yubihsm-auth-client`
+from `pkcs11rs`. The same minimum applies to the core, USB worker, I2C frontend,
+and qualification binary.
+
 ## Target matrix
 
 | Target | Adapter | What it qualifies |
