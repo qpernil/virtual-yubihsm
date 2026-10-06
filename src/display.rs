@@ -39,6 +39,10 @@ const IDLE_CADENCE: Cadence =
     Cadence::new(Duration::from_millis(1_500), Duration::from_millis(1_500));
 #[cfg(target_os = "linux")]
 const MINIMUM_EDGE: Duration = Duration::from_millis(8);
+#[cfg(target_os = "linux")]
+const MINIMUM_ACTIVITY_ON: Duration = Duration::from_micros(33_500);
+#[cfg(target_os = "linux")]
+const MINIMUM_ACTIVITY_OFF: Duration = Duration::from_millis(20);
 
 #[cfg(target_os = "linux")]
 const fn indicator_policy() -> Policy {
@@ -50,6 +54,8 @@ const fn indicator_policy() -> Policy {
         },
         MINIMUM_EDGE,
     )
+    .with_minimum_activity_on(MINIMUM_ACTIVITY_ON)
+    .with_minimum_activity_off(MINIMUM_ACTIVITY_OFF)
 }
 
 #[cfg(target_os = "linux")]
@@ -410,5 +416,7 @@ mod tests {
             }
         );
         assert_eq!(policy.minimum_edge, Duration::from_millis(8));
+        assert_eq!(policy.minimum_activity_off, Duration::from_millis(20));
+        assert_eq!(policy.minimum_activity_on, Duration::from_micros(33_500));
     }
 }
