@@ -329,12 +329,24 @@ worker samples its initial active-low GPIO value, coalesces notifications, and
 always converges USB presence to the latest physical state. A dropped wake can
 therefore never strand the worker in the ejected state.
 
-The bulk endpoint thread starts only after the supervisor reports `Enable`.
-If FunctionFS cancels I/O on disable or unbind, the thread parks until a newer
+Bulk command reception starts only after the supervisor reports `Enable`.
+If FunctionFS cancels OUT I/O on disable or unbind, reception parks until a newer
 endpoint activation arrives. Quiescence wakes it to exit, so the worker never
 re-enters a disabled endpoint while the supervisor is waiting for
 `Quiesced`.
 Worker shutdown also powers the display off. The worker refuses to run as root.
+
+YubiHSM USB uses its native three-byte command/length header over 64-byte bulk
+endpoints. The official Yubico connector and direct USB library send a
+zero-length packet (ZLP) after packet-aligned commands; the worker's bounded
+transfer read consumes that terminator. Every packet-aligned response, including
+the header in its length, also ends with a ZLP. One ordered response writer with
+a bounded queue keeps OUT reception independent of a pending IN terminator.
+Clients must read beyond the response length to consume that terminator; the
+shared pkcs11rs transport reads one packet beyond the 8192-byte frame limit.
+The upstream Yubico connector's fixed 8192-byte read cannot consume a trailing
+ZLP on an exact 8192-byte unencrypted response in the same read. Use the
+pkcs11rs client for that maximum-size virtual extension boundary.
 
 ### Display and blink lifecycle
 
