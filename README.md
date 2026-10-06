@@ -363,20 +363,22 @@ consequence of the current USB and command state:
 | A command is running | Use the measured 100 ms fast cycle: hold on for 67 ms and off for 33 ms. |
 | An authenticated `Blink Device` duration remains | Continue using the same fast cycle after returning the command response. |
 
-Command activity starts an LED edge. The next fast delay follows the resulting
-state: 67 ms after an on edge and 33 ms after an off edge. Fast activity takes
-precedence over the slow idle cadence. Activity always establishes an on phase;
-if slow idle is already on, an 8 ms off separator makes the following on edge
-visible. A short command then finishes off, while a sustained command continues
-directly into the 67/33 ms cadence. Periodic idle restarts from off afterward.
-The stopped state always forces the LED off.
+Command activity immediately interrupts slow idle or `Blink Device` blinking.
+Before its on phase, activity ensures at least 20 ms of off time. A lit LED
+turns off for that interval; an already-dark LED waits only for any remaining
+time since its last off edge, or turns on immediately if 20 ms has elapsed.
+Completed short commands get a 33.5 ms minimum on pulse; sustained work keeps
+the measured 67/33 ms cadence. Completion ends the activity indication as soon as its minimum on time
+is met. After a final 8 ms off boundary, slow idle blinking restarts with its
+full 1.5-second off phase, keeping its long on phase distinct from command
+activity. An active `Blink Device` pattern resumes its fast on phase after the
+boundary. The stopped state always forces the LED off.
 
 A monotonic command epoch preserves a command that starts and finishes during a
-synchronous frame write. Activity arriving while a pulse is already visible may
-retain one additional pulse; further activity coalesces rather than building a
-delayed animation queue. Edges begin at least 8 ms apart, with renderer time
-included in that interval rather than added to it. A slower display therefore
-becomes the natural rate limit.
+synchronous frame write. Commands coalesce into the current indication without
+extending its minimum on time or queuing replay pulses. Command execution never
+waits for rendering. Renderer time counts toward each interval, and a slower
+display limits the cadence without replaying missed transitions.
 
 `Blink Device` is asynchronous from the caller's perspective: its response is
 returned before the requested blinking ends. A small worker-side timer retains
