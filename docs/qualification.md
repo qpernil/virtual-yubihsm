@@ -176,6 +176,29 @@ loopback or a private test network. TLS and mutual-TLS policy are connector
 tests, while this suite qualifies the YubiHSM frame behavior behind the HTTP
 boundary.
 
+## USB packet-boundary qualification
+
+The read-only native USB Echo matrix lives in the shared `pkcs11rs-local-hardware`
+transport tests. It selects an explicit virtual-device serial and also requires
+manufacturer `Virtual USB Gadget`, so it cannot silently target a physical HSM.
+Run the [USB Echo workflow](https://github.com/qpernil/pkcs11rs/blob/master/docs/connector.md#usb-echo-qualification)
+from a `pkcs11rs` checkout with only the intended virtual HSM exposed.
+
+The verified matrix performs 80 exchanges through blocking/asynchronous and
+borrowed/owned-buffer APIs. Total frame lengths include 63/64/65, 127/128/129,
+191/192/193, 319/320/321, 3135/3136/3137, and 8191/8192 bytes, followed by a
+short command. Exact-fit caller buffers check that packet-aligned responses do
+not leave a terminator for the next exchange. The requests are unencrypted Echo
+commands; no authentication, key changes, or resets are required. Official
+`yubihsm-shell` direct USB Echo was also verified through 3136-byte frames, within
+that client's native size limit.
+
+These checks qualify native YubiHSM bulk framing, not CCID. The worker sends
+aligned IN replies with a ZLP, and clients send aligned OUT commands with a ZLP.
+Its ordered IN writer keeps command reception independent of a pending response
+terminator. USB framing is outside the core and does not apply to embedded or
+I2C frame adapters.
+
 ## Adding scenarios
 
 Each expectation belongs in the common runner unless it is inherently tied to
