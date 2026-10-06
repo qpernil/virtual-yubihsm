@@ -87,7 +87,7 @@ The deliberate differences from physical firmware are catalogued in
 [virtual extensions](docs/virtual-extensions.md).
 Three compile-time firmware profiles keep the device identity explicit. The
 default `firmware-full` profile enables every virtual extension;
-`firmware-secure-channel` enables only the protected client-authentication
+`firmware-protected-derivation` enables only the protected client-authentication
 extensions, and `firmware-yubihsm2` provides the physical-compatible baseline.
 See [virtual extensions](docs/virtual-extensions.md#firmware-profiles) for the
 motivation and exact surfaces.

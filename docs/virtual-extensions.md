@@ -73,14 +73,20 @@ There are three deployment profiles:
 | Cargo feature | Algorithms and commands | Purpose |
 | --- | --- | --- |
 | `firmware-yubihsm2` | Algorithms 1–55 and the YubiHSM 2-compatible command surface | Exercise physical-device compatibility without virtual extension commands |
-| `firmware-secure-channel` | Baseline plus `SessionObject` and `DeriveEcdhKdf` | Keep client-side SCP11 ephemeral keys and intermediate agreements inside the device |
-| `firmware-full` | Secure-channel profile plus X25519, X448, Ed448, ML-DSA, ML-KEM, concrete hybrid PQ/T KEMs, and direct RSA wrapping | Fully featured virtual deployments and interoperability experiments |
+| `firmware-protected-derivation` | Baseline plus `SessionObject` and `DeriveEcdhKdf` | Keep client-side SCP11 ephemeral keys and intermediate agreements inside the device |
+| `firmware-full` | Protected-derivation profile plus X25519, X448, Ed448, ML-DSA, ML-KEM, concrete hybrid PQ/T KEMs, and direct RSA wrapping | Fully featured virtual deployments and interoperability experiments |
 
-`firmware-full` is the default. Build either restricted profile explicitly:
+`firmware-full` is the default. Every profile includes the ordinary authenticated,
+encrypted YubiHSM session protocol. `firmware-protected-derivation` names
+additional device-side derivation commands and protected volatile objects,
+not a choice between SCP03 and SCP11. These extensions can protect the
+ephemeral keys and intermediate agreements used by an SCP11 client.
+
+Build either restricted profile explicitly:
 
 ```sh
 cargo build --no-default-features --features firmware-yubihsm2
-cargo build --no-default-features --features firmware-secure-channel
+cargo build --no-default-features --features firmware-protected-derivation
 ```
 
 The USB worker, I2C frontend, qualification binary, core, and embedded
@@ -89,11 +95,11 @@ also enables its embedded persistent runtime.
 
 Two core and connector features are reserved for tests:
 `test-firmware-prefixed-ecdh` and `test-firmware-session-objects`. Each exposes
-only one secure-channel extension so CI can verify the client's strongest-to-
+only one protected-derivation extension so CI can verify the client's strongest-to-
 weakest path selection. They are not deployment profiles.
 
 This configurability has three purposes. The baseline catches accidental use
-of virtual commands when testing physical compatibility. The secure-channel
+of virtual commands when testing physical compatibility. The protected-derivation
 profile provides the smallest extension that improves protection of client
 credentials. The full profile keeps post-quantum and other experimental
 algorithms available without implying that physical firmware implements them.

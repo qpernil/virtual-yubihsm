@@ -6,7 +6,7 @@
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum FirmwareProfile {
     YubiHsm2,
-    SecureChannel,
+    ProtectedDerivation,
     Full,
     TestPrefixedEcdh,
     TestSessionObjects,
@@ -16,13 +16,13 @@ impl FirmwareProfile {
     pub const fn compiled() -> Self {
         if cfg!(feature = "firmware-full") {
             Self::Full
-        } else if cfg!(feature = "firmware-secure-channel")
+        } else if cfg!(feature = "firmware-protected-derivation")
             || cfg!(all(
                 feature = "test-firmware-prefixed-ecdh",
                 feature = "test-firmware-session-objects"
             ))
         {
-            Self::SecureChannel
+            Self::ProtectedDerivation
         } else if cfg!(feature = "test-firmware-prefixed-ecdh") {
             Self::TestPrefixedEcdh
         } else if cfg!(feature = "test-firmware-session-objects") {
@@ -43,14 +43,14 @@ impl FirmwareProfile {
     pub const fn prefixed_ecdh(self) -> bool {
         matches!(
             self,
-            Self::SecureChannel | Self::Full | Self::TestPrefixedEcdh
+            Self::ProtectedDerivation | Self::Full | Self::TestPrefixedEcdh
         )
     }
 
     pub const fn session_objects(self) -> bool {
         matches!(
             self,
-            Self::SecureChannel | Self::Full | Self::TestSessionObjects
+            Self::ProtectedDerivation | Self::Full | Self::TestSessionObjects
         )
     }
 

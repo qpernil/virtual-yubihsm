@@ -9,7 +9,7 @@ worker subprocess internally.
 
 The connector compiles the core with default features disabled and forwards
 the same three firmware profiles as `firmware-yubihsm2`,
-`firmware-secure-channel`, and `firmware-full`. Selecting a profile also
+`firmware-protected-derivation`, and `firmware-full`. Selecting a profile also
 enables the embedded runtime.
 
 One protocol implementation and one persistent runtime serve every deployed
@@ -153,7 +153,7 @@ simultaneously.
 ## Configuration
 
 Embedded devices are enabled on Unix by building `pkcs11rs-connector` with one
-of `firmware-yubihsm2`, `firmware-secure-channel`, or `firmware-full`. That
+of `firmware-yubihsm2`, `firmware-protected-derivation`, or `firmware-full`. That
 feature selects the core firmware profile and enables the embedded runtime.
 Instances and common persistence policy are configured with:
 

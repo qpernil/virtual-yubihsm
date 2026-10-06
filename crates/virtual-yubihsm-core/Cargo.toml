@@ -10,7 +10,7 @@ publish = false
 [features]
 default = ["firmware-full"]
 firmware-yubihsm2 = []
-firmware-secure-channel = []
+firmware-protected-derivation = []
 firmware-full = []
 test-firmware-prefixed-ecdh = []
 test-firmware-session-objects = []
