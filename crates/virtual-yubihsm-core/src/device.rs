@@ -4506,7 +4506,7 @@ mod tests {
         BLOCK_SIZE, cbc_decrypt, cbc_encrypt, cmac, encrypt_block, pad, scp03_kdf, unpad,
     };
     #[cfg(any(
-        feature = "firmware-secure-channel",
+        feature = "firmware-protected-derivation",
         feature = "firmware-full",
         feature = "test-firmware-prefixed-ecdh",
         feature = "test-firmware-session-objects"
@@ -4515,7 +4515,7 @@ mod tests {
     use p256::elliptic_curve::sec1::ToSec1Point;
     use rsa::{BigUint, RsaPublicKey};
     #[cfg(any(
-        feature = "firmware-secure-channel",
+        feature = "firmware-protected-derivation",
         feature = "firmware-full",
         feature = "test-firmware-session-objects"
     ))]
@@ -4613,7 +4613,7 @@ mod tests {
     }
 
     #[cfg(any(
-        feature = "firmware-secure-channel",
+        feature = "firmware-protected-derivation",
         feature = "firmware-full",
         feature = "test-firmware-prefixed-ecdh"
     ))]
@@ -4670,7 +4670,7 @@ mod tests {
     }
 
     #[cfg(any(
-        feature = "firmware-secure-channel",
+        feature = "firmware-protected-derivation",
         feature = "firmware-full",
         feature = "test-firmware-session-objects"
     ))]
@@ -4688,7 +4688,7 @@ mod tests {
     }
 
     #[cfg(any(
-        feature = "firmware-secure-channel",
+        feature = "firmware-protected-derivation",
         feature = "firmware-full",
         feature = "test-firmware-session-objects"
     ))]
@@ -4698,7 +4698,7 @@ mod tests {
     }
 
     #[cfg(any(
-        feature = "firmware-secure-channel",
+        feature = "firmware-protected-derivation",
         feature = "firmware-full",
         feature = "test-firmware-session-objects"
     ))]
@@ -4716,7 +4716,7 @@ mod tests {
 
     #[test]
     #[cfg(any(
-        feature = "firmware-secure-channel",
+        feature = "firmware-protected-derivation",
         feature = "firmware-full",
         feature = "test-firmware-session-objects"
     ))]
@@ -4813,7 +4813,7 @@ mod tests {
 
     #[test]
     #[cfg(any(
-        feature = "firmware-secure-channel",
+        feature = "firmware-protected-derivation",
         feature = "firmware-full",
         feature = "test-firmware-session-objects"
     ))]
@@ -6552,7 +6552,7 @@ mod tests {
 
     #[test]
     #[cfg(any(
-        feature = "firmware-secure-channel",
+        feature = "firmware-protected-derivation",
         feature = "firmware-full",
         feature = "test-firmware-prefixed-ecdh"
     ))]

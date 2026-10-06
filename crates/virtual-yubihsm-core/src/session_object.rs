@@ -132,7 +132,7 @@ impl SessionObjects {
     #[cfg(all(
         test,
         any(
-            feature = "firmware-secure-channel",
+            feature = "firmware-protected-derivation",
             feature = "firmware-full",
             feature = "test-firmware-session-objects"
         )
