@@ -277,7 +277,8 @@ header/body reads, and READY directly for lab diagnostics.
 
 ## Hardware validation
 
-The bench uses build-host as controller and two Pi 3B+ targets at `0x24` and
+The bench uses build-host as controller and the 1 GiB Pi 3B targets
+`i2c-target-1` and `i2c-target-2` at `0x24` and
 `0x25`, with READY inputs GPIO23 and GPIO22. Each target is profile-launched as the configured unprivileged user with inherited FD 3 and separate qualification state. The ABI 3 handshake
 requires coordinated updates; qualification must cover both authenticated
 compatibility and simultaneous traffic during a slow command. See the driver
