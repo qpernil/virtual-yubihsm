@@ -275,7 +275,7 @@ header/body reads, and READY directly for lab diagnostics.
 
 ## Hardware validation
 
-The bench uses ubuntu4 as controller and the 1 GiB Pi 3B targets
+The bench uses ubuntu4 as controller and the 1 GiB Pi 3B+ targets
 `raspberrypi-1` and `raspberrypi-2` at `0x24` and
 `0x25`, with READY inputs GPIO23 and GPIO22. Each target is profile-launched as
 `per` with inherited FD 3 and separate qualification state. The ABI 3 handshake
