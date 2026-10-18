@@ -684,7 +684,7 @@ checksum = "b6d2cec3eae94f9f509c767b45932f1ada8350c4bdb85af2fcab4a3c14807981"
 [[package]]
 name = "ml-dsa"
 version = "0.1.1"
-source = "git+https://github.com/qpernil/signatures.git?rev=e06d2e28699428fbcc135c388516883bbb71f170#e06d2e28699428fbcc135c388516883bbb71f170"
+source = "git+https://github.com/qpernil/signatures.git?rev=0488ce78a45e955a1a49104fa23ce5be461d1243#0488ce78a45e955a1a49104fa23ce5be461d1243"
 dependencies = [
  "const-oid 0.10.2",
  "crypto-common 0.2.2",
