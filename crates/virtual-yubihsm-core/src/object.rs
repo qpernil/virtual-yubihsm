@@ -436,7 +436,7 @@ fn typed_private_material(info: &ObjectInfo, encoded: &[u8]) -> Result<ObjectMat
             return Err(DeviceError::InvalidData);
         }
         let (p, q) = encoded.split_at(expected / 2);
-        SoftwareSigningKey::from_rsa_primes(p, q, &[1, 0, 1])
+        SoftwareSigningKey::restore_rsa_primes(p, q, &[1, 0, 1])
     } else {
         SoftwareSigningKey::from_serialized_for_kind(key_kind(algorithm)?, encoded)
     }

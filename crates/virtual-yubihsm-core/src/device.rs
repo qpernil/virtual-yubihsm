@@ -1774,10 +1774,6 @@ impl Device {
         let expected_length = algorithm
             .asymmetric_key_length()
             .ok_or(DeviceError::InvalidData)?;
-        let material = asymmetric_key_material(algorithm, generate, supplied)?;
-        if material.len() != expected_length {
-            return Err(DeviceError::InvalidData);
-        }
         let id = self.resolve_id(ObjectType::AsymmetricKey, header.requested_id)?;
         let capability = if generate {
             Capability::GenerateAsymmetricKey
@@ -1799,9 +1795,17 @@ impl Device {
             delegated_capabilities: CapabilitySet::NONE,
         };
         authorization.authorize_create(&info, capability)?;
+        let material = asymmetric_key_material(algorithm, generate, supplied)?;
+        if material.len() != expected_length {
+            return Err(DeviceError::InvalidData);
+        }
         let record = ObjectRecord { info, material };
         record.validate()?;
-        self.write_object(record)?;
+        if generate {
+            self.write_object(record)?;
+        } else {
+            self.write_imported_object(record)?;
+        }
         Ok(id.to_be_bytes().to_vec())
     }
 
@@ -2620,18 +2624,6 @@ impl Device {
             }
             _ => return Err(DeviceError::InvalidData),
         };
-        let material = if algorithm.is_rsa_key() {
-            asymmetric_key_material(algorithm, generate, request.material)?
-        } else if generate {
-            let mut secret = vec![0; key_length];
-            getrandom::fill(&mut secret).map_err(|_| DeviceError::StorageFailed)?;
-            ObjectMaterial::Secret(secret)
-        } else {
-            if request.material.len() != key_length {
-                return Err(DeviceError::WrongLength);
-            }
-            ObjectMaterial::Secret(request.material.to_vec())
-        };
         let id = self.resolve_id(ObjectType::WrapKey, header.requested_id)?;
         let capability = if generate {
             Capability::GenerateWrapKey
@@ -2659,9 +2651,25 @@ impl Device {
             delegated_capabilities: request.delegated_capabilities,
         };
         authorization.authorize_create(&info, capability)?;
+        let material = if algorithm.is_rsa_key() {
+            asymmetric_key_material(algorithm, generate, request.material)?
+        } else if generate {
+            let mut secret = vec![0; key_length];
+            getrandom::fill(&mut secret).map_err(|_| DeviceError::StorageFailed)?;
+            ObjectMaterial::Secret(secret)
+        } else {
+            if request.material.len() != key_length {
+                return Err(DeviceError::WrongLength);
+            }
+            ObjectMaterial::Secret(request.material.to_vec())
+        };
         let record = ObjectRecord { info, material };
         record.validate()?;
-        self.write_object(record)?;
+        if generate {
+            self.write_object(record)?;
+        } else {
+            self.write_imported_object(record)?;
+        }
         Ok(id.to_be_bytes().to_vec())
     }
 
@@ -2780,7 +2788,7 @@ impl Device {
             record.info.id.to_be_bytes().as_slice(),
         ]
         .concat();
-        self.write_object(record)?;
+        self.write_imported_object(record)?;
         Ok(response)
     }
 
@@ -2906,7 +2914,7 @@ impl Device {
             record.info.id.to_be_bytes().as_slice(),
         ]
         .concat();
-        self.write_object(record)?;
+        self.write_imported_object(record)?;
         Ok(response)
     }
 
@@ -2996,7 +3004,7 @@ impl Device {
             record.info.id.to_be_bytes().as_slice(),
         ]
         .concat();
-        self.write_object(record)?;
+        self.write_imported_object(record)?;
         Ok(response)
     }
 
@@ -3400,9 +3408,61 @@ impl Device {
             .map_or(0, |generation| generation.wrapping_add(1))
     }
 
+    // Protocol imports require local key validation. Trusted provisioning,
+    // persisted-state restoration and ordinary key use do not repeat this work.
+    fn write_imported_object(&mut self, mut record: ObjectRecord) -> Result<()> {
+        record.promote_private_material()?;
+        record.validate()?;
+        if let ObjectMaterial::SigningKey(SoftwareSigningKey::Rsa(key)) = &record.material {
+            use software_key_core::rsa_private_validation::RsaPrivateValidationError;
+            let expected_bits = Algorithm::from_byte(record.info.algorithm)
+                .and_then(Algorithm::asymmetric_key_length)
+                .ok_or(DeviceError::InvalidData)?
+                * 8;
+            if key.modulus_bits() != expected_bits {
+                return Err(DeviceError::InvalidData);
+            }
+            // SP 800-56B Rev. 2 §6.4.1.2.2 plus the pair-wise consistency
+            // test in §6.4.1.1, before any object/sequence/persistent mutation.
+            let validated = key.validate_for_import().map_err(|error| match error {
+                RsaPrivateValidationError::InvalidPrivateKey => DeviceError::InvalidData,
+                RsaPrivateValidationError::RandomnessUnavailable => DeviceError::StorageFailed,
+            })?;
+            record.material = ObjectMaterial::SigningKey(SoftwareSigningKey::Rsa(validated));
+        }
+        self.write_object(record)
+    }
+
     fn write_object(&mut self, mut record: ObjectRecord) -> Result<()> {
         record.promote_private_material()?;
         record.validate()?;
+        // Every protocol import path reaches this point after authorization,
+        // including wrapped-object imports. Validate before consuming an object
+        // generation or changing the store. Persistence reads keep their cheap
+        // structural checks; trusted state is not repeatedly primality-tested.
+        if record.info.object_type == ObjectType::PublicWrapKey {
+            use software_key_core::rsa_public_validation::{
+                RsaPublicValidationError, validate_rsa_public_key,
+            };
+            let algorithm = Algorithm::from_byte(record.info.algorithm)
+                .filter(|algorithm| algorithm.is_rsa_key())
+                .ok_or(DeviceError::InvalidData)?;
+            let ObjectMaterial::Public(modulus) = &record.material else {
+                return Err(DeviceError::InvalidData);
+            };
+            validate_rsa_public_key(
+                modulus,
+                &[1, 0, 1],
+                algorithm
+                    .asymmetric_key_length()
+                    .ok_or(DeviceError::InvalidData)?
+                    * 8,
+            )
+            .map_err(|error| match error {
+                RsaPublicValidationError::InvalidPublicKey => DeviceError::InvalidData,
+                RsaPublicValidationError::RandomnessUnavailable => DeviceError::StorageFailed,
+            })?;
+        }
         let key = record.info.key();
         let generation = self.next_generation(key.id);
         record.info.sequence = generation as u8;
@@ -6250,6 +6310,111 @@ mod tests {
         )
         .unwrap();
         assert_eq!(device.execute_inner(admin, &decrypt).data, plaintext);
+    }
+
+    #[test]
+    fn rsa_creation_is_authorized_before_processing_private_material() {
+        let mut device = Device::factory_default(DeviceConfig::default());
+        let admin = device.session_authorization(1).unwrap();
+        let restricted = SessionAuthorization {
+            capabilities: CapabilitySet::NONE,
+            ..admin
+        };
+        let before = device.persistent_state().unwrap();
+        for command in [CommandCode::PutAsymmetricKey, CommandCode::PutWrapKey] {
+            let mut data = 402u16.to_be_bytes().to_vec();
+            data.resize(42, 0);
+            data.extend_from_slice(&1u16.to_be_bytes());
+            data.extend_from_slice(&CapabilitySet::NONE.to_bytes());
+            data.push(Algorithm::Rsa2048 as u8);
+            if command == CommandCode::PutWrapKey {
+                data.extend_from_slice(&CapabilitySet::NONE.to_bytes());
+            }
+            // Both factors are composite but pass basic exponent reconstruction.
+            data.extend_from_slice(&[0xff; 256]);
+            let frame = Frame::new(command as u8, data).unwrap();
+            assert_eq!(
+                device.execute_inner(restricted, &frame),
+                Frame::error(DeviceError::InsufficientPermissions)
+            );
+            assert_eq!(
+                device.execute_inner(admin, &frame),
+                Frame::error(DeviceError::InvalidData)
+            );
+            assert_eq!(device.persistent_state().unwrap(), before);
+        }
+        let malformed = wrapped_test_record(
+            403,
+            ObjectType::AsymmetricKey,
+            Algorithm::Rsa2048,
+            ObjectMaterial::Secret(vec![0xff; 256]),
+        );
+        assert_eq!(
+            device.write_imported_object(malformed),
+            Err(DeviceError::InvalidData)
+        );
+        assert_eq!(device.persistent_state().unwrap(), before);
+    }
+
+    #[test]
+    fn public_wrap_import_validates_before_mutating_the_store_or_sequence() {
+        fn put(id: u16, modulus: &[u8]) -> Frame {
+            let mut data = id.to_be_bytes().to_vec();
+            data.resize(42, 0);
+            data.extend_from_slice(&1u16.to_be_bytes());
+            data.extend_from_slice(&CapabilitySet::NONE.to_bytes());
+            data.push(Algorithm::Rsa2048 as u8);
+            data.extend_from_slice(&CapabilitySet::NONE.to_bytes());
+            data.extend_from_slice(modulus);
+            Frame::new(CommandCode::PutPublicWrapKey as u8, data).unwrap()
+        }
+        let key = SoftwareSigningKey::generate_rsa(2048).unwrap();
+        let SoftwarePublicKey::Rsa { modulus, .. } = key.public_key() else {
+            unreachable!()
+        };
+        let mut device = Device::factory_default(DeviceConfig::default());
+        let admin = device.session_authorization(1).unwrap();
+        let before = device.persistent_state().unwrap();
+        // 2^2048 - 1 has the right width and is odd, but has small factors.
+        assert_eq!(
+            device.execute_inner(admin, &put(400, &[0xff; 256])),
+            Frame::error(DeviceError::InvalidData)
+        );
+        assert_eq!(device.persistent_state().unwrap(), before);
+        assert_eq!(
+            device.execute_inner(admin, &put(400, &modulus)).data,
+            400u16.to_be_bytes()
+        );
+        let identity = ObjectKey {
+            object_type: ObjectType::PublicWrapKey,
+            id: 400,
+        };
+        let accepted = device.object(identity).unwrap().clone();
+        let after = device.persistent_state().unwrap();
+        // An occupied identifier is rejected before replacing any key.
+        assert_eq!(
+            device.execute_inner(admin, &put(400, &[0xff; 256])),
+            Frame::error(DeviceError::ObjectExists)
+        );
+        assert_eq!(device.object(identity), Some(&accepted));
+        assert_eq!(device.persistent_state().unwrap(), after);
+        let restored = Device::from_persistent_state(DeviceConfig::default(), &after).unwrap();
+        assert_eq!(restored.object(identity), Some(&accepted));
+    }
+
+    #[test]
+    fn wrapped_public_keys_cannot_bypass_validation_at_the_object_store() {
+        let mut device = Device::factory_default(DeviceConfig::default());
+        let before = device.persistent_state().unwrap();
+        let record = wrapped_test_record(
+            401,
+            ObjectType::PublicWrapKey,
+            Algorithm::Rsa2048,
+            ObjectMaterial::Public(vec![0xff; 256]),
+        );
+        let decoded = decode_wrapped_object(&encode_wrapped_object(&record).unwrap()).unwrap();
+        assert_eq!(device.write_object(decoded), Err(DeviceError::InvalidData));
+        assert_eq!(device.persistent_state().unwrap(), before);
     }
 
     #[test]
