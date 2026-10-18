@@ -60,6 +60,15 @@ order while command handlers operate on named fields. Serde remains reserved
 for durable CBOR state, whose self-describing data model fits it better than
 the positional command protocol.
 
+RSA generation and private import use the shared
+[`software-key-core` RSA boundary](https://github.com/qpernil/software-key-core/blob/main/docs/rsa-key-validation.md).
+It validates factor primality, ranges, separation and exponent consistency,
+recalculates CRT parameters, and performs a pairwise test. Public-only imports
+retain SP 800-89 partial validation. Supported algorithms and the fixed RSA
+exponent 65537 remain protocol policy. Wrapped private imports normalize their
+prime-factor representation; supplied CRT values are discarded. Trusted
+persistence restoration does not repeat import validation.
+
 The in-memory object store keeps private asymmetric keys in their typed
 runtime form. Generation and import parse once; RSA CRT precomputation,
 Ed25519/Ed448 expansion, EC validation, and X25519/X448 construction are therefore not

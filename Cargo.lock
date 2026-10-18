@@ -1264,6 +1264,7 @@ dependencies = [
  "ml-dsa",
  "ml-kem",
  "num-bigint-dig",
+ "num-integer",
  "p224",
  "p256",
  "p384",

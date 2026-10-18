@@ -51,6 +51,12 @@ bare PKCS #8 DER. The Edwards and Montgomery keys follow RFC 8410. The decoder
 verifies that the PKCS #8
 algorithm and parameters agree with the YubiHSM algorithm in the outer record.
 RSA keys must have the expected modulus size and public exponent 65537.
+New imports pass through the shared [RSA validation boundary](https://github.com/qpernil/software-key-core/blob/main/docs/rsa-key-validation.md).
+Supplied modulus/private-exponent consistency is checked, the private exponent
+is normalized, and CRT parameters are recalculated from the factors. Supplied
+CRT fields are discarded rather than compared. Validation covers the normalized
+prime-factor representation and the pairwise test, including full-object and
+key-material-only wrapped imports.
 
 Symmetric key material is raw, matching the key-only RSA-wrapped-key commands.
 A public RSA wrap key is also stored in its native virtual-device form: the
