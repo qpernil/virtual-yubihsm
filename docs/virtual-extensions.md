@@ -125,6 +125,10 @@ algorithms 59–64. Physical YubiHSM firmware does not advertise those algorithm
 The existing `GenerateAsymmetricKey`, `PutAsymmetricKey`, `GetPublicKey`,
 `GetObjectInfo`, listing, deletion, and persistence paths apply unchanged.
 Private-key imports carry the 32-byte ML-DSA seed or 64-byte ML-KEM seed.
+These native wire formats remain seed-only; the shared software-key-core API's
+validated expanded-import support serves other boundaries, including the
+PKCS #11 software slot. Concrete hybrid imports retain one 32-byte seed
+for both components.
 `GetPublicKey` returns the algorithm byte followed by the raw FIPS public-key
 encoding. Object metadata records the seed length while private material stays
 inside the HSM object and secure session.
