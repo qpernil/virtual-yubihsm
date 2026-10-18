@@ -69,6 +69,12 @@ exponent 65537 remain protocol policy. Wrapped private imports normalize their
 prime-factor representation; supplied CRT values are discarded. Trusted
 persistence restoration does not repeat import validation.
 
+Ed25519 and Ed448 private imports accept 32-byte and 57-byte seeds respectively.
+Public-point validation and signature verification use the shared
+[Edwards validation policy](https://github.com/qpernil/software-key-core/blob/main/docs/edwards-key-validation.md),
+including weak-key rejection and canonical encodings. Seed bytes are expanded
+to private scalars and public keys internally.
+
 The in-memory object store keeps private asymmetric keys in their typed
 runtime form. Generation and import parse once; RSA CRT precomputation,
 Ed25519/Ed448 expansion, EC validation, and X25519/X448 construction are therefore not
