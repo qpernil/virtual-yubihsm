@@ -7,9 +7,9 @@ included. The kernel module remains a separate target-local C build from
 `raspberry-pi-i2c-target`.
 
 Built from clean `virtual-yubihsm` source commit
-`3fe9570ec92fae5ade2b131bccbb0182f5a779ee` on `ubuntu4`, Ubuntu 26.04.1 LTS ARM64,
+`ea1c7c67fd6b52a43b2da54c80c2c94917577881` on `ubuntu4`, Ubuntu 26.04.1 LTS ARM64,
 with Rust/Cargo 1.99.0 and glibc 2.43. Its `software-key-core` path dependency
-was at `9e168f3280461bc8abadf21f55db19821391380c`; other cryptographic
+was at `40f84378086c76f7b4c64ec45141c9f7815a1e46`; other cryptographic
 revisions are pinned by the checked-in Cargo.lock.
 
 The AArch64 PIE executable requires at most `GLIBC_2.34`, compatible with
