@@ -146,7 +146,8 @@ impl ObjectMaterial {
                 KeyKind::Ec(curve) => ec_private_length(curve),
                 KeyKind::Edwards(curve) => curve.private_key_length(),
                 KeyKind::Rsa { modulus_bits } => modulus_bits / 8,
-                KeyKind::MlDsa(_) => key.serialized().map_or(0, |value| value.len()),
+                // Logical protocol size, independent of the retained encoding.
+                KeyKind::MlDsa(_) => 32,
             },
             Self::MontgomeryKey(key) => key.serialized().len(),
             Self::MlKemKey(_) => 64,
@@ -169,7 +170,8 @@ impl PartialEq for ObjectMaterial {
             }
             (Self::MontgomeryKey(a), Self::MontgomeryKey(b)) => a.serialized() == b.serialized(),
             (Self::MlKemKey(a), Self::MlKemKey(b)) => {
-                a.parameter_set() == b.parameter_set() && a.seed() == b.seed()
+                a.parameter_set() == b.parameter_set()
+                    && a.expanded_private_key() == b.expanded_private_key()
             }
             (Self::HybridKemKey(a), Self::HybridKemKey(b)) => {
                 a.construction() == b.construction() && a.seed() == b.seed()
@@ -289,7 +291,7 @@ impl ObjectRecord {
                 StoredObjectMaterial::Secret(key.serialized().to_vec())
             }
             ObjectMaterial::MlKemKey(key) => {
-                StoredObjectMaterial::Secret(key.seed().ok_or(DeviceError::InvalidData)?.to_vec())
+                StoredObjectMaterial::Secret(key.serialized().to_vec())
             }
             ObjectMaterial::HybridKemKey(key) => StoredObjectMaterial::Secret(key.seed().to_vec()),
             ObjectMaterial::Secret(value) => StoredObjectMaterial::Secret(value.clone()),
@@ -404,7 +406,7 @@ impl ObjectRecord {
 fn typed_private_material(info: &ObjectInfo, encoded: &[u8]) -> Result<ObjectMaterial> {
     let algorithm = Algorithm::from_byte(info.algorithm).ok_or(DeviceError::InvalidData)?;
     if let Some(parameters) = algorithm.ml_kem() {
-        return software_key_core::post_quantum::MlKemPrivateKey::from_seed_slice(
+        return software_key_core::post_quantum::MlKemPrivateKey::from_serialized(
             parameters, encoded,
         )
         .map(ObjectMaterial::MlKemKey)

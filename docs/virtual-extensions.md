@@ -124,13 +124,23 @@ algorithms 59–64. Physical YubiHSM firmware does not advertise those algorithm
 
 The existing `GenerateAsymmetricKey`, `PutAsymmetricKey`, `GetPublicKey`,
 `GetObjectInfo`, listing, deletion, and persistence paths apply unchanged.
-Private-key imports carry the 32-byte ML-DSA seed or 64-byte ML-KEM seed.
-These native wire formats remain seed-only; the shared software-key-core API's
-validated expanded-import support serves other boundaries, including the
-PKCS #11 software slot. Concrete hybrid imports retain one 32-byte seed
-for both components.
+Standalone private-key imports carry a raw seed, expanded FIPS 204/203 key,
+or seed followed by the expanded key. The algorithm and exact payload length
+select the representation: ML-DSA seeds have 32 bytes and expanded keys have
+2,560/4,032/4,896 bytes; ML-KEM seeds have 64 bytes and expanded keys have
+1,632/2,400/3,168 bytes. Combined payload lengths are their sums.
+The shared software-key-core constructors validate encoding, key-pair
+consistency, and an exact seed/expanded match before object-store mutation.
+Concrete hybrid imports retain one inseparable 32-byte seed for both components.
+
+Persistence keeps the original seed when known, otherwise the expanded key,
+in the existing protected private-material record. Restoration uses the same
+shared constructors. Existing seed records remain readable. Runtime equality
+compares complete ML-KEM private encodings, including the rejection secret,
+so distinct seedless keys cannot compare equal merely because both lack seeds.
 `GetPublicKey` returns the algorithm byte followed by the raw FIPS public-key
-encoding. Object metadata records the seed length while private material stays
+encoding. Object metadata records the logical seed length regardless of the
+stored representation, while private material stays
 inside the HSM object and secure session.
 
 `SignMlDsa` (`0x0d`) has this request body:
