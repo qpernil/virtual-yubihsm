@@ -25,7 +25,7 @@ firmware-protected-derivation = ["virtual-yubihsm-core/firmware-protected-deriva
 firmware-full = ["virtual-yubihsm-core/firmware-full"]
 
 [dependencies]
-libc = "0.2.189"
+libc = "0.2.191"
 usb-gadget-worker = { path = "../usb-gadget-supervisor/crates/usb-gadget-worker" }
 virtual-yubihsm-core = { path = "crates/virtual-yubihsm-core", default-features = false, features = ["persistent-runtime"] }
 
