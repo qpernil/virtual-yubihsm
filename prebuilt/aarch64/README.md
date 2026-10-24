@@ -7,13 +7,13 @@ included. The kernel module remains a separate target-local C build from
 `raspberry-pi-i2c-target`.
 
 Built from clean `virtual-yubihsm` source commit
-`9fdcc30aedc74f008f870aa103f035a8dd2d881f` on `ubuntu4`, Ubuntu 26.04.1 LTS ARM64,
+`283fe74071c84e9124ebc1161792d93f531aac1e` on `ubuntu4`, Ubuntu 26.04.1 LTS ARM64,
 with Rust/Cargo 1.99.0 and glibc 2.43. Its `software-key-core` path dependency
-was at `3c0c6f59dd140fd45258440b072caba2da2574b1`; other cryptographic
+was at `e85c29f247e5bdbfa8be08136e8ec47b8ad268c2`; other cryptographic
 revisions are pinned by the checked-in Cargo.lock. Standalone ML-DSA/ML-KEM
 imports accept seeds, expanded keys, and consistent combined forms; persistent
-records preserve keys whose seed is unavailable. The lockfile includes the
-patched constant-time arithmetic dependencies.
+records preserve keys whose seed is unavailable. The lockfile includes ML-KEM 0.3.3
+with arithmetic CBD sampling and patched constant-time arithmetic dependencies.
 
 The AArch64 PIE executable requires at most `GLIBC_2.34`, compatible with
 Raspberry Pi OS Debian 13 using glibc 2.41. Verify before installation:
