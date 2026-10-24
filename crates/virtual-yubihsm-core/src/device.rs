@@ -3581,13 +3581,21 @@ fn asymmetric_key_material(
         .asymmetric_key_length()
         .ok_or(DeviceError::InvalidData)?;
     if let Some(parameters) = algorithm.ml_kem() {
-        if generate && !supplied.is_empty() || !generate && supplied.len() != 64 {
+        if generate && !supplied.is_empty()
+            || !generate
+                && ![
+                    64,
+                    parameters.expanded_private_key_length(),
+                    64 + parameters.expanded_private_key_length(),
+                ]
+                .contains(&supplied.len())
+        {
             return Err(DeviceError::WrongLength);
         }
         let key = if generate {
             software_key_core::post_quantum::MlKemPrivateKey::generate(parameters)
         } else {
-            software_key_core::post_quantum::MlKemPrivateKey::from_seed_slice(parameters, supplied)
+            software_key_core::post_quantum::MlKemPrivateKey::from_serialized(parameters, supplied)
         }
         .map_err(|_| DeviceError::InvalidData)?;
         return Ok(ObjectMaterial::MlKemKey(key));
@@ -3641,6 +3649,31 @@ fn asymmetric_key_material(
         return Ok(ObjectMaterial::SigningKey(key));
     }
     let key_kind = asymmetric_key_kind(algorithm)?;
+    if let Some(parameters) = algorithm.ml_dsa() {
+        if !generate
+            && ![
+                32,
+                parameters.expanded_private_key_length(),
+                32 + parameters.expanded_private_key_length(),
+            ]
+            .contains(&supplied.len())
+        {
+            return Err(DeviceError::WrongLength);
+        }
+        let key = if generate {
+            software_key_core::post_quantum::MlDsaPrivateKey::generate(parameters)
+        } else {
+            software_key_core::post_quantum::MlDsaPrivateKey::from_serialized(parameters, supplied)
+        }
+        .map_err(|_| {
+            if generate {
+                DeviceError::StorageFailed
+            } else {
+                DeviceError::InvalidData
+            }
+        })?;
+        return Ok(ObjectMaterial::SigningKey(SoftwareSigningKey::MlDsa(key)));
+    }
     let key = if generate {
         SoftwareSigningKey::generate_for_kind(key_kind).map_err(|_| DeviceError::StorageFailed)?
     } else {
@@ -3974,7 +4007,9 @@ fn asymmetric_material_from_pkcs8(algorithm: Algorithm, encoded: &[u8]) -> Resul
         }
         return Ok(ObjectMaterial::SigningKey(key));
     }
-    if algorithm.asymmetric_key_length() != key.private_value().as_deref().map(Vec::len) {
+    if algorithm.ml_dsa().is_none()
+        && algorithm.asymmetric_key_length() != key.private_value().as_deref().map(Vec::len)
+    {
         return Err(DeviceError::InvalidData);
     }
     Ok(ObjectMaterial::SigningKey(key))
@@ -4002,12 +4037,16 @@ fn validate_wrapped_object(object: &ObjectRecord) -> Result<()> {
             .is_ok_and(|parsed| &parsed == authentication)
         }
         (ObjectType::AsymmetricKey, ObjectMaterial::SigningKey(value)) => {
-            !matches!(algorithm, Algorithm::X25519 | Algorithm::X448)
-                && algorithm.asymmetric_key_length()
-                    == Some(value.private_value().map_or_else(
-                        || algorithm.asymmetric_key_length().unwrap_or_default(),
-                        |private| private.len(),
-                    ))
+            if let Some(parameters) = algorithm.ml_dsa() {
+                value.key_kind() == KeyKind::MlDsa(parameters)
+            } else {
+                !matches!(algorithm, Algorithm::X25519 | Algorithm::X448)
+                    && algorithm.asymmetric_key_length()
+                        == Some(value.private_value().map_or_else(
+                            || algorithm.asymmetric_key_length().unwrap_or_default(),
+                            |private| private.len(),
+                        ))
+            }
         }
         (ObjectType::AsymmetricKey, ObjectMaterial::MontgomeryKey(_)) => {
             matches!(algorithm, Algorithm::X25519 | Algorithm::X448)
@@ -5997,6 +6036,137 @@ mod tests {
             &restored_signature.data,
         )
         .unwrap();
+    }
+
+    #[test]
+    #[cfg(feature = "firmware-full")]
+    fn post_quantum_expanded_and_combined_imports_survive_persistence() {
+        use software_key_core::post_quantum::{
+            MlDsaPrivateKey, MlKemPrivateKey, ml_kem_encapsulate, verify_ml_dsa,
+        };
+        for algorithm in [
+            Algorithm::MlDsa44,
+            Algorithm::MlDsa65,
+            Algorithm::MlDsa87,
+            Algorithm::MlKem512,
+            Algorithm::MlKem768,
+            Algorithm::MlKem1024,
+        ] {
+            let (seed, expanded, public) = if let Some(parameters) = algorithm.ml_dsa() {
+                let key = MlDsaPrivateKey::from_seed(parameters, [7; 32]);
+                (vec![7; 32], key.expanded_private_key(), key.public_key())
+            } else {
+                let parameters = algorithm.ml_kem().unwrap();
+                let key = MlKemPrivateKey::from_seed(parameters, [7; 64]);
+                let unrelated = MlKemPrivateKey::from_seed(parameters, [8; 64]);
+                let seedless = MlKemPrivateKey::from_expanded_private_key(
+                    parameters,
+                    &key.expanded_private_key(),
+                )
+                .unwrap();
+                let unrelated_seedless = MlKemPrivateKey::from_expanded_private_key(
+                    parameters,
+                    &unrelated.expanded_private_key(),
+                )
+                .unwrap();
+                assert_ne!(
+                    ObjectMaterial::MlKemKey(seedless),
+                    ObjectMaterial::MlKemKey(unrelated_seedless)
+                );
+                (vec![7; 64], key.expanded_private_key(), key.public_key())
+            };
+            let both = [seed.as_slice(), expanded.as_slice()].concat();
+            for (encoded, has_seed) in [
+                (seed.as_slice(), true),
+                (expanded.as_slice(), false),
+                (both.as_slice(), true),
+            ] {
+                let config = DeviceConfig::default();
+                let mut device = Device::factory_default(config.clone());
+                let admin = device.session_authorization(1).unwrap();
+                let capabilities = CapabilitySet::from_capabilities([
+                    Capability::SignMlDsa,
+                    Capability::EncapsulateMlKem,
+                    Capability::DecapsulateMlKem,
+                ]);
+                let request = put_asymmetric_key_request(74, 1, capabilities, algorithm, encoded);
+                assert_eq!(
+                    device.execute_inner(admin, &request).data,
+                    74_u16.to_be_bytes()
+                );
+                let state = device.persistent_state().unwrap();
+                let mut inconsistent = both.clone();
+                inconsistent[0] ^= 1;
+                for malformed in [
+                    inconsistent.as_slice(),
+                    &expanded[..expanded.len() - 1],
+                    &vec![0; expanded.len()],
+                ] {
+                    let request =
+                        put_asymmetric_key_request(75, 1, capabilities, algorithm, malformed);
+                    assert!(
+                        device.execute_inner(admin, &request).command
+                            == crate::frame::ERROR_COMMAND
+                    );
+                    assert_eq!(device.persistent_state().unwrap(), state);
+                }
+                for _ in 0..2 {
+                    let record = device
+                        .objects
+                        .get(&ObjectKey {
+                            object_type: ObjectType::AsymmetricKey,
+                            id: 74,
+                        })
+                        .unwrap();
+                    let stored = record.to_stored().unwrap();
+                    let crate::object::StoredObjectMaterial::Secret(ref bytes) = stored.material
+                    else {
+                        panic!("private record");
+                    };
+                    assert_eq!(
+                        bytes.as_slice(),
+                        if has_seed {
+                            seed.as_slice()
+                        } else {
+                            expanded.as_slice()
+                        }
+                    );
+                    assert_eq!(record.info.length as usize, seed.len());
+                    if let Some(parameters) = algorithm.ml_dsa() {
+                        // Standard wrapped-object PKCS #8 preserves seedless keys too.
+                        let wrapped = encode_wrapped_object(record).unwrap();
+                        assert_eq!(decode_wrapped_object(&wrapped).unwrap(), *record);
+                        let sign = Frame::new(
+                            CommandCode::SignMlDsa as u8,
+                            [
+                                74_u16.to_be_bytes().as_slice(),
+                                &[0, 0, 0],
+                                b"expanded import",
+                            ]
+                            .concat(),
+                        )
+                        .unwrap();
+                        let response = device.execute_inner(admin, &sign);
+                        verify_ml_dsa(parameters, &public, b"expanded import", &[], &response.data)
+                            .unwrap();
+                    } else {
+                        let (ciphertext, shared) =
+                            ml_kem_encapsulate(algorithm.ml_kem().unwrap(), &public).unwrap();
+                        let request = Frame::new(
+                            CommandCode::DecapsulateMlKem as u8,
+                            [74_u16.to_be_bytes().as_slice(), ciphertext.as_slice()].concat(),
+                        )
+                        .unwrap();
+                        assert_eq!(
+                            device.execute_inner(admin, &request).data,
+                            shared.as_slice()
+                        );
+                    }
+                    let state = device.persistent_state().unwrap();
+                    device = Device::from_persistent_state(config.clone(), &state).unwrap();
+                }
+            }
+        }
     }
 
     #[test]

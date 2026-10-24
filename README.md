@@ -75,6 +75,11 @@ Public-point validation and signature verification use the shared
 including weak-key rejection and canonical encodings. Seed bytes are expanded
 to private scalars and public keys internally.
 
+Standalone ML-DSA/ML-KEM imports accept seeds, expanded private keys, and
+consistent seed-plus-expanded pairs through shared software-key-core validation.
+Persistence retains the seed when available and the expanded key otherwise;
+existing seed records remain readable. See [PQC wire formats](docs/virtual-extensions.md#post-quantum-commands).
+
 The in-memory object store keeps private asymmetric keys in their typed
 runtime form. Generation and import parse once; RSA CRT precomputation,
 Ed25519/Ed448 expansion, EC validation, and X25519/X448 construction are therefore not
