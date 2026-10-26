@@ -10,13 +10,16 @@ Built from clean `virtual-yubihsm` source commit
 `c71047fb26524c7a4100930ce6286dc8e22f0c7a` on `ubuntu4`, Ubuntu 26.04.1 LTS ARM64,
 with Rust/Cargo 1.99.0 and glibc 2.43. Its `software-key-core` path dependency
 was at `4e7a79348e90eea1f608c24d2aaeb6d3c803d994`; other cryptographic
-revisions are pinned by the checked-in Cargo.lock. Standalone ML-DSA/ML-KEM
-imports accept seeds, expanded keys, and consistent combined forms; persistent
-records preserve keys whose seed is unavailable. The lockfile includes ML-KEM 0.3.3
-with arithmetic CBD sampling and patched constant-time arithmetic dependencies.
-ML-DSA uses only the minimal matrix stack-usage PR at
+revisions are recorded in Cargo.lock at that source commit. Standalone
+ML-DSA/ML-KEM imports accept seeds, expanded keys, and consistent combined forms;
+persistent records preserve keys whose seed is unavailable. The build's lockfile
+includes ML-KEM 0.3.3 with arithmetic CBD sampling and patched constant-time
+arithmetic dependencies.
+This binary uses the minimal ML-DSA matrix stack-usage PR at
 `a08a14910652a3737b8de83d18ad33704853d9db`; expanded-key import validation
 is implemented by `software-key-core` using the dependency's public API.
+Current source uses upstream RustCrypto/signatures without a revision pin;
+rebuild the binary to incorporate the resolved upstream dependency.
 
 The AArch64 PIE executable requires at most `GLIBC_2.34`, compatible with
 Raspberry Pi OS Debian 13 using glibc 2.41. Verify before installation:
