@@ -30,8 +30,8 @@ describe the exchange contract, signal-integrity checks, and evidence to retain.
 
 ## Shared-bus qualification
 
-A shared BSC bus requires one complete request/computation/response exchange
-at a time. Concurrent HTTP/PKCS #11 clients queue through the controller's
+The supported shared-BSC mode serializes complete request/computation/response
+exchanges. Concurrent HTTP/PKCS #11 clients queue through the controller's
 advisory bus lock; separate adapters remain independent. A long command can
 delay other targets on its adapter. Every bus client must follow this policy.
 
