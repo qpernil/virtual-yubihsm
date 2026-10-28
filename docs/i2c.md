@@ -30,17 +30,13 @@ describe the exchange contract, signal-integrity checks, and evidence to retain.
 
 ## Shared-bus qualification
 
-The supported shared-BSC mode serializes complete request/computation/response
-exchanges. Concurrent HTTP/PKCS #11 clients queue through the controller's
-advisory bus lock; separate adapters remain independent. A long command can
-delay other targets on its adapter. Every bus client must follow this policy.
-
-Pipelining exchanges across addresses is unqualified: ordinary echo and
-read-only SDK traffic reproduce transport and MAC-verification failures.
-Reducing the rate to 100 kHz or increasing SDA hold is not an accepted fix.
-The precise peripheral or electrical mechanism remains unestablished. See the
+Concurrent operation across targets on one shared BSC bus remains unqualified.
+Ordinary echo and read-only SDK traffic reproduce transport and MAC-verification
+failures. Reducing the rate to 100 kHz or increasing SDA hold does not qualify
+this mode. The precise peripheral or electrical mechanism remains unestablished.
+Separate physical adapters remain independent. See the
 [controller qualification and limits](https://github.com/qpernil/pkcs11rs/blob/master/docs/i2c-stability.md#pqc-provider-qualification)
-for the finite tested configuration and acceptance results.
+for single-target baseline results and historical experiment evidence.
 
 ## Wire exchange
 
@@ -66,9 +62,8 @@ waiter. Linux both-edge detection may classify an interrupt by sampling the pin
 in its deferred handler, mislabeling a short inactive interval. Single-edge
 selection avoids that ambiguity without extending response timing.
 
-After the acknowledgment the controller retains the shared bus lock while
-waiting for READY and reading the exact response length. The lock covers the
-complete exchange, including computation and response publication.
+After the acknowledgment the controller releases the shared bus lock while
+waiting for READY, then reacquires it to read the exact response length.
 The driver queues only response bytes. READY stays asserted after the read;
 there is no guard byte, fallback marker, drain timeout, or post-read reset.
 The next request clears any leftovers, including abandoned reads. No peripheral
@@ -86,9 +81,9 @@ A read and its corresponding write belong to one worker; concurrent worker
 reads are not supported. Requests must have a STOP and wait for acknowledgment
 before another request; arbitrary adjacent writes can merge into one record.
 
-The bus lock covers the complete header/body read and HSM computation.
-Concurrent clients queue complete exchanges on each physical adapter. Separate
-adapters remain independent; pipelining exchanges on one BSC bus is unqualified.
+The bus lock covers the complete header/body read, but not HSM computation.
+Separate READY lines permit computation on different targets to overlap. This
+protocol capability does not establish reliable concurrent shared-bus operation.
 All controllers sharing the physical bus must cooperate in this lock; other
 kernel drivers and raw clients do not do so automatically. Administrative
 activation, close and unload still require quiescent controller traffic.
