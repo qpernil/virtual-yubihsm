@@ -8,24 +8,25 @@ opening. The default `firmware-full` profile and shared persistent runtime are
 included. The kernel module remains a separate target-local C build from
 `raspberry-pi-i2c-target`.
 
-Built from clean `virtual-yubihsm` source commit
-`2a194b2d19d0f8947dad2c8805c69012d0cb5bb8` on `build-host`, Ubuntu 26.04.1 LTS ARM64,
-with Rust/Cargo 1.99.1 and glibc 2.43. Its `software-key-core` path dependency
-was at `1a8746639730a1f210cb0af45decb2ee1c5b0990`; other cryptographic
-revisions are recorded in Cargo.lock at that source commit.
+Built on `build-host`, Ubuntu 26.04.1 LTS ARM64, with Rust 1.99.1, Cargo 1.99.1,
+and glibc 2.43, from these clean source revisions:
 
-This prebuilt binary resolves ML-DSA from
-[RustCrypto/signatures](https://github.com/RustCrypto/signatures) at commit
-`7b8bdcde8917a9db5775e689e25c91adb784492a`, including row-allocated matrices to
-limit stack usage. Expanded-key import validation is implemented by
-`software-key-core` using the dependency's public API. Standalone ML-DSA/ML-KEM
-imports accept seeds, expanded keys, and consistent combined forms; persistent
-records preserve keys whose seed is unavailable. The build's lockfile includes
-ML-KEM 0.3.3 with arithmetic CBD sampling and patched constant-time arithmetic
-dependencies.
+| Build input | Commit |
+| --- | --- |
+| `virtual-yubihsm` | `dc1b592c96aca7f133faae0e642f1821ec38da04` |
+| `software-key-core` | `59a0521b89c5a62e2ebfa522f396b2c2c34a5cb4` |
 
-The AArch64 PIE executable requires at most `GLIBC_2.34`, compatible with
-Raspberry Pi OS Debian 13 using glibc 2.41. Verify before installation:
+The source commit's `Cargo.lock` records the dependency resolution. ML-DSA is
+pinned to upstream RustCrypto/signatures commit
+`a3690c4a0bd861fcf2bde0e38b3609e86c3fe89e`, retaining the matrix stack fix.
+The lockfile includes `crypto-bigint` 0.7.10, `elliptic-curve` 0.14.3,
+`der` 0.8.3, and ML-KEM 0.3.3. Expanded-key validation and persistent storage
+remain in the shared core; seeds, expanded keys, and consistent combined forms
+are supported, including keys whose seed is unavailable.
+
+The AArch64 PIE executable requires at most
+`GLIBC_2.34`, compatible with Raspberry Pi OS Debian 13 using glibc 2.41.
+Verify before installation:
 
 ```sh
 (cd prebuilt/aarch64 && sha256sum -c SHA256SUMS)
