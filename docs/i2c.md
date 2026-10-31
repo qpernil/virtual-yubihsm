@@ -102,9 +102,10 @@ already using `/dev/bsc-target0` before a foreground run.
 Use current builds of `virtual-yubihsm-i2c` and
 `usb-gadget-supervisor`. Install the [device profile](#profile-based-service)
 once, using the configured unprivileged account. No device group or dedicated account
-is required. On small ARM64 targets, each repository provides a checksummed
-convenience binary under `prebuilt/aarch64/`; substitute that path for
-`target/release/` in these recipes. The kernel module still needs a local C
+is required. Only `i2c-target-1` and `i2c-target-2` use the checksummed
+supervisor and I2C HSM binaries under their repositories' `prebuilt/aarch64/`
+directories; substitute those paths for `target/release/` on those two hosts.
+All other lab hosts build locally. The kernel module always needs a local C
 build against the running kernel.
 
 **Target Pi:** from `raspberry-pi-i2c-target`, build and install the kernel
@@ -172,8 +173,9 @@ connector with Ctrl-C after testing.
 
 Install the current supervisor following its
 [build and installation recipe](https://github.com/qpernil/usb-gadget-supervisor#build).
-Build the HSM source or use the checksummed ARM64 binary in
-`prebuilt/aarch64/`. Set the profile command to the chosen executable.
+Build the HSM source locally and point the profile at
+`target/release/virtual-yubihsm-i2c`. Only `i2c-target-1` and `i2c-target-2`
+use the checksummed `prebuilt/aarch64/virtual-yubihsm-i2c` instead.
 
 ```sh
 cargo build --release --locked -p virtual-yubihsm-i2c
@@ -236,7 +238,7 @@ An example installation, after installing the driver and its overlay, is:
 
 ```sh
 sudo useradd --system --home /nonexistent --shell /usr/sbin/nologin virtual-yubihsm
-sudo install -o root -g root -m 0755 prebuilt/aarch64/virtual-yubihsm-i2c \
+sudo install -o root -g root -m 0755 target/release/virtual-yubihsm-i2c \
   /usr/local/sbin/virtual-yubihsm-i2c
 sudo install -o root -g root -m 0644 deploy/90-virtual-yubihsm-i2c.rules \
   /etc/udev/rules.d/90-virtual-yubihsm-i2c.rules
