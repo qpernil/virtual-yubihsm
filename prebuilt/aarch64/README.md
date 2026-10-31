@@ -2,7 +2,8 @@
 
 Hostnames and device/account identifiers below are illustrative; replace them with your own configured values.
 
-`virtual-yubihsm-i2c` is a release build for small Raspberry Pi targets. It
+`virtual-yubihsm-i2c` is prebuilt only for `i2c-target-1` and `i2c-target-2`.
+Every other lab host builds its worker locally. This release build
 supports `--inherited-device` for supervisor profiles and `--device` for direct
 opening. The default `firmware-full` profile and shared persistent runtime are
 included. The kernel module remains a separate target-local C build from
