@@ -43,7 +43,7 @@ for single-target baseline results and historical experiment evidence.
 ## Wire exchange
 
 Response mode requires an active-low, open-drain READY GPIO and driver ABI 3.
-Upgrade the controller, driver and HSM frontend together. Receive-only display
+Upgrade the controller and HSM frontend together with a recovery-capable driver. Receive-only display
 workloads do not require READY and retain their 1,024-record receive ring.
 The HSM transport accepts complete frames up to 8,192 bytes. Its frontend checks
 the kernel driver's reported maximum transfer at startup and fails if the driver
@@ -51,25 +51,28 @@ cannot carry a full frame. This is the common semi-arbitrary implementation
 ceiling, believed to be large enough for all anticipated post-quantum payloads;
 it is not an I2C or YubiHSM wire-format limit.
 
-The controller holds the physical bus lock while writing a complete request.
-The driver invalidates the previous result when new input arrives and clears
-old transmit data after the receive burst ends. It then acknowledges cleanup
-with a deasserting READY edge (physical rising edge). If READY was already
-inactive, a short assertion ensures this edge still exists; the assertion is
-held for 20 µs so the controller GPIO can latch it. During this request phase,
-that pulse is an acknowledgment, not a response. Arm rising-only GPIO detection before writing and discard stale events. After
-acknowledgment, arm falling-only detection and check the current response level.
-A reply arriving before reconfiguration stays asserted; a later reply wakes the
-waiter. Linux both-edge detection may classify an interrupt by sampling the pin
-in its deferred handler, mislabeling a short inactive interval. Single-edge
-selection avoids that ambiguity without extending response timing.
+Ordinary HSM request and response bytes are unchanged. The controller holds the
+bus lock through the write and request acceptance acknowledgment, releases it
+while computation runs, then reacquires it for the complete response read.
+BSC stays in I2C mode during normal exchanges. The connector retains rising-only
+READY detection and polls response readiness without changing edge configuration.
 
-After the acknowledgment the controller releases the shared bus lock while
-waiting for READY, then reacquires it to read the exact response length.
-The driver queues only response bytes. READY stays asserted after the read;
-there is no guard byte, fallback marker, drain timeout, or post-read reset.
-The next request clears any leftovers, including abandoned reads. No peripheral
-reset occurs while another target is computing or publishing its response.
+On open/reconnect, the connector first sends the reserved I2C-frontend operation
+`00 00 0d`, ASCII `BSCRECOV`, byte `01`, and a four-byte big-endian token. The
+frontend recognizes only the exact 16-byte control request and calls the driver's
+`BSC_TARGET_IOC_RECOVER` (`0x4203`) before confirming the same frame with command
+byte `80`. This bypasses HSM execution and does not alter objects or credentials.
+The controller retains the shared bus lock through the whole recovery exchange.
+The frontend requires ABI 3 with READY and the recovery capability bit in
+GET_INFO `reserved[1]`. Generic driver clients have no reserved wire sequence.
+
+An incomplete or uncertain exchange closes the controller transport. It must
+recover before another command and must not replay the failed operation. The
+kernel driver clears stale transmit state only for the explicit ioctl. Adapter
+errors, HSM framing checks and authenticated-session MACs retain their existing
+roles; the driver does not add another data envelope or checksum. Raw protocols
+without integrity checks cannot detect all silent corruption. See the
+[driver contract](https://github.com/qpernil/raspberry-pi-i2c-target/blob/main/docs/response-transport.md).
 
 One worker executes requests sequentially. With READY, the driver retains only
 one pending request, replacing it when newer input arrives. A worker response
@@ -81,7 +84,8 @@ before request and response I/O. Other bus clients must preserve that
 adapter-wide policy; retrying a partially consumed response also loses framing.
 A read and its corresponding write belong to one worker; concurrent worker
 reads are not supported. Requests must have a STOP and wait for acknowledgment
-before another request; arbitrary adjacent writes can merge into one record.
+before another request. Incomplete exchanges require explicit recovery; arbitrary
+adjacent writes are unsupported.
 
 The bus lock covers the complete header/body read, but not HSM computation.
 Separate READY lines permit computation on different targets to overlap. This
