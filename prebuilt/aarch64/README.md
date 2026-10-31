@@ -6,8 +6,8 @@ Hostnames and device/account identifiers below are illustrative; replace them wi
 Every other lab host builds its worker locally. This release build
 supports `--inherited-device` for supervisor profiles and `--device` for direct
 opening. The default `firmware-full` profile and shared persistent runtime are
-included. The frontend supports explicit response recovery with the driver recovery ioctl.
-The frontend supports explicit response recovery with the driver recovery ioctl.
+included. The frontend supports explicit response recovery with the driver
+recovery ioctl.
 The kernel module remains a separate target-local C build from
 `raspberry-pi-i2c-target`.
 

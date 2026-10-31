@@ -94,6 +94,25 @@ All controllers sharing the physical bus must cooperate in this lock; other
 kernel drivers and raw clients do not do so automatically. Administrative
 activation, close and unload still require quiescent controller traffic.
 
+## Verified transport checks
+
+The coordinated driver, HSM frontend and connector pass the finite raw-byte
+recovery checks in the [validation record](https://github.com/qpernil/raspberry-pi-i2c-target/blob/main/docs/explicit-recovery-validation.json): 100 normal echoes with one
+startup recovery, 50 exchanges with every fifth response deliberately incomplete,
+30 concurrent echoes per target, reconnects, and exact 8192-byte requests/replies
+on both targets. The unchanged `controller-long` works with the committed C echo
+fixture, including an 8192-byte reply. Receive-only test records arrive unchanged.
+Neither path reports overruns or underruns.
+
+Four-channel scope records cover SCL, SDA and both READY signals. Threshold
+decoding matches the complete 3133-byte echo request and reply in both a steady
+capture and a READY2 pulse-control capture. All ten pulse-control echoes pass;
+this short run does not establish a fix for the intermittent fault. A native
+20 ns excerpt measures SCL at approximately 391 kHz. C3 observes READY2 via the
+breadboard; Pi2 READY is on controller GPIO22/pin 15. Concurrent authenticated
+PQC remains unqualified. Full display application qualification is not repeated
+by the receive-only byte check.
+
 ## Manual bench test
 
 Use a Linux controller with `/dev/i2c-1` enabled and a Pi 3B/3B+ or Pi 4B
