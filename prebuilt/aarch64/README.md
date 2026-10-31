@@ -12,9 +12,8 @@ with Rust/Cargo 1.99.1 and glibc 2.43. Its `software-key-core` path dependency
 was at `1a8746639730a1f210cb0af45decb2ee1c5b0990`; other cryptographic
 revisions are recorded in Cargo.lock at that source commit.
 
-ML-DSA follows the upstream
-[RustCrypto/signatures](https://github.com/RustCrypto/signatures) default branch
-without a revision pin. This build resolves upstream commit
+This prebuilt binary resolves ML-DSA from
+[RustCrypto/signatures](https://github.com/RustCrypto/signatures) at commit
 `7b8bdcde8917a9db5775e689e25c91adb784492a`, including row-allocated matrices to
 limit stack usage. Expanded-key import validation is implemented by
 `software-key-core` using the dependency's public API. Standalone ML-DSA/ML-KEM
