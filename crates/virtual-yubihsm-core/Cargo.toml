@@ -19,7 +19,7 @@ persistent-runtime = ["software-key-core/state-persistence"]
 [dependencies]
 ciborium = "0.2.2"
 const-oid = "0.10.2"
-der = { version = "0.8.1", features = ["alloc", "derive", "std"] }
+der = { version = "0.8.3", features = ["alloc", "derive", "std"] }
 getrandom = "0.4.3"
 serde = { version = "1.0.228", features = ["derive"] }
 software-key-core = { workspace = true, features = ["x509-signing"] }
