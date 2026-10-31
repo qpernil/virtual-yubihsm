@@ -4,6 +4,8 @@ use std::{env, io, path::PathBuf};
 
 #[cfg(target_os = "linux")]
 mod linux;
+#[cfg(any(test, target_os = "linux"))]
+mod recovery;
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 struct Options {

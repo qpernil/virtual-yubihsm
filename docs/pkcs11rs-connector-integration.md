@@ -87,7 +87,8 @@ It contains no independent YubiHSM command implementation.
 ### `virtual-yubihsm-i2c`
 
 The I2C binary owns the Linux BSC target descriptor, driver-ABI and READY
-validation, request/response polling, and signal handling. It uses the same
+validation, request/response polling, explicit driver recovery through its
+reserved transport-control operation, and signal handling. It uses the same
 `PersistentDevice` API as the other deployed frontends and contains no
 independent device or persistence implementation.
 

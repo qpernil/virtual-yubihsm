@@ -16,6 +16,7 @@ use virtual_yubihsm_core::{
 
 const O_NONBLOCK: i32 = 0x800;
 const BSC_TARGET_IOC_GET_INFO: libc::c_ulong = 0x8020_4200;
+const BSC_TARGET_IOC_RECOVER: libc::c_ulong = 0x4203;
 const PERSISTENCE_BATCH_DELAY: Duration = Duration::from_millis(500);
 static STOP_REQUESTED: AtomicBool = AtomicBool::new(false);
 
@@ -102,6 +103,22 @@ fn serve(target: &mut File, hsm: &PersistentDeviceHandle) -> io::Result<()> {
             Err(error) if error.kind() == io::ErrorKind::Interrupted => continue,
             Err(error) => return Err(with_context(error, "read I2C request")),
         };
+
+        if let Some(response) = crate::recovery::response(&request[..length]) {
+            // The controller retains the shared bus lock through this exchange.
+            // Recovery is transport maintenance and never executes an HSM command.
+            // SAFETY: target owns the descriptor; this ioctl has no pointer argument.
+            if unsafe { libc::ioctl(target.as_raw_fd(), BSC_TARGET_IOC_RECOVER, 0) } < 0 {
+                let error = io::Error::last_os_error();
+                if error.kind() == io::ErrorKind::WouldBlock {
+                    continue; // A newer request superseded this recovery operation.
+                }
+                return Err(with_context(error, "recover I2C transmit state"));
+            }
+            queue_response(target, &response)?;
+            eprintln!("virtual-yubihsm-i2c: explicit transport recovery");
+            continue;
+        }
 
         let command = request.first().copied().unwrap_or_default();
         let response = hsm.execute(&request[..length])?;
@@ -197,9 +214,9 @@ fn validate_target(target: &File) -> io::Result<()> {
 }
 
 fn validate_target_info(info: &[u32; 8]) -> io::Result<()> {
-    if info[0] != 3 || info[5] != 1 {
+    if info[0] != 3 || info[5] != 1 || info[6] & 1 == 0 {
         return Err(io::Error::other(
-            "I2C target requires driver ABI 3 with a configured READY GPIO",
+            "I2C target requires driver ABI 3 with READY and explicit recovery support",
         ));
     }
     if usize::try_from(info[3]).unwrap_or_default() < MAX_FRAME_LENGTH {
@@ -245,6 +262,7 @@ mod tests {
         info[0] = 3;
         info[3] = MAX_FRAME_LENGTH as u32;
         info[5] = 1;
+        info[6] = 1;
         assert!(validate_target_info(&info).is_ok());
 
         info[3] = MAX_FRAME_LENGTH as u32 - 1;
@@ -252,6 +270,9 @@ mod tests {
 
         info[3] = MAX_FRAME_LENGTH as u32;
         info[5] = 0;
+        assert!(validate_target_info(&info).is_err());
+        info[5] = 1;
+        info[6] = 0;
         assert!(validate_target_info(&info).is_err());
     }
 }
