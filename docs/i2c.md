@@ -32,6 +32,15 @@ describe the exchange contract, signal-integrity checks, and evidence to retain.
 
 ## Shared-bus qualification
 
+The [2026-11-01 bench record](https://github.com/qpernil/raspberry-pi-i2c-target/blob/main/docs/bench-validation-2026-11-01.md)
+includes configure-once receive-only reproduction and production low/release
+READY controls. Finite 4 mA runs pass substantial traffic but a later ordinary
+production run still fails; no GPIO tuning is deployed. Rebooted pad defaults
+and normal target services are restored. A distinct fresh Echo succeeds after
+one natural transport failure without restarting the connector or targets,
+with recovery-counter increments. This does not qualify authenticated-session
+or PQC recovery, or guarantee release of a physically stuck bus.
+
 Concurrent operation across targets on one shared BSC bus remains unqualified.
 Ordinary echo and read-only SDK traffic reproduce transport and MAC-verification
 failures. Reducing the rate to 100 kHz or increasing SDA hold does not qualify
