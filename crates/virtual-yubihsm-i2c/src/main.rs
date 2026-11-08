@@ -9,6 +9,7 @@ mod recovery;
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 struct Options {
+    unlimited_storage: bool,
     serial: u32,
     state_directory: PathBuf,
     device: PathBuf,
@@ -56,17 +57,20 @@ fn parse_arguments(arguments: impl IntoIterator<Item = String>) -> io::Result<Op
     let mut persistence = Persistence::Batched;
     let mut inherited_device = false;
     let mut explicit_device = false;
+    let mut unlimited_storage = false;
     let mut arguments = arguments.into_iter();
     while let Some(argument) = arguments.next() {
         match argument.as_str() {
+            "--unlimited-storage" => unlimited_storage = true,
             "-h" | "--help" => {
                 println!(
-                    "Usage: virtual-yubihsm-i2c --serial DECIMAL --state-directory PATH [--device PATH | --inherited-device] [--persistence MODE]\n\n\
+                    "Usage: virtual-yubihsm-i2c --serial DECIMAL --state-directory PATH [--device PATH | --inherited-device] [--persistence MODE] [--unlimited-storage]\n\n\
                      Serve one real virtual YubiHSM protocol endpoint through the BSC I2C\n\
                      target driver. The kernel module and overlay must already be loaded.\n\
                      The process needs read/write access to DEVICE, but does not require root.\n\
                      --inherited-device takes ownership of an already-open device on FD 3.\n\
-                     MODE is batched (default, 500 ms) or immediate."
+                     MODE is batched (default, 500 ms) or immediate.\n\
+                     --unlimited-storage disables the default simulated hardware capacity limits."
                 );
                 return Ok(None);
             }
@@ -116,6 +120,7 @@ fn parse_arguments(arguments: impl IntoIterator<Item = String>) -> io::Result<Op
         return invalid("--device must be an absolute path");
     }
     Ok(Some(Options {
+        unlimited_storage,
         serial,
         state_directory,
         device,
@@ -154,6 +159,23 @@ fn invalid<T>(message: impl Into<String>) -> io::Result<T> {
 mod tests {
     use super::*;
 
+    #[test]
+    fn unlimited_storage_is_explicit() {
+        let options = parse_arguments(
+            [
+                "--serial",
+                "42",
+                "--state-directory",
+                "/tmp/test-hsm",
+                "--unlimited-storage",
+            ]
+            .map(str::to_owned),
+        )
+        .unwrap()
+        .unwrap();
+        assert!(options.unlimited_storage);
+    }
+
     fn parse(arguments: &[&str]) -> io::Result<Option<Options>> {
         parse_arguments(arguments.iter().map(|value| (*value).to_owned()))
     }
@@ -171,6 +193,7 @@ mod tests {
             ])
             .unwrap(),
             Some(Options {
+                unlimited_storage: false,
                 serial: 12_345_678,
                 state_directory: PathBuf::from("/var/lib/virtual-yubihsm-i2c/one"),
                 device: PathBuf::from("/dev/test-target"),

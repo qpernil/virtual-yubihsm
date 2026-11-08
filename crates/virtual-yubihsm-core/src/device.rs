@@ -59,6 +59,8 @@ use x509_cert::{
 use zeroize::Zeroizing;
 
 const MAX_OBJECTS: usize = 256;
+const STORAGE_PAGES: usize = 1024;
+const STORAGE_PAGE_SIZE: usize = 126;
 const MAX_SESSIONS: u8 = 16;
 const SESSION_INACTIVITY_TIMEOUT: Duration = Duration::from_secs(30);
 const DEFAULT_AUTHENTICATION_ALGORITHM: u8 = AUTHENTICATION_ALGORITHM_AES128_YUBICO;
@@ -84,6 +86,9 @@ const OPTION_FIX: u8 = 2;
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
 pub struct DeviceConfig {
+    /// Disable the simulated hardware object and page limits explicitly.
+    #[serde(default)]
+    pub unlimited_storage: bool,
     pub version: [u8; 3],
     pub serial: u32,
     pub log_capacity: u8,
@@ -222,6 +227,7 @@ impl BuilderProfile for AttestationProfile {
 impl Default for DeviceConfig {
     fn default() -> Self {
         Self {
+            unlimited_storage: false,
             version: [2, 5, 0],
             serial: 12_345_678,
             log_capacity: 62,
@@ -718,6 +724,7 @@ impl Device {
         let mut object = object;
         object.promote_private_material()?;
         object.validate()?;
+        self.check_storage_capacity(&object)?;
         let key = object.info.key();
         self.sequence_history
             .record(key.id, u64::from(object.info.sequence));
@@ -825,6 +832,16 @@ impl Device {
                 return Err(DeviceError::InvalidData);
             }
         }
+        if !config.unlimited_storage
+            && (objects.len() > MAX_OBJECTS
+                || objects
+                    .values()
+                    .map(Self::object_storage_pages)
+                    .sum::<usize>()
+                    > STORAGE_PAGES)
+        {
+            return Err(DeviceError::StorageFailed);
+        }
         Ok(Self {
             // Device identity and capabilities belong to the running virtual
             // firmware. Durable state supplies objects, options, and audit
@@ -880,12 +897,22 @@ impl Device {
             }
             CommandCode::GetStorageInfo => {
                 decode_request::<GetStorageInfoRequest>(&request.data)?;
-                let used = self.objects.len() as u16;
-                let free = MAX_OBJECTS.saturating_sub(self.objects.len()) as u16;
-                Ok([MAX_OBJECTS as u16, free, 1024, 1024 - used, 126]
-                    .into_iter()
-                    .flat_map(u16::to_be_bytes)
-                    .collect())
+                let (records, pages) = if self.config.unlimited_storage {
+                    (u16::MAX as usize, u16::MAX as usize)
+                } else {
+                    (MAX_OBJECTS, STORAGE_PAGES)
+                };
+                let used_pages = self.objects.values().map(Self::object_storage_pages).sum();
+                Ok([
+                    records as u16,
+                    records.saturating_sub(self.objects.len()) as u16,
+                    pages as u16,
+                    pages.saturating_sub(used_pages) as u16,
+                    STORAGE_PAGE_SIZE as u16,
+                ]
+                .into_iter()
+                .flat_map(u16::to_be_bytes)
+                .collect())
             }
             CommandCode::GetPseudoRandom => {
                 let length =
@@ -3433,9 +3460,38 @@ impl Device {
         self.write_object(record)
     }
 
+    // Charge the device-reported logical length in whole pages. This matches
+    // published RSA capacity and keeps storage independent of host encodings.
+    fn object_storage_pages(record: &ObjectRecord) -> usize {
+        usize::from(record.info.length)
+            .div_ceil(STORAGE_PAGE_SIZE)
+            .max(1)
+    }
+
+    fn check_storage_capacity(&self, replacement: &ObjectRecord) -> Result<()> {
+        if self.config.unlimited_storage {
+            return Ok(());
+        }
+        let key = replacement.info.key();
+        let previous = self.objects.get(&key);
+        let records = self.objects.len() + usize::from(previous.is_none());
+        let pages = self
+            .objects
+            .values()
+            .map(Self::object_storage_pages)
+            .sum::<usize>()
+            - previous.map_or(0, Self::object_storage_pages)
+            + Self::object_storage_pages(replacement);
+        if records > MAX_OBJECTS || pages > STORAGE_PAGES {
+            return Err(DeviceError::StorageFailed);
+        }
+        Ok(())
+    }
+
     fn write_object(&mut self, mut record: ObjectRecord) -> Result<()> {
         record.promote_private_material()?;
         record.validate()?;
+        self.check_storage_capacity(&record)?;
         // Every protocol import path reaches this point after authorization,
         // including wrapped-object imports. Validate before consuming an object
         // generation or changing the store. Persistence reads keep their cheap
@@ -5101,8 +5157,11 @@ mod tests {
     }
 
     #[test]
-    fn storage_info_reports_no_free_object_slots_above_nominal_capacity() {
-        let mut device = Device::factory_default(DeviceConfig::default());
+    fn unlimited_storage_accepts_more_than_the_physical_object_capacity() {
+        let mut device = Device::factory_default(DeviceConfig {
+            unlimited_storage: true,
+            ..DeviceConfig::default()
+        });
         for id in 1..=MAX_OBJECTS as u16 {
             device
                 .provision_object(ObjectRecord {
@@ -5128,7 +5187,7 @@ mod tests {
             device.session_authorization(1).unwrap(),
             &Frame::new(CommandCode::GetStorageInfo as u8, []).unwrap(),
         );
-        assert_eq!(&response.data[..4], &[0x01, 0x00, 0x00, 0x00]);
+        assert_eq!(&response.data[..4], &[0xff, 0xff, 0xfe, 0xfe]);
     }
 
     #[test]
@@ -7423,3 +7482,7 @@ mod tests {
         );
     }
 }
+
+#[cfg(test)]
+#[path = "storage_tests.rs"]
+mod storage_tests;

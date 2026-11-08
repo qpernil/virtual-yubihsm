@@ -26,6 +26,7 @@ pub(super) fn run(options: Options) -> io::Result<()> {
     install_signal_handlers()?;
     validate_state_directory(&options.state_directory)?;
     let config = DeviceConfig {
+        unlimited_storage: options.unlimited_storage,
         serial: options.serial,
         ..DeviceConfig::default()
     };

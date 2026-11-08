@@ -225,3 +225,11 @@ The connector remains intended for trusted-network deployment unless its TLS,
 client-authentication, and admission controls are configured for the exposure.
 The repositories currently use coordinated sibling paths; independently
 reproducible releases require versioned crates or pinned Git revisions.
+
+## Storage limits
+
+Embedded devices use the core's [hardware-like storage limits](storage-capacity.md)
+by default. `--virtual-yubihsm-unlimited-storage` disables both the object and
+page limits for all embedded devices configured in that connector process.
+State restoration uses the running configuration; oversized images require
+explicit unlimited mode and are never silently truncated.

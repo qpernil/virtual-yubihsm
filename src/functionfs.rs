@@ -49,6 +49,7 @@ pub(crate) fn run_worker(
     serial: u32,
     display_kind: crate::DisplayKind,
     persistence_mode: PersistenceMode,
+    unlimited_storage: bool,
     stop: &'static AtomicBool,
 ) -> io::Result<()> {
     // SAFETY: geteuid has no preconditions.
@@ -62,6 +63,7 @@ pub(crate) fn run_worker(
     let resources = InitialResources::parse(validate_initial_resources(control.receive()?)?)?;
     let state_directory = required_path(STATE_DIRECTORY_ENV)?;
     let config = DeviceConfig {
+        unlimited_storage,
         serial,
         ..DeviceConfig::default()
     };

@@ -42,6 +42,7 @@ impl DisplayKind {
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 struct Options {
+    unlimited_storage: bool,
     serial: u32,
     display: DisplayKind,
     persistence: PersistenceMode,
@@ -66,6 +67,7 @@ fn run() -> io::Result<()> {
             options.serial,
             options.display,
             options.persistence,
+            options.unlimited_storage,
             &STOP_REQUESTED,
         )
     }
@@ -84,16 +86,19 @@ fn parse_arguments(arguments: impl IntoIterator<Item = String>) -> io::Result<Op
     let mut serial = 12_345_678;
     let mut display = DisplayKind::St7789Spi;
     let mut persistence = PersistenceMode::Batched(Duration::from_millis(500));
+    let mut unlimited_storage = false;
     let mut arguments = arguments.into_iter();
     while let Some(argument) = arguments.next() {
         match argument.as_str() {
+            "--unlimited-storage" => unlimited_storage = true,
             "-h" | "--help" => {
                 println!(
-                    "Usage: virtual-yubihsm-worker [--serial DECIMAL] [--display BACKEND] [--persistence MODE]\n\n\
+                    "Usage: virtual-yubihsm-worker [--serial DECIMAL] [--display BACKEND] [--persistence MODE] [--unlimited-storage]\n\n\
                      Unprivileged YubiHSM 2 FunctionFS worker for usb-gadget-supervisor.\n\
                      Persistent state is stored in STATE_DIRECTORY.\n\
                      BACKEND is st7789-spi (default), sh1106-spi, or sh1106-i2c.\n\
-                     MODE is batched (default, 500 ms) or immediate."
+                     MODE is batched (default, 500 ms) or immediate.\n\
+                     --unlimited-storage disables the default simulated hardware capacity limits."
                 );
                 return Ok(None);
             }
@@ -138,6 +143,7 @@ fn parse_arguments(arguments: impl IntoIterator<Item = String>) -> io::Result<Op
         }
     }
     Ok(Some(Options {
+        unlimited_storage,
         serial,
         display,
         persistence,
@@ -173,6 +179,14 @@ fn install_signal_handlers() -> io::Result<()> {
 mod tests {
     use super::*;
 
+    #[test]
+    fn unlimited_storage_is_explicit() {
+        let options = parse_arguments(["--unlimited-storage".to_owned()])
+            .unwrap()
+            .unwrap();
+        assert!(options.unlimited_storage);
+    }
+
     const OLED_PROFILE: &str = include_str!("../profiles/virtual-yubihsm-sh1106-spi.toml");
     const I2C_PROFILE: &str = include_str!("../profiles/virtual-yubihsm-sh1106-i2c.toml");
 
@@ -181,6 +195,7 @@ mod tests {
         assert_eq!(
             parse_arguments(["--serial".to_owned(), "42".to_owned()]).unwrap(),
             Some(Options {
+                unlimited_storage: false,
                 serial: 42,
                 display: DisplayKind::St7789Spi,
                 persistence: PersistenceMode::Batched(Duration::from_millis(500)),
@@ -194,6 +209,7 @@ mod tests {
         assert_eq!(
             parse_arguments(["--display=sh1106-spi".to_owned()]).unwrap(),
             Some(Options {
+                unlimited_storage: false,
                 serial: 12_345_678,
                 display: DisplayKind::Sh1106Spi,
                 persistence: PersistenceMode::Batched(Duration::from_millis(500)),
@@ -203,6 +219,7 @@ mod tests {
         assert_eq!(
             parse_arguments(["--display=sh1106-i2c".to_owned()]).unwrap(),
             Some(Options {
+                unlimited_storage: false,
                 serial: 12_345_678,
                 display: DisplayKind::Sh1106I2c,
                 persistence: PersistenceMode::Batched(Duration::from_millis(500)),
@@ -215,6 +232,7 @@ mod tests {
         assert_eq!(
             parse_arguments(["--persistence=immediate".to_owned()]).unwrap(),
             Some(Options {
+                unlimited_storage: false,
                 serial: 12_345_678,
                 display: DisplayKind::St7789Spi,
                 persistence: PersistenceMode::Immediate,

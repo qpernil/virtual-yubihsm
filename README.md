@@ -468,3 +468,9 @@ protocols and products with which this test implementation interoperates.
 
 Licensed under either the [MIT License](LICENSE-MIT) or the
 [Apache License 2.0](LICENSE-APACHE), at your option.
+
+## Storage capacity
+
+The [device storage model](docs/storage-capacity.md) defaults to the physical
+256-object and 1,024-page limits. USB and I2C workers accept
+`--unlimited-storage` for explicit opt-out.

@@ -2,7 +2,8 @@
 
 This table records the `length` returned by `GetObjectInfo` on a physical
 YubiHSM 2. These values are object metadata; they are not protocol input
-lengths.
+lengths. The [storage capacity model](storage-capacity.md) rounds these lengths
+to device allocation pages and enforces both object and page limits.
 
 In the formulas below, `n` is the RSA modulus length in bytes, `c` is an
 elliptic-curve coordinate length in bytes, `k` is the stored key material
