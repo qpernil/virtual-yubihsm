@@ -205,7 +205,8 @@ authorization boundary without claiming physical tamper resistance. See
 - asymmetric P-256 ECDH authentication with receipt and the common encrypted
   message exchange;
 - 16 concurrent secure sessions with the physical device's 30-second
-  inactivity timeout; every valid session command refreshes its deadline;
+  inactivity timeout; every valid session command refreshes its deadline after
+  command execution and response encryption, so processing time is not idle time;
 - public-key retrieval for asymmetric P-256 Authentication Keys, a deliberate
   virtual extension over firmware that rejects `GET PUBLIC KEY` for that object
   type;

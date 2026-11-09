@@ -609,7 +609,6 @@ impl Device {
             return Err(DeviceError::InvalidSession);
         }
         let inner = entry.secure.decrypt_request(request)?;
-        entry.last_activity = Instant::now();
         let authorization_error = CommandCode::from_byte(inner.command)
             .and_then(CommandCode::required_session_capability)
             .and_then(|required| entry.authorization.require_capability(required).err());
@@ -637,6 +636,9 @@ impl Device {
             && response.command != crate::frame::ERROR_COMMAND);
         let outer = entry.secure.encrypt_response(&response)?;
         if !closes_session {
+            // Time spent executing an authenticated command is activity, not
+            // idle time. Even a slow key generation gets a full idle window.
+            entry.last_activity = Instant::now();
             self.sessions.insert(sid, entry);
         }
         Ok(outer)
@@ -5804,9 +5806,19 @@ mod tests {
         let message = Frame::new(CommandCode::SessionMessage as u8, message_payload).unwrap();
         let prior_activity = Instant::now().checked_sub(Duration::from_secs(15)).unwrap();
         device.sessions.get_mut(&sid).unwrap().last_activity = prior_activity;
-        let response = Frame::parse(&device.handle_encoded(&message.encode())).unwrap();
+        let mut command_completed_at = None;
+        let response = Frame::parse(
+            &device.handle_encoded_observing(&message.encode(), |_, _, _| {
+                command_completed_at = Some(Instant::now())
+            }),
+        )
+        .unwrap();
         assert_eq!(response.command, CommandCode::SessionMessage as u8 | 0x80);
         assert!(device.sessions.get(&sid).unwrap().last_activity > prior_activity);
+        assert!(
+            device.sessions.get(&sid).unwrap().last_activity >= command_completed_at.unwrap(),
+            "command execution must not consume the session inactivity window"
+        );
 
         let response_payload_length = response.data.len() - 8;
         let response_without_mac = &response.encode()[..3 + response_payload_length];
