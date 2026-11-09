@@ -7,7 +7,9 @@ Every other lab host builds its worker locally. This release build
 supports `--inherited-device` for supervisor profiles and `--device` for direct
 opening. The default `firmware-full` profile and shared persistent runtime are
 included. The frontend supports explicit response recovery with the driver
-recovery ioctl.
+recovery ioctl. Hardware-like storage limits apply by default;
+`--unlimited-storage` explicitly disables them. See the
+[storage model](../../docs/storage-capacity.md).
 The kernel module remains a separate target-local C build from
 `raspberry-pi-i2c-target`.
 
@@ -16,7 +18,7 @@ and glibc 2.43, from these clean source revisions:
 
 | Build input | Commit |
 | --- | --- |
-| `virtual-yubihsm` | `cc3f9fe6f26c1c3f845069db60a82197d6a54e86` |
+| `virtual-yubihsm` | `03fec3b0155df1ad51b3c5d46fb30f73c7a52d47` |
 | `software-key-core` | `59a0521b89c5a62e2ebfa522f396b2c2c34a5cb4` |
 
 The source commit's `Cargo.lock` records the dependency resolution. ML-DSA is
