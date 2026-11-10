@@ -4670,7 +4670,7 @@ mod tests {
     ))]
     use p256::ecdh::diffie_hellman;
     use p256::elliptic_curve::sec1::ToSec1Point;
-    use rsa::{BigUint, RsaPublicKey};
+    use rsa::{BoxedUint, PublicKey as RsaPublicKey};
     #[cfg(any(
         feature = "firmware-protected-derivation",
         feature = "firmware-full",
@@ -6515,8 +6515,8 @@ mod tests {
         .unwrap();
         let encoded_signature = device.execute_inner(admin, &sign_encoded).data;
         let rsa_public = RsaPublicKey::new(
-            BigUint::from_bytes_be(&public_response.data[1..]),
-            BigUint::from(65_537_u32),
+            BoxedUint::from_be_slice_vartime(&public_response.data[1..]),
+            BoxedUint::from(65_537_u32),
         )
         .unwrap();
         software_key_core::rsa_signing::rsa_verify_pkcs1v15_payload(
