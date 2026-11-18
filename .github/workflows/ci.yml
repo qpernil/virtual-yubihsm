@@ -36,6 +36,7 @@ jobs:
           git clone --depth 1 https://github.com/qpernil/software-key-core.git ../software-key-core
           git clone --depth 1 https://github.com/qpernil/usb-gadget-supervisor.git ../usb-gadget-supervisor
           git clone --depth 1 https://github.com/qpernil/display-backends.git ../display-backends
+          git clone --depth 1 https://github.com/qpernil/virtual-yubikey.git ../virtual-yubikey
           git clone --depth 1 https://github.com/qpernil/raspberry-pi-i2c-target.git ../raspberry-pi-i2c-target
 
       - name: Test compiled firmware profile
