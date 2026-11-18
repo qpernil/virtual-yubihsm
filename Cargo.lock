@@ -1489,6 +1489,7 @@ dependencies = [
 name = "yubihsm-auth-client"
 version = "0.1.0"
 dependencies = [
+ "yubikey-apdu",
  "zeroize",
 ]
 
@@ -1507,6 +1508,10 @@ dependencies = [
  "yubihsm-auth-client",
  "zeroize",
 ]
+
+[[package]]
+name = "yubikey-apdu"
+version = "0.1.0"
 
 [[package]]
 name = "zerocopy"
