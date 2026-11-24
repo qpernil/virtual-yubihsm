@@ -18,15 +18,15 @@ persistent-runtime = ["software-key-core/state-persistence"]
 
 [dependencies]
 ciborium = "0.2.2"
-const-oid = "0.10.2"
+const-oid = "0.10.3"
 der = { version = "0.8.3", features = ["alloc", "derive", "std"] }
 getrandom = "0.4.3"
-serde = { version = "1.0.228", features = ["derive"] }
+serde = { version = "1.0.229", features = ["derive"] }
 software-key-core = { workspace = true, features = ["x509-signing"] }
-spki = { version = "0.8.0", features = ["alloc", "std"] }
+spki = { version = "0.8.1", features = ["alloc", "std"] }
 subtle = "2.6.1"
-x509-cert = { version = "0.3.0", default-features = false, features = ["builder", "std"] }
-zeroize = { version = "1.9.0", features = ["derive"] }
+x509-cert = { version = "0.3.1", default-features = false, features = ["builder", "std"] }
+zeroize = { version = "1.9.2", features = ["derive"] }
 
 [dev-dependencies]
 p256 = { version = "0.14.0", features = ["ecdh", "ecdsa", "pkcs8"] }
