@@ -83,6 +83,9 @@ jobs:
       - name: Run Clippy
         run: cargo clippy --locked --workspace --all-targets --all-features -- -D warnings
 
+      - name: Check normal worker build
+        run: cargo check --locked -p virtual-yubihsm --bin virtual-yubihsm-worker
+
       - name: Check formatting
         run: cargo fmt --all -- --check
 

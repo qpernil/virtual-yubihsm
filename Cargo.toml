@@ -19,6 +19,8 @@ resolver = "2"
 software-key-core = { path = "../software-key-core" }
 
 [features]
+# Build the ordinary worker against simulated I/O for process tests.
+worker-harness = ["usb-gadget-worker-io/simulated"]
 default = ["firmware-full"]
 firmware-yubihsm2 = ["virtual-yubihsm-core/firmware-yubihsm2"]
 firmware-protected-derivation = ["virtual-yubihsm-core/firmware-protected-derivation"]
@@ -39,3 +41,8 @@ path = "src/main.rs"
 
 [dev-dependencies]
 usb-gadget-harness = { path = "../usb-gadget-supervisor/crates/usb-gadget-harness" }
+
+[[test]]
+name = "worker_harness"
+path = "tests/worker_harness.rs"
+required-features = ["worker-harness"]

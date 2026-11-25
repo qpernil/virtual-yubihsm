@@ -437,19 +437,22 @@ display and KEY3 resources intentionally match the corresponding
 With the documented sibling dependencies checked out, run:
 
 ```sh
-cargo test --locked --test worker_harness
+cargo test --locked --features worker-harness --test worker_harness
 ```
 
 These tests launch the real worker executable through the separate
 [`usb-gadget-harness`](../usb-gadget-supervisor/crates/usb-gadget-harness)
 crate in `usb-gadget-supervisor`. The harness supplies FD 3 control messages,
-named local resources, and fresh endpoint handles. The `usb-gadget-worker-io`
-compatibility library supplies the existing file, GPIO, and display APIs using
-device-file or simulated socket operations; the
-worker command, I/O calls, protocol handlers, and lifecycle flow are the same,
-without a test-mode flag. Source adaptations are platform gates, imports, and
-dependencies. Display output is inert, and button inputs require explicit test actions.
-Authentication, presence, state, and persistence use the production paths.
+named local resources, and fresh endpoint handles. Production Linux builds use
+the real file, GPIO, and display APIs. The `worker-harness` build feature links
+compatible fake implementations on Linux; macOS uses the compatible APIs.
+There is no runtime backend detection or worker-mode flag. Worker I/O calls,
+protocol handlers, and lifecycle flow remain the same; source adaptations are
+platform gates, imports, and dependencies. Display output is inert, and button
+inputs require explicit test actions. Authentication, presence, state, and
+persistence use the production paths.
+
+Deployment builds omit `worker-harness`; `--all-features` includes the fake APIs.
 
 Coverage includes bulk frame dispatch, packet-aligned response ZLPs, malformed
 requests, session cleanup on disable/unbind, suspend/resume, rejection, stale
