@@ -1372,12 +1372,31 @@ dependencies = [
 ]
 
 [[package]]
+name = "usb-gadget-harness"
+version = "0.1.0"
+dependencies = [
+ "libc",
+ "usb-gadget-worker",
+ "usb-gadget-worker-io",
+]
+
+[[package]]
 name = "usb-gadget-worker"
 version = "0.1.0"
 dependencies = [
  "ciborium",
+ "libc",
  "serde",
  "serde_bytes",
+]
+
+[[package]]
+name = "usb-gadget-worker-io"
+version = "0.1.0"
+dependencies = [
+ "display-backends",
+ "gpiocdev-uapi",
+ "libc",
 ]
 
 [[package]]
@@ -1385,9 +1404,10 @@ name = "virtual-yubihsm"
 version = "0.1.0"
 dependencies = [
  "display-backends",
- "gpiocdev-uapi",
  "libc",
+ "usb-gadget-harness",
  "usb-gadget-worker",
+ "usb-gadget-worker-io",
  "virtual-yubihsm-core",
 ]
 

@@ -1,5 +1,5 @@
 //! Supervisor-facing FunctionFS runtime for the YubiHSM bulk endpoints.
-#![cfg_attr(not(target_os = "linux"), allow(dead_code))]
+#![cfg_attr(not(unix), allow(dead_code))]
 
 use crate::{
     usb_identity::{BULK_IN, BULK_OUT, MAX_PACKET_SIZE},
@@ -7,7 +7,6 @@ use crate::{
 };
 use std::{
     env,
-    fs::File,
     io::{self, Read, Write},
     os::fd::AsRawFd,
     path::PathBuf,
@@ -19,6 +18,7 @@ use std::{
     thread,
 };
 use usb_gadget_worker::{EndpointLifecycle, UsbBusEvent};
+use usb_gadget_worker_io::File;
 use virtual_yubihsm_core::{
     CommandCode, DeviceConfig, DeviceError, Frame, MAX_FRAME_LENGTH, PersistenceMode,
     PersistentDevice, PersistentDeviceHandle, SessionAuthorization,

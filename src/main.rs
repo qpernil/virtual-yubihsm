@@ -1,22 +1,22 @@
 //! Unprivileged YubiHSM 2 protocol worker for `usb-gadget-supervisor`.
 
-#[cfg(target_os = "linux")]
+#[cfg(unix)]
 mod buttons;
-#[cfg(any(target_os = "linux", test))]
+#[cfg(any(unix, test))]
 mod display;
-#[cfg(target_os = "linux")]
+#[cfg(unix)]
 mod functionfs;
-#[cfg(any(target_os = "linux", test))]
+#[cfg(any(unix, test))]
 mod usb_identity;
-#[cfg(any(target_os = "linux", test))]
+#[cfg(any(unix, test))]
 mod worker_protocol;
 
-#[cfg(target_os = "linux")]
+#[cfg(unix)]
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::{env, io, time::Duration};
 use virtual_yubihsm_core::PersistenceMode;
 
-#[cfg(target_os = "linux")]
+#[cfg(unix)]
 static STOP_REQUESTED: AtomicBool = AtomicBool::new(false);
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -60,7 +60,7 @@ fn run() -> io::Result<()> {
         return Ok(());
     };
 
-    #[cfg(target_os = "linux")]
+    #[cfg(unix)]
     {
         install_signal_handlers()?;
         functionfs::run_worker(
@@ -72,12 +72,12 @@ fn run() -> io::Result<()> {
         )
     }
 
-    #[cfg(not(target_os = "linux"))]
+    #[cfg(not(unix))]
     {
         let _ = options;
         Err(io::Error::new(
             io::ErrorKind::Unsupported,
-            "the virtual YubiHSM worker is Linux-only",
+            "the virtual YubiHSM worker requires Unix handles",
         ))
     }
 }
@@ -161,7 +161,7 @@ fn parse_persistence(value: &str) -> io::Result<PersistenceMode> {
     }
 }
 
-#[cfg(target_os = "linux")]
+#[cfg(unix)]
 fn install_signal_handlers() -> io::Result<()> {
     unsafe extern "C" fn stop(_signal: i32) {
         STOP_REQUESTED.store(true, Ordering::Relaxed);

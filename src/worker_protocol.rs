@@ -3,10 +3,10 @@
 
 use std::{
     ffi::c_void,
-    fs::File,
     io,
     os::fd::{AsRawFd, BorrowedFd, FromRawFd, OwnedFd},
 };
+use usb_gadget_worker_io::File;
 
 pub(crate) const STATE_DIRECTORY_ENV: &str = "STATE_DIRECTORY";
 const CONTROL_FD: i32 = 3;

@@ -28,15 +28,14 @@ firmware-full = ["virtual-yubihsm-core/firmware-full"]
 libc = "0.2.191"
 virtual-yubihsm-core = { path = "crates/virtual-yubihsm-core", default-features = false, features = ["persistent-runtime"] }
 
-[target.'cfg(target_os = "linux")'.dependencies]
+[target.'cfg(unix)'.dependencies]
+usb-gadget-worker-io = { path = "../usb-gadget-supervisor/crates/usb-gadget-worker-io" }
 usb-gadget-worker = { path = "../usb-gadget-supervisor/crates/usb-gadget-worker" }
 display-backends = { path = "../display-backends" }
-gpiocdev-uapi = "0.7.0"
 
 [[bin]]
 name = "virtual-yubihsm-worker"
 path = "src/main.rs"
 
-# USB identity tests also need the worker types on macOS.
 [dev-dependencies]
-usb-gadget-worker = { path = "../usb-gadget-supervisor/crates/usb-gadget-worker" }
+usb-gadget-harness = { path = "../usb-gadget-supervisor/crates/usb-gadget-harness" }

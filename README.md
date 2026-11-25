@@ -432,6 +432,34 @@ values. The worker includes both native asset sets and selects one with
 display and KEY3 resources intentionally match the corresponding
 `virtual-yubikey` profiles so either worker can use the same wiring.
 
+## Worker process tests on macOS and Linux
+
+With the documented sibling dependencies checked out, run:
+
+```sh
+cargo test --locked --test worker_harness
+```
+
+These tests launch the real worker executable through the separate
+[`usb-gadget-harness`](../usb-gadget-supervisor/crates/usb-gadget-harness)
+crate in `usb-gadget-supervisor`. The harness supplies FD 3 control messages,
+named local resources, and fresh endpoint handles. The `usb-gadget-worker-io`
+compatibility library supplies the existing file, GPIO, and display APIs using
+device-file or simulated socket operations; the
+worker command, I/O calls, protocol handlers, and lifecycle flow are the same,
+without a test-mode flag. Source adaptations are platform gates, imports, and
+dependencies. Display output is inert, and button inputs require explicit test actions.
+Authentication, presence, state, and persistence use the production paths.
+
+Coverage includes bulk frame dispatch, packet-aligned response ZLPs, malformed
+requests, session cleanup on disable/unbind, suspend/resume, rejection, stale
+generations, reinsertion, and persistent device identity across process restart.
+
+CI runs these process tests on macOS and Linux. Physical USB gadget operation
+still requires Linux; kernel, GPIO/display, browser, and host-driver qualification
+remain separate. Embedded integrations keep using the transport-independent
+core directly. The harness adds no requirement to that API.
+
 ## Development
 
 ```sh

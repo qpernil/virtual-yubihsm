@@ -52,7 +52,11 @@ jobs:
           cargo check --locked -p yubihsm-qualification --no-default-features --features "${{ matrix.feature }}"
 
   test:
-    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest]
+    runs-on: ${{ matrix.os }}
 
     steps:
       - name: Check out repository
@@ -68,6 +72,7 @@ jobs:
           git clone --depth 1 https://github.com/qpernil/raspberry-pi-i2c-target.git ../raspberry-pi-i2c-target
 
       - name: Install native dependencies
+        if: runner.os == 'Linux'
         run: |
           sudo apt-get update
           sudo apt-get install -y libpcsclite-dev pkg-config
@@ -101,6 +106,7 @@ jobs:
         uses: dtolnay/rust-toolchain@1.95.0
 
       - name: Install native dependencies
+        if: runner.os == 'Linux'
         run: |
           sudo apt-get update
           sudo apt-get install -y libpcsclite-dev pkg-config

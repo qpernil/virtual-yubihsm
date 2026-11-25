@@ -9,42 +9,42 @@ const OLED_LED_OFF_FRAME: &[u8; OLED_FRAME_SIZE] =
 const OLED_LED_ON_FRAME: &[u8; OLED_FRAME_SIZE] =
     include_bytes!("../assets/yubihsm-oled-led-on.mono1");
 
-#[cfg(target_os = "linux")]
+#[cfg(unix)]
 use display_backends::indicator::{
     AttentionGuard, BlinkCount, Cadence, CommandGuard, Controller as IndicatorController,
     IdlePolicy, IndicatorRenderer, Policy,
 };
-#[cfg(target_os = "linux")]
-use display_backends::{Backend, Display};
-#[cfg(target_os = "linux")]
-use std::fs::File;
-#[cfg(target_os = "linux")]
+#[cfg(unix)]
 use std::io;
-#[cfg(target_os = "linux")]
+#[cfg(unix)]
 use std::os::fd::AsRawFd;
-#[cfg(target_os = "linux")]
+#[cfg(unix)]
 use std::sync::{
     Arc, Mutex,
     mpsc::{self, Receiver, RecvTimeoutError, Sender},
 };
-#[cfg(target_os = "linux")]
+#[cfg(unix)]
 use std::thread::{self, JoinHandle};
-#[cfg(target_os = "linux")]
+#[cfg(unix)]
 use std::time::{Duration, Instant};
+#[cfg(unix)]
+use usb_gadget_worker_io::File;
+#[cfg(unix)]
+use usb_gadget_worker_io::display::{Backend, Display};
 
-#[cfg(target_os = "linux")]
+#[cfg(unix)]
 const BUSY_CADENCE: Cadence = Cadence::new(Duration::from_millis(67), Duration::from_millis(33));
-#[cfg(target_os = "linux")]
+#[cfg(unix)]
 const IDLE_CADENCE: Cadence =
     Cadence::new(Duration::from_millis(1_500), Duration::from_millis(1_500));
-#[cfg(target_os = "linux")]
+#[cfg(unix)]
 const MINIMUM_EDGE: Duration = Duration::from_millis(8);
-#[cfg(target_os = "linux")]
+#[cfg(unix)]
 const MINIMUM_ACTIVITY_ON: Duration = Duration::from_micros(33_500);
-#[cfg(target_os = "linux")]
+#[cfg(unix)]
 const MINIMUM_ACTIVITY_OFF: Duration = Duration::from_millis(20);
 
-#[cfg(target_os = "linux")]
+#[cfg(unix)]
 const fn indicator_policy() -> Policy {
     Policy::new(
         BUSY_CADENCE,
@@ -58,14 +58,14 @@ const fn indicator_policy() -> Policy {
     .with_minimum_activity_off(MINIMUM_ACTIVITY_OFF)
 }
 
-#[cfg(target_os = "linux")]
+#[cfg(unix)]
 #[derive(Clone)]
 pub(crate) struct Activity {
     inner: display_backends::indicator::Activity,
     sender: Sender<Command>,
 }
 
-#[cfg(target_os = "linux")]
+#[cfg(unix)]
 impl Activity {
     pub(crate) fn begin(&self) -> CommandGuard {
         self.inner.begin()
@@ -76,14 +76,14 @@ impl Activity {
     }
 }
 
-#[cfg(target_os = "linux")]
+#[cfg(unix)]
 pub(crate) struct Controller {
     sender: Sender<Command>,
     activity: display_backends::indicator::Activity,
     thread: JoinHandle<io::Result<()>>,
 }
 
-#[cfg(target_os = "linux")]
+#[cfg(unix)]
 impl Controller {
     pub(crate) fn start(bus: File, control: File, kind: crate::DisplayKind) -> io::Result<Self> {
         let hardware = Arc::new(Mutex::new(Hardware::new(bus, control, kind)));
@@ -146,7 +146,7 @@ impl Controller {
     }
 }
 
-#[cfg(target_os = "linux")]
+#[cfg(unix)]
 #[derive(Clone, Copy)]
 enum Command {
     Identify(u8),
@@ -159,14 +159,14 @@ enum Command {
     Shutdown,
 }
 
-#[cfg(target_os = "linux")]
+#[cfg(unix)]
 fn send_command(sender: &Sender<Command>, command: Command) -> io::Result<()> {
     sender
         .send(command)
         .map_err(|_| io::Error::new(io::ErrorKind::BrokenPipe, "YubiHSM display thread stopped"))
 }
 
-#[cfg(target_os = "linux")]
+#[cfg(unix)]
 fn display_loop(
     indicator: IndicatorController,
     hardware: Arc<Mutex<Hardware>>,
@@ -273,19 +273,19 @@ fn display_loop(
     }
 }
 
-#[cfg(target_os = "linux")]
+#[cfg(unix)]
 fn lock_hardware(hardware: &Mutex<Hardware>) -> io::Result<std::sync::MutexGuard<'_, Hardware>> {
     hardware
         .lock()
         .map_err(|_| io::Error::other("YubiHSM display lock poisoned"))
 }
 
-#[cfg(target_os = "linux")]
+#[cfg(unix)]
 struct HardwareRenderer {
     hardware: Arc<Mutex<Hardware>>,
 }
 
-#[cfg(target_os = "linux")]
+#[cfg(unix)]
 impl IndicatorRenderer for HardwareRenderer {
     fn set_indicator(&mut self, lit: bool) -> io::Result<()> {
         lock_hardware(&self.hardware)?.render(lit);
@@ -293,7 +293,7 @@ impl IndicatorRenderer for HardwareRenderer {
     }
 }
 
-#[cfg(target_os = "linux")]
+#[cfg(unix)]
 struct Hardware {
     bus: File,
     control: File,
@@ -302,7 +302,7 @@ struct Hardware {
     error_reported: bool,
 }
 
-#[cfg(target_os = "linux")]
+#[cfg(unix)]
 impl Hardware {
     fn new(bus: File, control: File, kind: crate::DisplayKind) -> Self {
         Self {
@@ -402,7 +402,7 @@ mod tests {
         assert_ne!(OLED_LED_OFF_FRAME, OLED_LED_ON_FRAME);
     }
 
-    #[cfg(target_os = "linux")]
+    #[cfg(unix)]
     #[test]
     fn indicator_policy_preserves_yubihsm_cadences() {
         let policy = indicator_policy();
